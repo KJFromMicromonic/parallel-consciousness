@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/yourname/conclave/pkg/agent"
 	"github.com/yourname/conclave/pkg/protocol"
@@ -75,6 +76,7 @@ func ServeRunner(a *agent.Agent, fn func(ctx context.Context, gateID string, ver
 // receives participants' readiness signals.
 type Coordinator struct {
 	a         *agent.Agent
+	timeout   time.Duration
 	mu        sync.Mutex
 	gates     map[string]*gateState
 	onVerdict func(Verdict)
@@ -85,16 +87,31 @@ type gateState struct {
 	mu       sync.Mutex
 	ready    map[string]string // participant -> version
 	inflight bool              // a run is awaiting the runner's verdict
+	gen      int               // bumped on each resolution; invalidates stale timers
 }
 
 // NewCoordinator wires gate handlers onto an agent.
 func NewCoordinator(a *agent.Agent) *Coordinator {
-	c := &Coordinator{a: a, gates: make(map[string]*gateState)}
+	c := &Coordinator{a: a, timeout: 5 * time.Second, gates: make(map[string]*gateState)}
 	a.On(protocol.IntentReady, c.onReady)
 	a.On(protocol.IntentDone, c.onVerdictMsg)
 	a.On(protocol.IntentDisagree, c.onVerdictMsg)
 	a.On(protocol.IntentBlock, c.onVerdictMsg)
 	return c
+}
+
+// SetRunnerTimeout sets how long the coordinator waits for a runner's verdict
+// before declaring the gate stalled. Default 5s.
+func (c *Coordinator) SetRunnerTimeout(d time.Duration) {
+	c.mu.Lock()
+	c.timeout = d
+	c.mu.Unlock()
+}
+
+func (c *Coordinator) runnerTimeout() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.timeout
 }
 
 // Register declares a gate this coordinator will coordinate.
@@ -137,17 +154,31 @@ func (c *Coordinator) onReady(ctx context.Context, _ *agent.Agent, m protocol.Me
 func (c *Coordinator) open(ctx context.Context, gs *gateState) {
 	gs.mu.Lock()
 	gs.inflight = true
+	gen := gs.gen
 	versions := copyMap(gs.ready)
 	runner := gs.spec.Runner
 	gateID := gs.spec.ID
 	gs.mu.Unlock()
 
-	_ = c.a.Send(ctx, protocol.New(
+	timeout := c.runnerTimeout()
+	req := protocol.New(
 		protocol.Address{Agent: c.a.Name},
 		protocol.Address{Agent: runner},
 		protocol.IntentRequest,
 		map[string]any{"gate": gateID, "versions": versions},
-	))
+	)
+	req.Deadline = req.Timestamp.Add(timeout)
+	_ = c.a.Send(ctx, req)
+
+	time.AfterFunc(timeout, func() {
+		gs.mu.Lock()
+		stale := gs.gen != gen || !gs.inflight
+		gs.mu.Unlock()
+		if stale {
+			return // this run already resolved; ignore
+		}
+		c.resolve(ctx, gs, Verdict{GateID: gateID, Passed: false, Detail: "runner unresponsive"}, true)
+	})
 }
 
 func (c *Coordinator) onVerdictMsg(ctx context.Context, _ *agent.Agent, m protocol.Message) *protocol.Message {
@@ -157,20 +188,18 @@ func (c *Coordinator) onVerdictMsg(ctx context.Context, _ *agent.Agent, m protoc
 		return nil
 	}
 	detail, _ := m.Body["detail"].(string)
-	c.resolve(ctx, gs, Verdict{GateID: gateID, Passed: m.Intent == protocol.IntentDone, Detail: detail})
+	c.resolve(ctx, gs, Verdict{GateID: gateID, Passed: m.Intent == protocol.IntentDone, Detail: detail}, false)
 	return nil
 }
 
-// resolve finalizes one run: broadcasts the verdict, routes blocks to owners on
-// failure, clears readiness (re-arm), and fires the OnVerdict hook. Idempotent
-// per run via the inflight flag — a duplicate verdict is a no-op.
-func (c *Coordinator) resolve(ctx context.Context, gs *gateState, v Verdict) {
+func (c *Coordinator) resolve(ctx context.Context, gs *gateState, v Verdict, stalled bool) {
 	gs.mu.Lock()
 	if !gs.inflight {
 		gs.mu.Unlock()
 		return
 	}
 	gs.inflight = false
+	gs.gen++ // invalidate any pending timer for this run
 	if v.Versions == nil {
 		v.Versions = copyMap(gs.ready)
 	}
@@ -179,8 +208,13 @@ func (c *Coordinator) resolve(ctx context.Context, gs *gateState, v Verdict) {
 	gateID := gs.spec.ID
 	gs.mu.Unlock()
 
-	text := fmt.Sprintf("%s PASSED", gateID)
-	if !v.Passed {
+	var text string
+	switch {
+	case stalled:
+		text = fmt.Sprintf("%s STALLED: runner unresponsive", gateID)
+	case v.Passed:
+		text = fmt.Sprintf("%s PASSED", gateID)
+	default:
 		text = fmt.Sprintf("%s FAILED: %s", gateID, v.Detail)
 	}
 	_ = c.a.Send(ctx, protocol.New(

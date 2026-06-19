@@ -345,3 +345,30 @@ func TestGateReArmsAfterVerdict(t *testing.T) {
 		t.Fatalf("round 2 verdict = %+v, want passed billing=b2", v)
 	}
 }
+
+func TestRunnerTimeoutStalls(t *testing.T) {
+	// nil runnerFn => no runner agent exists, so the request is never answered.
+	h := setupGate(t, checkoutSpec(), nil)
+	defer h.cancel()
+	h.coord.SetRunnerTimeout(80 * time.Millisecond)
+
+	h.ready(t, "billing", "b1")
+	h.ready(t, "gateway", "g1")
+
+	v := recvVerdict(t, h.verdict)
+	if v.Passed {
+		t.Fatalf("verdict = %+v, want stalled failure", v)
+	}
+	if v.Detail != "runner unresponsive" {
+		t.Fatalf("detail = %q, want \"runner unresponsive\"", v.Detail)
+	}
+
+	owners := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		m := recvMsg(t, h.blocks)
+		owners[m.To.Agent] = true
+	}
+	if !owners["billing"] || !owners["gateway"] {
+		t.Fatalf("blocked owners = %v, want billing+gateway", owners)
+	}
+}
