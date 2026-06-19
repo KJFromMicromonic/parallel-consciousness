@@ -42,3 +42,28 @@ func Ready(ctx context.Context, a *agent.Agent, gateID, version string) error {
 		map[string]any{"gate": gateID, "version": version},
 	))
 }
+
+// ServeRunner registers fn as the test executor on a runner agent. When a gate
+// opens, the coordinator sends the runner an IntentRequest carrying the gate id
+// and the participating versions; fn runs the spanning test however it likes and
+// returns a Verdict. This callback is the only place a test is executed —
+// pkg/gate itself never shells out.
+func ServeRunner(a *agent.Agent, fn func(ctx context.Context, gateID string, versions map[string]string) Verdict) {
+	a.On(protocol.IntentRequest, func(ctx context.Context, ag *agent.Agent, m protocol.Message) *protocol.Message {
+		gateID, _ := m.Body["gate"].(string)
+		if gateID == "" {
+			return nil // not a gate request; ignore
+		}
+		versions, _ := m.Body["versions"].(map[string]string)
+		v := fn(ctx, gateID, versions)
+		intent := protocol.IntentDone
+		if !v.Passed {
+			intent = protocol.IntentDisagree
+		}
+		reply := m.Reply(protocol.Address{Agent: ag.Name}, intent, map[string]any{
+			"gate":   gateID,
+			"detail": v.Detail,
+		})
+		return &reply
+	})
+}
