@@ -7,6 +7,8 @@ package gate
 
 import (
 	"context"
+	"fmt"
+	"sync"
 
 	"github.com/yourname/conclave/pkg/agent"
 	"github.com/yourname/conclave/pkg/protocol"
@@ -66,4 +68,157 @@ func ServeRunner(a *agent.Agent, fn func(ctx context.Context, gateID string, ver
 		})
 		return &reply
 	})
+}
+
+// Coordinator hosts one or more gates on top of an agent. One agent hosts it;
+// that agent must be subscribed to Topic(id) for each registered gate so it
+// receives participants' readiness signals.
+type Coordinator struct {
+	a         *agent.Agent
+	mu        sync.Mutex
+	gates     map[string]*gateState
+	onVerdict func(Verdict)
+}
+
+type gateState struct {
+	spec     Spec
+	mu       sync.Mutex
+	ready    map[string]string // participant -> version
+	inflight bool              // a run is awaiting the runner's verdict
+}
+
+// NewCoordinator wires gate handlers onto an agent.
+func NewCoordinator(a *agent.Agent) *Coordinator {
+	c := &Coordinator{a: a, gates: make(map[string]*gateState)}
+	a.On(protocol.IntentReady, c.onReady)
+	a.On(protocol.IntentDone, c.onVerdictMsg)
+	a.On(protocol.IntentDisagree, c.onVerdictMsg)
+	a.On(protocol.IntentBlock, c.onVerdictMsg)
+	return c
+}
+
+// Register declares a gate this coordinator will coordinate.
+func (c *Coordinator) Register(spec Spec) {
+	c.mu.Lock()
+	c.gates[spec.ID] = &gateState{spec: spec, ready: make(map[string]string)}
+	c.mu.Unlock()
+}
+
+// OnVerdict registers a hook called with every resolved verdict. Useful for
+// logging and tests.
+func (c *Coordinator) OnVerdict(fn func(Verdict)) { c.onVerdict = fn }
+
+func (c *Coordinator) gate(id string) *gateState {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.gates[id]
+}
+
+func (c *Coordinator) onReady(ctx context.Context, _ *agent.Agent, m protocol.Message) *protocol.Message {
+	gateID, _ := m.Body["gate"].(string)
+	version, _ := m.Body["version"].(string)
+	gs := c.gate(gateID)
+	if gs == nil {
+		return nil
+	}
+	gs.mu.Lock()
+	required := contains(gs.spec.Required, m.From.Agent)
+	if required && !gs.inflight {
+		gs.ready[m.From.Agent] = version // dedup by participant; last write wins
+	}
+	full := required && !gs.inflight && len(gs.ready) == len(gs.spec.Required)
+	gs.mu.Unlock()
+	if full {
+		c.open(ctx, gs)
+	}
+	return nil // ready is terminal
+}
+
+func (c *Coordinator) open(ctx context.Context, gs *gateState) {
+	gs.mu.Lock()
+	gs.inflight = true
+	versions := copyMap(gs.ready)
+	runner := gs.spec.Runner
+	gateID := gs.spec.ID
+	gs.mu.Unlock()
+
+	_ = c.a.Send(ctx, protocol.New(
+		protocol.Address{Agent: c.a.Name},
+		protocol.Address{Agent: runner},
+		protocol.IntentRequest,
+		map[string]any{"gate": gateID, "versions": versions},
+	))
+}
+
+func (c *Coordinator) onVerdictMsg(ctx context.Context, _ *agent.Agent, m protocol.Message) *protocol.Message {
+	gateID, _ := m.Body["gate"].(string)
+	gs := c.gate(gateID)
+	if gs == nil {
+		return nil
+	}
+	detail, _ := m.Body["detail"].(string)
+	c.resolve(ctx, gs, Verdict{GateID: gateID, Passed: m.Intent == protocol.IntentDone, Detail: detail})
+	return nil
+}
+
+// resolve finalizes one run: broadcasts the verdict, routes blocks to owners on
+// failure, clears readiness (re-arm), and fires the OnVerdict hook. Idempotent
+// per run via the inflight flag — a duplicate verdict is a no-op.
+func (c *Coordinator) resolve(ctx context.Context, gs *gateState, v Verdict) {
+	gs.mu.Lock()
+	if !gs.inflight {
+		gs.mu.Unlock()
+		return
+	}
+	gs.inflight = false
+	if v.Versions == nil {
+		v.Versions = copyMap(gs.ready)
+	}
+	gs.ready = make(map[string]string) // re-arm for the next round
+	owners := append([]string(nil), gs.spec.Required...)
+	gateID := gs.spec.ID
+	gs.mu.Unlock()
+
+	text := fmt.Sprintf("%s PASSED", gateID)
+	if !v.Passed {
+		text = fmt.Sprintf("%s FAILED: %s", gateID, v.Detail)
+	}
+	_ = c.a.Send(ctx, protocol.New(
+		protocol.Address{Agent: c.a.Name},
+		protocol.Address{Topic: Topic(gateID)},
+		protocol.IntentInform,
+		map[string]any{"text": text, "gate": gateID, "passed": v.Passed},
+	))
+
+	if !v.Passed {
+		for _, owner := range owners {
+			_ = c.a.Send(ctx, protocol.New(
+				protocol.Address{Agent: c.a.Name},
+				protocol.Address{Agent: owner},
+				protocol.IntentBlock,
+				map[string]any{"text": fmt.Sprintf("%s gate failing: %s", gateID, v.Detail), "gate": gateID},
+			))
+		}
+	}
+
+	if c.onVerdict != nil {
+		c.onVerdict(v)
+	}
+}
+
+func contains(ss []string, s string) bool {
+	for _, x := range ss {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+func copyMap(m map[string]string) map[string]string {
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
