@@ -1,0 +1,13 @@
+# Build output
+/bin/
+*.exe
+
+# Redundant: the canonical source now lives in the tree
+conclave.tar.gz
+
+# Editor / OS
+.DS_Store
+*.swp
+
+# Local tooling index (not part of the project)
+.codegraph/
