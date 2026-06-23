@@ -68,6 +68,10 @@ func Open(ctx context.Context, path string, opts ...Option) (*Bus, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite %q: %w", path, err)
 	}
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("connect sqlite %q: %w", path, err)
+	}
 	b := &Bus{
 		db:    db,
 		poll:  25 * time.Millisecond,
