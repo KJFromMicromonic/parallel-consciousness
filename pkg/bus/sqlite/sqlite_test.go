@@ -11,6 +11,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/KJFromMicromonic/parallel-consciousness/pkg/bus"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/bus/bustest"
 	"github.com/KJFromMicromonic/parallel-consciousness/pkg/bus/sqlite"
 	"github.com/KJFromMicromonic/parallel-consciousness/pkg/protocol"
 )
@@ -334,5 +335,48 @@ func TestPruneRemovesOldRows(t *testing.T) {
 	}
 	if count != 2 {
 		t.Fatalf("remaining = %d, want 2", count)
+	}
+}
+
+func TestSQLiteConformance(t *testing.T) {
+	bustest.Run(t, func(t *testing.T) bus.Bus {
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		path := filepath.Join(t.TempDir(), "bus.db")
+		b, err := sqlite.Open(ctx, path, sqlite.WithPollInterval(5*time.Millisecond))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { b.Close() })
+		return b
+	})
+}
+
+func TestCrossProcessDelivery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	path := filepath.Join(t.TempDir(), "bus.db")
+
+	// Two independent Bus instances on the same file == two processes.
+	b1, err := sqlite.Open(ctx, path, sqlite.WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b1.Close()
+	b2, err := sqlite.Open(ctx, path, sqlite.WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b2.Close()
+
+	ch, err := b2.Subscribe(ctx, "a", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b1.Publish(ctx, inform("b", "a", "cross")); err != nil {
+		t.Fatal(err)
+	}
+	if m := recv(t, ch); m.Body["text"] != "cross" {
+		t.Fatalf("cross-process delivered %+v", m)
 	}
 }
