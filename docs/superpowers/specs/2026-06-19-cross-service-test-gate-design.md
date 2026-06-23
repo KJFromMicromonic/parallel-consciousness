@@ -1,15 +1,15 @@
 # Cross-Service Integration-Test Gate — Design Spec
 
-**Status:** Approved (design phase) · **Date:** 2026-06-19 · **Project:** Conclave
+**Status:** Approved (design phase) · **Date:** 2026-06-19 · **Project:** Parallel Consciousness
 
 ## Summary
 
-The first real capability built on Conclave's conversation layer: a **gate** that
+The first real capability built on Parallel Consciousness's conversation layer: a **gate** that
 coordinates an integration test spanning services owned by different agents.
 Several service-owning agents each declare *"I'm ready at version X"* for a named
 gate. When every required participant has declared ready, the gate **opens**, a
 designated **runner** is told to go, it executes the spanning test and reports a
-**verdict**, and Conclave **broadcasts pass/fail** — routing a failure back to the
+**verdict**, and Parallel Consciousness **broadcasts pass/fail** — routing a failure back to the
 owners as a `block` so the conversation continues.
 
 This is a handoff a shared markdown doc fundamentally cannot express, which is the
@@ -17,7 +17,7 @@ whole pitch of the project.
 
 ## Motivation
 
-Conclave was born from running coding agents in parallel on a distributed system —
+Parallel Consciousness was born from running coding agents in parallel on a distributed system —
 **one agent per service** — where the painful coordination failure is *cross-service
 test gating*: an integration test spans services owned by different agents, and today
 nobody knows when all sides are at a compatible state. So spanning tests run too early
@@ -26,15 +26,15 @@ observable handshake instead of guesswork.
 
 ## Principles
 
-1. **Coordinate, don't execute.** Conclave resolves the readiness barrier and asks a
+1. **Coordinate, don't execute.** Parallel Consciousness resolves the readiness barrier and asks a
    runner to go; it never shells out or runs a test itself. This keeps it a pure
-   coordination layer, true to the project thesis ("a bus moves bytes; Conclave is the
+   coordination layer, true to the project thesis ("a bus moves bytes; Parallel Consciousness is the
    conversation on top").
-2. **Harness-agnostic.** Conclave coordinates *processes*. Whatever drives a process —
+2. **Harness-agnostic.** Parallel Consciousness coordinates *processes*. Whatever drives a process —
    Claude Code, OpenCode, a script, a human — is opaque to it. The gate API therefore
    traffics only in plain data (a gate id, a version string, a verdict), never anything
    tied to a specific agent harness. This is what lets a future thin CLI/sidecar
-   (`conclave ready --gate G --version $(git rev-parse HEAD)`) map 1:1 onto the API so
+   (`pc ready --gate G --version $(git rev-parse HEAD)`) map 1:1 onto the API so
    any harness can participate by shelling out.
 3. **Single-process for v0.1.** Built on the existing in-memory bus. Cross-process
    transport and a durable readiness ledger are deferred deliberately, to be revisited
@@ -57,14 +57,14 @@ observable handshake instead of guesswork.
 
 ## The Model
 
-Three roles, all of them ordinary Conclave agents:
+Three roles, all of them ordinary Parallel Consciousness agents:
 
 - **Participants** — the service-owning agents (e.g. `billing-svc`, `gateway`). Each
   declares readiness when its own work reaches a state it believes is compatible.
 - **Coordinator** — an embeddable component that *one* agent hosts (a dedicated
   `gatekeeper`, or the runner itself). It owns the gate's state and turns scattered
   `ready` signals into a decision. It is not separate infrastructure.
-- **Runner** — the agent designated to execute the spanning test. Conclave only ever
+- **Runner** — the agent designated to execute the spanning test. Parallel Consciousness only ever
   *asks* it to go and *listens* for its verdict.
 
 ### New protocol intent
@@ -85,7 +85,7 @@ Everything else reuses existing intents:
 gateway   --ready(v=a1b2)--> #gate.checkout      coordinator records: 1/2
 billing   --ready(v=c3d4)--> #gate.checkout      coordinator records: 2/2 -> OPEN
 coord     --request-------->  runner             {gate, versions:{gateway:a1b2, billing:c3d4}}
-runner    ...runs the spanning test (opaque to Conclave)...
+runner    ...runs the spanning test (opaque to Parallel Consciousness)...
 runner    --done----------->  coord              {pass, report}
 coord     --inform-------->  #gate.checkout      "checkout PASSED @ a1b2/c3d4"
                                                   round clears; re-arms for the next state
@@ -135,15 +135,15 @@ func (c *Coordinator) OnVerdict(func(Verdict))   // optional hook (logging/tests
 // Participant side — one helper, harness-agnostic (plain strings):
 func Ready(ctx context.Context, a *agent.Agent, gateID, version string) error
 
-// Runner side — register the test executor. Conclave calls fn when the gate
+// Runner side — register the test executor. Parallel Consciousness calls fn when the gate
 // opens; fn runs the test however it likes and returns the verdict.
 func ServeRunner(a *agent.Agent, fn func(ctx context.Context, gateID string, versions map[string]string) Verdict)
 ```
 
-`ServeRunner` is the seam that enforces "coordinate, don't execute": Conclave hands the
+`ServeRunner` is the seam that enforces "coordinate, don't execute": Parallel Consciousness hands the
 runner a gate + versions and gets a `Verdict` back. Whether `fn` shells out to `go test`,
-hits CI, or returns a canned result (in the demo) is none of Conclave's business. It is
-also exactly the shape a future `conclave run-gate --gate G -- <cmd>` CLI wraps.
+hits CI, or returns a canned result (in the demo) is none of Parallel Consciousness's business. It is
+also exactly the shape a future `pc run-gate --gate G -- <cmd>` CLI wraps.
 
 ### Wiring
 
@@ -228,7 +228,7 @@ Round 2 — a regression:
 
 ## Assumptions
 
-- Each service is represented by a long-running process that embeds the Conclave library
+- Each service is represented by a long-running process that embeds the Parallel Consciousness library
   and stays subscribed to the bus. What *drives* that process is out of scope.
 - v0.1 runs in a single process (in-memory bus); the design does not yet attempt
   cross-process correctness.

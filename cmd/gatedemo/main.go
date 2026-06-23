@@ -13,10 +13,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yourname/conclave/pkg/agent"
-	"github.com/yourname/conclave/pkg/bus"
-	"github.com/yourname/conclave/pkg/gate"
-	"github.com/yourname/conclave/pkg/protocol"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/agent"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/bus"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/gate"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/protocol"
 )
 
 const gateID = "checkout"
@@ -65,7 +65,7 @@ func main() {
 		run(a)
 	}
 
-	log.Println("── conclave: cross-service test gate ──")
+	log.Println("── parallel-consciousness: cross-service test gate ──")
 	log.Println("Round 1 — both services at compatible versions:")
 	_ = gate.Ready(ctx, gateway, gateID, "a1b2")
 	_ = gate.Ready(ctx, billing, gateID, "c3d4")

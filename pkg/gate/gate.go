@@ -1,7 +1,7 @@
-// Package gate coordinates cross-service integration tests over the Conclave
+// Package gate coordinates cross-service integration tests over the Parallel Consciousness
 // conversation layer. Participants declare readiness for a named gate; when the
 // full required set is ready, a Coordinator asks a designated runner to execute
-// the spanning test and broadcasts the verdict. Conclave coordinates the
+// the spanning test and broadcasts the verdict. Parallel Consciousness coordinates the
 // handshake — it never runs a test itself.
 package gate
 
@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yourname/conclave/pkg/agent"
-	"github.com/yourname/conclave/pkg/protocol"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/agent"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/protocol"
 )
 
 // Topic returns the bus topic a gate's signals ride on. The agent hosting a
@@ -36,7 +36,7 @@ type Verdict struct {
 
 // Ready declares that the calling agent is at a compatible state for a gate.
 // Harness-agnostic by design: a gate id and an opaque version string, nothing
-// more. A future `conclave ready --gate G --version V` CLI maps 1:1 onto this.
+// more. A future `pc ready --gate G --version V` CLI maps 1:1 onto this.
 func Ready(ctx context.Context, a *agent.Agent, gateID, version string) error {
 	return a.Send(ctx, protocol.New(
 		protocol.Address{Agent: a.Name},

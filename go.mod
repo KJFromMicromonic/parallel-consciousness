@@ -1,4 +1,4 @@
-module github.com/yourname/conclave
+module github.com/KJFromMicromonic/parallel-consciousness
 
 go 1.22
 

@@ -11,7 +11,7 @@ import (
 	"context"
 	"sync"
 
-	"github.com/yourname/conclave/pkg/protocol"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/protocol"
 )
 
 // Bus is the transport contract. Implementations: InMemory (default),

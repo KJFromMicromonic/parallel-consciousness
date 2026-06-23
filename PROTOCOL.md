@@ -1,11 +1,11 @@
-# Conclave Protocol Specification (v0.1)
+# Parallel Consciousness Protocol Specification (v0.1)
 
 The contract for coworker-like agent communication. Transport-agnostic: the
 same envelope rides the in-memory bus or a Kafka/Redpanda topic unchanged.
 
 ## Design principle
 
-A message bus moves bytes. Conclave is the *conversation layer* on top:
+A message bus moves bytes. Parallel Consciousness is the *conversation layer* on top:
 **intent-typed speech acts**, **threading**, and **turn-taking discipline**.
 This is the part that distinguishes "agents talking like coworkers" from
 "agents appending to a shared file."

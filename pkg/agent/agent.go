@@ -10,8 +10,8 @@ import (
 	"log"
 	"sync"
 
-	"github.com/yourname/conclave/pkg/bus"
-	"github.com/yourname/conclave/pkg/protocol"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/bus"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/protocol"
 )
 
 // Handler reacts to one inbound message. Returning a non-nil message sends it

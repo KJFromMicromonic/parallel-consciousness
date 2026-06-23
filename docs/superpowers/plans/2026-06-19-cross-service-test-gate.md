@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a reusable `pkg/gate` coordinator that gates a cross-service integration test: services declare readiness, the gate opens when the required set is complete, a designated runner executes, and Conclave broadcasts the verdict.
+**Goal:** Build a reusable `pkg/gate` coordinator that gates a cross-service integration test: services declare readiness, the gate opens when the required set is complete, a designated runner executes, and Parallel Consciousness broadcasts the verdict.
 
-**Architecture:** A new `pkg/gate` package layered on the existing `pkg/bus` + `pkg/agent` + `pkg/protocol`. Participants broadcast an `IntentReady` speech act to a per-gate topic; a `Coordinator` (hosted by one agent) accumulates readiness, sends the designated runner an `IntentRequest` when the required set is complete, collects the runner's verdict (`done` = pass, `disagree`/`block` = fail), broadcasts the verdict, and routes failures back to owners as `block`. Conclave never runs a test itself — the `ServeRunner` callback is the only execution seam and is supplied by the caller.
+**Architecture:** A new `pkg/gate` package layered on the existing `pkg/bus` + `pkg/agent` + `pkg/protocol`. Participants broadcast an `IntentReady` speech act to a per-gate topic; a `Coordinator` (hosted by one agent) accumulates readiness, sends the designated runner an `IntentRequest` when the required set is complete, collects the runner's verdict (`done` = pass, `disagree`/`block` = fail), broadcasts the verdict, and routes failures back to owners as `block`. Parallel Consciousness never runs a test itself — the `ServeRunner` callback is the only execution seam and is supplied by the caller.
 
 **Tech Stack:** Go 1.22, standard library, `github.com/google/uuid` (already vendored via go.sum). In-memory bus only.
 
@@ -12,7 +12,7 @@
 
 - Go version stays `go 1.22` (per `go.mod`); do not raise it.
 - **No new dependencies.** Standard library + the existing `github.com/google/uuid` only.
-- Module path remains the placeholder `github.com/yourname/conclave` (rename deferred by decision). Use this exact path in every import.
+- Module path remains the placeholder `github.com/KJFromMicromonic/parallel-consciousness` (rename deferred by decision). Use this exact path in every import.
 - `pkg/gate` MUST NOT execute tests or shell out. Coordination only; the caller-supplied `ServeRunner` callback is the sole execution seam.
 - The gate API stays **harness-agnostic**: it traffics only in plain data (a gate id, a version string, a `Verdict`) — nothing tied to any agent harness.
 - **Single-process / in-memory bus.** Do not attempt cross-process correctness.
@@ -128,10 +128,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yourname/conclave/pkg/agent"
-	"github.com/yourname/conclave/pkg/bus"
-	"github.com/yourname/conclave/pkg/gate"
-	"github.com/yourname/conclave/pkg/protocol"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/agent"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/bus"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/gate"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/protocol"
 )
 
 // recvMsg reads one message or fails the test after 2s.
@@ -195,23 +195,23 @@ func TestReadyBroadcastsToGateTopic(t *testing.T) {
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `go test ./pkg/gate/ -v`
-Expected: FAIL — `package github.com/yourname/conclave/pkg/gate is not in std` / no Go files.
+Expected: FAIL — `package github.com/KJFromMicromonic/parallel-consciousness/pkg/gate is not in std` / no Go files.
 
 - [ ] **Step 3: Create `pkg/gate/gate.go` with types, `Topic`, and `Ready`**
 
 ```go
-// Package gate coordinates cross-service integration tests over the Conclave
+// Package gate coordinates cross-service integration tests over the Parallel Consciousness
 // conversation layer. Participants declare readiness for a named gate; when the
 // full required set is ready, a Coordinator asks a designated runner to execute
-// the spanning test and broadcasts the verdict. Conclave coordinates the
+// the spanning test and broadcasts the verdict. Parallel Consciousness coordinates the
 // handshake — it never runs a test itself.
 package gate
 
 import (
 	"context"
 
-	"github.com/yourname/conclave/pkg/agent"
-	"github.com/yourname/conclave/pkg/protocol"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/agent"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/protocol"
 )
 
 // Topic returns the bus topic a gate's signals ride on. The agent hosting a
@@ -235,7 +235,7 @@ type Verdict struct {
 
 // Ready declares that the calling agent is at a compatible state for a gate.
 // Harness-agnostic by design: a gate id and an opaque version string, nothing
-// more. A future `conclave ready --gate G --version V` CLI maps 1:1 onto this.
+// more. A future `pc ready --gate G --version V` CLI maps 1:1 onto this.
 func Ready(ctx context.Context, a *agent.Agent, gateID, version string) error {
 	return a.Send(ctx, protocol.New(
 		protocol.Address{Agent: a.Name},
@@ -1041,10 +1041,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yourname/conclave/pkg/agent"
-	"github.com/yourname/conclave/pkg/bus"
-	"github.com/yourname/conclave/pkg/gate"
-	"github.com/yourname/conclave/pkg/protocol"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/agent"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/bus"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/gate"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/protocol"
 )
 
 const gateID = "checkout"
@@ -1093,7 +1093,7 @@ func main() {
 		run(a)
 	}
 
-	log.Println("── conclave: cross-service test gate ──")
+	log.Println("── parallel-consciousness: cross-service test gate ──")
 	log.Println("Round 1 — both services at compatible versions:")
 	_ = gate.Ready(ctx, gateway, gateID, "a1b2")
 	_ = gate.Ready(ctx, billing, gateID, "c3d4")

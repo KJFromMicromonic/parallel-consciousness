@@ -5,10 +5,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yourname/conclave/pkg/agent"
-	"github.com/yourname/conclave/pkg/bus"
-	"github.com/yourname/conclave/pkg/gate"
-	"github.com/yourname/conclave/pkg/protocol"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/agent"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/bus"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/gate"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/protocol"
 )
 
 // recvMsg reads one message or fails the test after 2s.

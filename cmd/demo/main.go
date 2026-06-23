@@ -16,9 +16,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yourname/conclave/pkg/agent"
-	"github.com/yourname/conclave/pkg/bus"
-	"github.com/yourname/conclave/pkg/protocol"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/agent"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/bus"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/protocol"
 )
 
 const project = "project.alpha"
@@ -116,7 +116,7 @@ func main() {
 
 	// Kick off: planner asks the writer to write (which it can't yet) — the
 	// block/escalate/re-sequence dance unfolds from here.
-	log.Println("── conclave: 3 agents, one complementary task ──")
+	log.Println("── parallel-consciousness: 3 agents, one complementary task ──")
 	planner.Send(ctx, protocol.New(
 		protocol.Address{Agent: "planner"},
 		protocol.Address{Agent: "writer"},
