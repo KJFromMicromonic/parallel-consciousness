@@ -57,10 +57,9 @@ func ServeRunner(a *agent.Agent, fn func(ctx context.Context, gateID string, ver
 		if gateID == "" {
 			return nil // not a gate request; ignore
 		}
-		// NOTE: in-memory bus only — it passes Body by reference, so versions is
-		// a map[string]string. A serializing transport (JSON/Kafka) would deliver
-		// map[string]any here; revisit when the transport adapter lands.
-		versions, _ := m.Body["versions"].(map[string]string)
+		// Transport-safe: the in-memory bus passes versions as map[string]string;
+		// a JSON transport (e.g. pkg/bus/sqlite) delivers map[string]any.
+		versions := versionsFromBody(m.Body["versions"])
 		v := fn(ctx, gateID, versions)
 		intent := protocol.IntentDone
 		if !v.Passed {
@@ -269,4 +268,23 @@ func copyMap(m map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+// versionsFromBody coerces a wire "versions" value into map[string]string,
+// accepting both the in-memory map[string]string and a JSON map[string]any.
+func versionsFromBody(v any) map[string]string {
+	switch mm := v.(type) {
+	case map[string]string:
+		return mm
+	case map[string]any:
+		out := make(map[string]string, len(mm))
+		for k, val := range mm {
+			if s, ok := val.(string); ok {
+				out[k] = s
+			}
+		}
+		return out
+	default:
+		return nil
+	}
 }

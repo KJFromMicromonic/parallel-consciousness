@@ -372,3 +372,32 @@ func TestRunnerTimeoutStalls(t *testing.T) {
 		t.Fatalf("blocked owners = %v, want billing+gateway", owners)
 	}
 }
+
+func TestServeRunnerDecodesJSONVersions(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b := bus.NewInMemory(8)
+
+	runner, err := agent.New(ctx, b, "runner", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seen map[string]string
+	gate.ServeRunner(runner, func(ctx context.Context, gateID string, versions map[string]string) gate.Verdict {
+		seen = versions
+		return gate.Verdict{GateID: gateID, Passed: true}
+	})
+	go runner.Run(ctx)
+
+	// Simulate a JSON transport: versions arrives as map[string]any.
+	m := sendAndCaptureReply(t, ctx, b, "runner", map[string]any{
+		"gate":     "checkout",
+		"versions": map[string]any{"billing": "e5f6"},
+	})
+	if m.Intent != protocol.IntentDone {
+		t.Fatalf("intent = %q, want done", m.Intent)
+	}
+	if seen["billing"] != "e5f6" {
+		t.Fatalf("versions = %v, want billing=e5f6", seen)
+	}
+}
