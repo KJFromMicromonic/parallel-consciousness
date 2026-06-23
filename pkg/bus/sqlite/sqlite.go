@@ -7,11 +7,14 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"time"
 
 	_ "modernc.org/sqlite"
+
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/protocol"
 )
 
 const schema = `
@@ -90,3 +93,30 @@ func Open(ctx context.Context, path string, opts ...Option) (*Bus, error) {
 
 // Close closes the underlying database.
 func (b *Bus) Close() error { return b.db.Close() }
+
+// Publish appends a message to the log.
+func (b *Bus) Publish(ctx context.Context, m protocol.Message) error {
+	body := ""
+	if m.Body != nil {
+		raw, err := json.Marshal(m.Body)
+		if err != nil {
+			return fmt.Errorf("marshal body: %w", err)
+		}
+		body = string(raw)
+	}
+	var deadline any
+	if !m.Deadline.IsZero() {
+		deadline = m.Deadline.UTC().Format(time.RFC3339Nano)
+	}
+	_, err := b.db.ExecContext(ctx, `
+		INSERT INTO messages
+		  (id, conversation_id, in_reply_to, from_agent, to_agent, to_topic, intent, body, ts, deadline)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		m.ID, m.ConversationID, m.InReplyTo, m.From.Agent, m.To.Agent, m.To.Topic,
+		string(m.Intent), body, m.Timestamp.UTC().Format(time.RFC3339Nano), deadline,
+	)
+	if err != nil {
+		return fmt.Errorf("publish: %w", err)
+	}
+	return nil
+}
