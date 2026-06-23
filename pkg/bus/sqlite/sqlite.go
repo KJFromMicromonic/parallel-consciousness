@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -119,4 +120,167 @@ func (b *Bus) Publish(ctx context.Context, m protocol.Message) error {
 		return fmt.Errorf("publish: %w", err)
 	}
 	return nil
+}
+
+// Subscribe returns a channel of messages addressed to agent (directly or via a
+// subscribed topic). A new agent starts at the current head of the log; the
+// channel closes when ctx is cancelled.
+func (b *Bus) Subscribe(ctx context.Context, agent string, topics []string) (<-chan protocol.Message, error) {
+	cursor, err := b.initCursor(ctx, agent)
+	if err != nil {
+		return nil, err
+	}
+	out := make(chan protocol.Message, b.batch)
+	go b.poll_(ctx, agent, topics, cursor, out)
+	return out, nil
+}
+
+// initCursor decides where a subscription starts. Until Task 4 wires durable
+// resume, a new agent starts at the current head of the log.
+func (b *Bus) initCursor(ctx context.Context, agent string) (int64, error) {
+	return b.headSeq(ctx)
+}
+
+func (b *Bus) headSeq(ctx context.Context) (int64, error) {
+	var head sql.NullInt64
+	if err := b.db.QueryRowContext(ctx, `SELECT MAX(seq) FROM messages`).Scan(&head); err != nil {
+		return 0, fmt.Errorf("head seq: %w", err)
+	}
+	if head.Valid {
+		return head.Int64, nil
+	}
+	return 0, nil
+}
+
+func (b *Bus) poll_(ctx context.Context, agent string, topics []string, cursor int64, out chan<- protocol.Message) {
+	defer close(out)
+	ticker := time.NewTicker(b.poll)
+	defer ticker.Stop()
+	for {
+		n, next, err := b.deliverBatch(ctx, agent, topics, cursor, out)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			b.onErr(err)
+		} else {
+			if next > cursor {
+				cursor = next
+				b.saveCursor(ctx, agent, cursor)
+			}
+			if n == b.batch {
+				continue // full batch: keep draining without waiting a tick
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (b *Bus) deliverBatch(ctx context.Context, agent string, topics []string, cursor int64, out chan<- protocol.Message) (int, int64, error) {
+	query, args := selectQuery(agent, topics, cursor, b.batch)
+	rows, err := b.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return 0, cursor, err
+	}
+	defer rows.Close()
+
+	n := 0
+	last := cursor
+	for rows.Next() {
+		var (
+			seq                                                              int64
+			id, conv, inReplyTo, fromAgent, toAgent, toTopic, intent, bodyS string
+			ts                                                               string
+			deadline                                                         sql.NullString
+		)
+		if err := rows.Scan(&seq, &id, &conv, &inReplyTo, &fromAgent, &toAgent, &toTopic, &intent, &bodyS, &ts, &deadline); err != nil {
+			return n, last, err
+		}
+		m, derr := buildMessage(id, conv, inReplyTo, fromAgent, toAgent, toTopic, intent, bodyS, ts, deadline)
+		if derr != nil {
+			b.onErr(fmt.Errorf("decode seq %d: %w", seq, derr))
+			last = seq // skip the bad row but advance past it
+			n++
+			continue
+		}
+		select {
+		case out <- m:
+			last = seq
+			n++
+		case <-ctx.Done():
+			return n, last, ctx.Err()
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return n, last, err
+	}
+	return n, last, nil
+}
+
+func selectQuery(agent string, topics []string, cursor int64, batch int) (string, []any) {
+	var sb strings.Builder
+	sb.WriteString(`SELECT seq, id, conversation_id, in_reply_to, from_agent, to_agent, to_topic, intent, body, ts, deadline FROM messages WHERE seq > ? AND (to_agent = ?`)
+	args := []any{cursor, agent}
+	if len(topics) > 0 {
+		sb.WriteString(` OR (to_topic IN (`)
+		for i, t := range topics {
+			if i > 0 {
+				sb.WriteString(",")
+			}
+			sb.WriteString("?")
+			args = append(args, t)
+		}
+		sb.WriteString(`) AND from_agent <> ?)`)
+		args = append(args, agent)
+	}
+	sb.WriteString(`) ORDER BY seq LIMIT ?`)
+	args = append(args, batch)
+	return sb.String(), args
+}
+
+func buildMessage(id, conv, inReplyTo, fromAgent, toAgent, toTopic, intent, bodyS, ts string, deadline sql.NullString) (protocol.Message, error) {
+	m := protocol.Message{
+		ID:             id,
+		ConversationID: conv,
+		InReplyTo:      inReplyTo,
+		From:           protocol.Address{Agent: fromAgent},
+		To:             protocol.Address{Agent: toAgent, Topic: toTopic},
+		Intent:         protocol.Intent(intent),
+	}
+	if bodyS != "" {
+		var body map[string]any
+		if err := json.Unmarshal([]byte(bodyS), &body); err != nil {
+			return protocol.Message{}, err
+		}
+		m.Body = body
+	}
+	t, err := time.Parse(time.RFC3339Nano, ts)
+	if err != nil {
+		return protocol.Message{}, err
+	}
+	m.Timestamp = t
+	if deadline.Valid && deadline.String != "" {
+		d, err := time.Parse(time.RFC3339Nano, deadline.String)
+		if err != nil {
+			return protocol.Message{}, err
+		}
+		m.Deadline = d
+	}
+	return m, nil
+}
+
+// saveCursor persists an agent's read position. Errors are non-fatal (reported
+// via the error hook); the read side is wired in Task 4.
+func (b *Bus) saveCursor(ctx context.Context, agent string, seq int64) {
+	_, err := b.db.ExecContext(ctx,
+		`INSERT INTO cursors (agent, last_seq) VALUES (?, ?)
+		 ON CONFLICT(agent) DO UPDATE SET last_seq = excluded.last_seq`,
+		agent, seq)
+	if err != nil && ctx.Err() == nil {
+		b.onErr(fmt.Errorf("save cursor for %q: %w", agent, err))
+	}
 }

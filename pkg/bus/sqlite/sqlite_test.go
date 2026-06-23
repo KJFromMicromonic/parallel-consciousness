@@ -6,9 +6,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/bus"
 	"github.com/KJFromMicromonic/parallel-consciousness/pkg/bus/sqlite"
 	"github.com/KJFromMicromonic/parallel-consciousness/pkg/protocol"
 )
@@ -84,4 +86,141 @@ func TestPublishInsertsRow(t *testing.T) {
 	if !strings.Contains(body, `"version":"c3d4"`) {
 		t.Fatalf("body = %q", body)
 	}
+}
+
+// recv reads one message or fails after 2s.
+func recv(t *testing.T, ch <-chan protocol.Message) protocol.Message {
+	t.Helper()
+	select {
+	case m := <-ch:
+		return m
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for message")
+		return protocol.Message{}
+	}
+}
+
+// expectNone asserts nothing arrives within d.
+func expectNone(t *testing.T, ch <-chan protocol.Message, d time.Duration) {
+	t.Helper()
+	select {
+	case m := <-ch:
+		t.Fatalf("unexpected message: %+v", m)
+	case <-time.After(d):
+	}
+}
+
+func openBus(t *testing.T, ctx context.Context) (*sqlite.Bus, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "bus.db")
+	b, err := sqlite.Open(ctx, path, sqlite.WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	return b, path
+}
+
+func inform(from, toAgent, text string) protocol.Message {
+	return protocol.New(protocol.Address{Agent: from}, protocol.Address{Agent: toAgent},
+		protocol.IntentInform, map[string]any{"text": text})
+}
+
+func TestImplementsBusInterface(t *testing.T) {
+	var _ bus.Bus = (*sqlite.Bus)(nil)
+}
+
+func TestSubscribeDirectDelivery(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b, _ := openBus(t, ctx)
+
+	ch, err := b.Subscribe(ctx, "a", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Publish(ctx, inform("b", "a", "hi")); err != nil {
+		t.Fatal(err)
+	}
+	if m := recv(t, ch); m.Body["text"] != "hi" || m.From.Agent != "b" {
+		t.Fatalf("got %+v", m)
+	}
+}
+
+func TestSubscribeTopicSkipsSender(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b, _ := openBus(t, ctx)
+
+	ch, err := b.Subscribe(ctx, "a", []string{"t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// a broadcasts to its own topic; must not receive its own message.
+	topicMsg := protocol.New(protocol.Address{Agent: "a"}, protocol.Address{Topic: "t"},
+		protocol.IntentInform, map[string]any{"text": "self"})
+	if err := b.Publish(ctx, topicMsg); err != nil {
+		t.Fatal(err)
+	}
+	expectNone(t, ch, 100*time.Millisecond)
+}
+
+func TestSubscribeOrderedPerRecipient(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b, _ := openBus(t, ctx)
+
+	ch, err := b.Subscribe(ctx, "a", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		if err := b.Publish(ctx, inform("b", "a", "m"+string(rune('0'+i)))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 10; i++ {
+		want := "m" + string(rune('0'+i))
+		if m := recv(t, ch); m.Body["text"] != want {
+			t.Fatalf("position %d: got %v want %q", i, m.Body["text"], want)
+		}
+	}
+}
+
+func TestSubscribeInboxIsolation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b, _ := openBus(t, ctx)
+
+	chA, err := b.Subscribe(ctx, "a", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chB, err := b.Subscribe(ctx, "b", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Publish(ctx, inform("c", "a", "for-a")); err != nil {
+		t.Fatal(err)
+	}
+	if m := recv(t, chA); m.Body["text"] != "for-a" {
+		t.Fatalf("a got %+v", m)
+	}
+	expectNone(t, chB, 100*time.Millisecond)
+}
+
+func TestNewAgentStartsAtHead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b, _ := openBus(t, ctx)
+
+	// Publish before anyone subscribes; a new agent should NOT see history.
+	if err := b.Publish(ctx, inform("b", "a", "old")); err != nil {
+		t.Fatal(err)
+	}
+	ch, err := b.Subscribe(ctx, "a", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectNone(t, ch, 100*time.Millisecond)
 }
