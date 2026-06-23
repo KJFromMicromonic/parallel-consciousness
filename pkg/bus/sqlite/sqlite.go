@@ -298,3 +298,14 @@ func (b *Bus) saveCursor(ctx context.Context, agent string, seq int64) {
 		b.onErr(fmt.Errorf("save cursor for %q: %w", agent, err))
 	}
 }
+
+// Prune deletes messages with seq < beforeSeq and returns the number removed.
+// Cursors are untouched; callers prune only below positions all subscribers have
+// already passed.
+func (b *Bus) Prune(ctx context.Context, beforeSeq int64) (int64, error) {
+	res, err := b.db.ExecContext(ctx, `DELETE FROM messages WHERE seq < ?`, beforeSeq)
+	if err != nil {
+		return 0, fmt.Errorf("prune: %w", err)
+	}
+	return res.RowsAffected()
+}

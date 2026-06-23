@@ -304,3 +304,35 @@ func TestReplayFromZero(t *testing.T) {
 		}
 	}
 }
+
+func TestPruneRemovesOldRows(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b, path := openBus(t, ctx)
+
+	for _, txt := range []string{"a", "b", "c", "d"} {
+		if err := b.Publish(ctx, inform("x", "y", txt)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	removed, err := b.Prune(ctx, 3) // delete seq 1 and 2
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 2 {
+		t.Fatalf("removed = %d, want 2", removed)
+	}
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("remaining = %d, want 2", count)
+	}
+}
