@@ -25,6 +25,7 @@ const (
 	IntentInform   Intent = "inform"   // FYI, no response required
 	IntentBlock    Intent = "block"    // "I am blocked on you" (escalates)
 	IntentDone     Intent = "done"     // a request was completed
+	IntentReady    Intent = "ready"    // "I'm at a compatible state for a gate"
 
 	// Control plane
 	IntentAck   Intent = "ack"   // I received your message
@@ -94,7 +95,7 @@ func (m Message) Reply(from Address, intent Intent, body map[string]any) Message
 // inform and the control acks are terminal; the rest expect a turn back.
 func (i Intent) WantsResponse() bool {
 	switch i {
-	case IntentInform, IntentAck, IntentNack, IntentYield, IntentDone:
+	case IntentInform, IntentAck, IntentNack, IntentYield, IntentDone, IntentReady:
 		return false
 	default:
 		return true
