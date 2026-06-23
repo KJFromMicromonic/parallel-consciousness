@@ -8,6 +8,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -135,10 +136,23 @@ func (b *Bus) Subscribe(ctx context.Context, agent string, topics []string) (<-c
 	return out, nil
 }
 
-// initCursor decides where a subscription starts. Until Task 4 wires durable
-// resume, a new agent starts at the current head of the log.
+// initCursor decides where a subscription starts: a returning agent (cursor row
+// present) resumes after its last_seq; a new agent starts at head, or at 0 if
+// WithReplayFromZero was set.
 func (b *Bus) initCursor(ctx context.Context, agent string) (int64, error) {
-	return b.headSeq(ctx)
+	var last int64
+	err := b.db.QueryRowContext(ctx, `SELECT last_seq FROM cursors WHERE agent = ?`, agent).Scan(&last)
+	switch {
+	case err == nil:
+		return last, nil
+	case errors.Is(err, sql.ErrNoRows):
+		if b.replayZero {
+			return 0, nil
+		}
+		return b.headSeq(ctx)
+	default:
+		return 0, fmt.Errorf("load cursor for %q: %w", agent, err)
+	}
 }
 
 func (b *Bus) headSeq(ctx context.Context) (int64, error) {
