@@ -57,6 +57,9 @@ func ServeRunner(a *agent.Agent, fn func(ctx context.Context, gateID string, ver
 		if gateID == "" {
 			return nil // not a gate request; ignore
 		}
+		// NOTE: in-memory bus only — it passes Body by reference, so versions is
+		// a map[string]string. A serializing transport (JSON/Kafka) would deliver
+		// map[string]any here; revisit when the transport adapter lands.
 		versions, _ := m.Body["versions"].(map[string]string)
 		v := fn(ctx, gateID, versions)
 		intent := protocol.IntentDone
@@ -122,8 +125,19 @@ func (c *Coordinator) Register(spec Spec) {
 }
 
 // OnVerdict registers a hook called with every resolved verdict. Useful for
-// logging and tests.
-func (c *Coordinator) OnVerdict(fn func(Verdict)) { c.onVerdict = fn }
+// logging and tests. Guarded by c.mu so it is safe to set alongside the other
+// configuration setters; the hook is read via verdictHook from resolve.
+func (c *Coordinator) OnVerdict(fn func(Verdict)) {
+	c.mu.Lock()
+	c.onVerdict = fn
+	c.mu.Unlock()
+}
+
+func (c *Coordinator) verdictHook() func(Verdict) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.onVerdict
+}
 
 func (c *Coordinator) gate(id string) *gateState {
 	c.mu.Lock()
@@ -235,8 +249,8 @@ func (c *Coordinator) resolve(ctx context.Context, gs *gateState, v Verdict, sta
 		}
 	}
 
-	if c.onVerdict != nil {
-		c.onVerdict(v)
+	if hook := c.verdictHook(); hook != nil {
+		hook(v)
 	}
 }
 
