@@ -71,4 +71,6 @@ v0.1 — runnable demo + protocol spec. See [PROTOCOL.md](./PROTOCOL.md).
 
 ## License
 
-Apache-2.0 (suggested).
+Licensed under the [Apache License 2.0](./LICENSE).
+
+Copyright 2026 Micromonic Digital Inc.
