@@ -380,3 +380,31 @@ func TestCrossProcessDelivery(t *testing.T) {
 		t.Fatalf("cross-process delivered %+v", m)
 	}
 }
+
+func TestCloseStopsSubscription(t *testing.T) {
+	ctx := context.Background() // deliberately NOT cancelled — Close must stop the poller
+	path := filepath.Join(t.TempDir(), "bus.db")
+	b, err := sqlite.Open(ctx, path, sqlite.WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, err := b.Subscribe(ctx, "a", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// The poller must stop and close the channel promptly (drain any buffered msgs).
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case _, ok := <-ch:
+			if !ok {
+				return // channel closed — poller stopped cleanly
+			}
+		case <-deadline:
+			t.Fatal("Close did not stop the subscription: channel never closed")
+		}
+	}
+}

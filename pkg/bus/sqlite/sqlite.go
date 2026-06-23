@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -64,6 +65,8 @@ type Bus struct {
 	batch      int
 	onErr      func(error)
 	replayZero bool
+	closed     chan struct{}
+	closeOnce  sync.Once
 }
 
 // Open opens (creating if needed) the SQLite database at path and ensures the schema exists.
@@ -78,10 +81,11 @@ func Open(ctx context.Context, path string, opts ...Option) (*Bus, error) {
 		return nil, fmt.Errorf("connect sqlite %q: %w", path, err)
 	}
 	b := &Bus{
-		db:    db,
-		poll:  25 * time.Millisecond,
-		batch: 256,
-		onErr: func(err error) { log.Printf("sqlite bus: %v", err) },
+		db:     db,
+		poll:   25 * time.Millisecond,
+		batch:  256,
+		onErr:  func(err error) { log.Printf("sqlite bus: %v", err) },
+		closed: make(chan struct{}),
 	}
 	for _, o := range opts {
 		o(b)
@@ -93,8 +97,11 @@ func Open(ctx context.Context, path string, opts ...Option) (*Bus, error) {
 	return b, nil
 }
 
-// Close closes the underlying database.
-func (b *Bus) Close() error { return b.db.Close() }
+// Close stops all subscription pollers and closes the underlying database.
+func (b *Bus) Close() error {
+	b.closeOnce.Do(func() { close(b.closed) })
+	return b.db.Close()
+}
 
 // Publish appends a message to the log.
 func (b *Bus) Publish(ctx context.Context, m protocol.Message) error {
@@ -176,6 +183,11 @@ func (b *Bus) poll_(ctx context.Context, agent string, topics []string, cursor i
 			if ctx.Err() != nil {
 				return
 			}
+			select {
+			case <-b.closed:
+				return
+			default:
+			}
 			b.onErr(err)
 		} else {
 			if next > cursor {
@@ -188,6 +200,8 @@ func (b *Bus) poll_(ctx context.Context, agent string, topics []string, cursor i
 		}
 		select {
 		case <-ctx.Done():
+			return
+		case <-b.closed:
 			return
 		case <-ticker.C:
 		}
