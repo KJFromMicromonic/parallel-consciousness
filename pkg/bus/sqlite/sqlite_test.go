@@ -381,6 +381,33 @@ func TestCrossProcessDelivery(t *testing.T) {
 	}
 }
 
+func TestCloseUnblocksStalledPoller(t *testing.T) {
+	ctx := context.Background() // not cancelled — Close must unblock the poller
+	path := filepath.Join(t.TempDir(), "bus.db")
+	b, err := sqlite.Open(ctx, path, sqlite.WithPollInterval(5*time.Millisecond), sqlite.WithBatchSize(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Subscribe but never drain ch: the consumer stalls with a full buffer.
+	if _, err := b.Subscribe(ctx, "a", nil); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		if err := b.Publish(ctx, inform("x", "a", "m")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(50 * time.Millisecond) // let the poller fill the buffer and block on send
+
+	done := make(chan error, 1)
+	go func() { done <- b.Close() }()
+	select {
+	case <-done: // Close returned — no deadlock
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close hung: poller blocked on send did not observe b.closed")
+	}
+}
+
 func TestCloseStopsSubscription(t *testing.T) {
 	ctx := context.Background() // deliberately NOT cancelled — Close must stop the poller
 	path := filepath.Join(t.TempDir(), "bus.db")

@@ -20,6 +20,8 @@ import (
 	"github.com/KJFromMicromonic/parallel-consciousness/pkg/protocol"
 )
 
+var errBusClosed = errors.New("sqlite bus: closed")
+
 const schema = `
 CREATE TABLE IF NOT EXISTS messages (
   seq             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -241,6 +243,8 @@ func (b *Bus) deliverBatch(ctx context.Context, agent string, topics []string, c
 			n++
 		case <-ctx.Done():
 			return n, last, ctx.Err()
+		case <-b.closed:
+			return n, last, errBusClosed
 		}
 	}
 	if err := rows.Err(); err != nil {
