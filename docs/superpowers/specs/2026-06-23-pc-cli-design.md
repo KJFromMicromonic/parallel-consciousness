@@ -31,9 +31,11 @@ for the harnesses that have it — over one implementation so they never drift.
    an agent name. Nothing tied to a specific harness.
 3. **Reuse the durable log.** `pc` adds no new coordination semantics; it drives
    `pkg/gate` over `pkg/bus/sqlite`. `Submit`'s correctness rides the durable cursor.
-4. **Hold the `go 1.22` floor.** New deps (`go-sdk`, a YAML lib) are pinned to keep
-   the module at `go 1.22`; if impossible, isolate `cmd/pc` as a nested module
-   (fallback B) so the importable library stays pristine.
+4. **Floor: `go 1.23` (resolved 2026-06-23).** The MCP `go-sdk` hard-requires
+   `go 1.23` (every release v0.2.0–v1.2.0 was probed; none supports 1.22). Rather
+   than carry a permanent second module to preserve `go 1.22`, the project bumps to
+   a single-module `go 1.23` floor — a widely-available release with near-zero
+   consumer friction. No cgo is introduced; pure-Go stays intact.
 
 ## Scope
 
@@ -43,7 +45,7 @@ for the harnesses that have it — over one implementation so they never drift.
 - `.pc.yaml` config (DB + gate definitions) with env overrides.
 - An MCP server (`pc mcp`) exposing `submit_to_gate` and `gate_status`, built on
   `github.com/modelcontextprotocol/go-sdk`.
-- New deps: `go-sdk` + a YAML lib, pinned to keep `go 1.22`.
+- New deps: `go-sdk` (v1.2.0) + `gopkg.in/yaml.v3`; the module floor moves to `go 1.23`.
 
 **Out of scope (deferred):**
 - **The WebUI ("Slack for Agents") — the NEXT milestone**, its own brainstorm →
@@ -164,16 +166,17 @@ tools):
 
 Tool handlers are thin wrappers over `pcops`; no MCP/JSON-RPC logic is hand-rolled.
 
-## Dependency & `go 1.22` Floor (Approach A; B as committed fallback)
+## Dependency & Go Floor (resolved: single module, `go 1.23`)
 
-- Add `github.com/modelcontextprotocol/go-sdk` and `gopkg.in/yaml.v3`, **pinned to
-  the newest versions that keep `go.mod` at `go 1.22`** — verified the way
-  `modernc v1.33.1` was (the dependency-setup task confirms the floor holds before
-  anything builds on it). Remove any `toolchain` line a `go get` introduces.
-- **Fallback B (only if no `go-sdk` release supports `go 1.22`):** stop and confirm
-  with the maintainer, then move `cmd/pc` into its own nested module
-  (`cmd/pc/go.mod` requiring the library module) so the importable `pkg/...` library
-  stays `go 1.22` with only `modernc`/`uuid`; a `go.work` covers local dev.
+- **Probe result (2026-06-23):** every `go-sdk` release (v0.2.0–v1.2.0) requires
+  `go 1.23`; there is no `go 1.22`-compatible version. `gopkg.in/yaml.v3` (v3.0.1)
+  holds `go 1.22`/`1.23`.
+- **Decision (maintainer, 2026-06-23):** bump the single module's `go` directive to
+  `go 1.23` and add `github.com/modelcontextprotocol/go-sdk` (v1.2.0) +
+  `gopkg.in/yaml.v3` (v3.0.1). Remove any `toolchain` line `go get` introduces. The
+  nested-module fallback (B) is **not** used — simplicity over preserving the 1.22
+  floor, given 1.23 is widely available.
+- No cgo is introduced; the project stays pure-Go.
 
 ## File Layout
 
@@ -183,7 +186,7 @@ internal/pcops/pcops_test.go   ops tested over a temp SQLite bus
 cmd/pc/main.go                 subcommand + flag parsing → pcops → exit codes
 cmd/pc/mcp.go                  pc mcp: go-sdk server, tools → pcops
 .pc.yaml.example               documented sample config
-go.mod / go.sum                + go-sdk + gopkg.in/yaml.v3 (pinned to hold go 1.22)
+go.mod / go.sum                + go-sdk v1.2.0 + gopkg.in/yaml.v3; floor → go 1.23
 ```
 
 `internal/pcops` imports the public `pkg/...`; no import cycle. `cmd/demo`,
