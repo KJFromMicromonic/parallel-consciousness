@@ -153,9 +153,9 @@ type Budget struct {
 
 type Session interface {
 	Events() <-chan Event                        // closed when the session ends
-	Steer(ctx context.Context, s string) error   // redirect the CURRENT turn
-	Follow(ctx context.Context, s string) error  // queue for AFTER the current turn
-	Interrupt(ctx context.Context) error         // abort the turn; session survives
+	Steer(ctx context.Context, s string) error   // deliver at the next turn boundary
+	Follow(ctx context.Context, s string) error  // queue behind pending work
+	Interrupt(ctx context.Context) error         // preempt: abort in-flight tool, then the turn
 	Close(ctx context.Context) error             // terminate
 	Wait(ctx context.Context) (Outcome, error)
 }
@@ -163,22 +163,29 @@ type Session interface {
 type EventKind string
 
 const (
-	KindStarted   EventKind = "started"
-	KindTurnBegan EventKind = "turn_began"
-	KindTurnEnded EventKind = "turn_ended"
-	KindToolUsed  EventKind = "tool_used"
-	KindIdle      EventKind = "idle"
-	KindErrored   EventKind = "errored"
-	KindExited    EventKind = "exited"
+	KindStarted      EventKind = "started"
+	KindTurnBegan    EventKind = "turn_began"
+	KindTurnEnded    EventKind = "turn_ended"
+	KindToolUsed     EventKind = "tool_used"
+	KindQueueChanged EventKind = "queue_changed"
+	KindIdle         EventKind = "idle"
+	KindErrored      EventKind = "errored"
+	KindExited       EventKind = "exited"
 )
 
 type Event struct {
-	Kind  EventKind
-	At    time.Time
-	Agent string
-	Tool  *ToolUse // set when Kind == KindToolUsed
-	Err   string
+	Kind    EventKind
+	At      time.Time
+	Agent   string
+	Tool    *ToolUse // set when Kind == KindToolUsed
+	Pending *Queue   // set when Kind == KindQueueChanged
+	Err     string
 }
+
+// Queue reports what the adapter has accepted but not yet applied — the
+// delivery receipt that separates "delivered" from "acted on". The day-0 spike
+// measured those diverging by 23 seconds during a single bash call.
+type Queue struct{ Steering, FollowUp int }
 
 type ToolUse struct {
 	Name   string // read, write, edit, bash, grep, find, ls
@@ -215,10 +222,13 @@ Design decisions:
   the seam through which pi-isms reach callers, and no import test would catch
   it. The adapter writes raw JSONL frames to a per-session transcript file
   instead, preserving debuggability without leaking the boundary.
-- **Three control verbs, because the protocol already needs three.**
-  `IntentBlock` maps to `Steer` (urgent, mid-turn — the analogue of the existing
-  `urgent` channel), ordinary intents map to `Follow` (turn boundary), and an
-  operator stop maps to `Interrupt`.
+- **Three control verbs, with `Steer` deliberately *not* a preemption
+  primitive.** The day-0 spike established that pi accepts a steer during an
+  in-flight tool call, reports it in a queue, and applies it only once the tool
+  finishes — measured at 23 seconds behind a `sleep 25`. `Steer` therefore means
+  "deliver at the next turn boundary." `IntentBlock` maps to `Steer`, ordinary
+  intents map to `Follow`, and only an operator stop or budget kill maps to
+  `Interrupt`, which alone preempts in-flight work.
 - **Wall-clock budget is enforced; tokens are reported.** Token enforcement
   requires a policy decision (kill, warn, or degrade the model) that this slice
   does not need to make.
@@ -278,8 +288,16 @@ keeping.
 
 **Framing.** pi requires records to be split on `\n` only. Go's
 `bufio.ScanLines` satisfies this, but `bufio.Scanner`'s default 64KB token limit
-would truncate streaming assistant messages and large tool results. The adapter
-uses `bufio.Reader.ReadBytes('\n')` with no size cap.
+would truncate large frames. The adapter uses `bufio.Reader.ReadBytes('\n')` with
+no size cap.
+
+This is measured, not theoretical. The day-0 spike observed a **65,590-byte
+frame** — past `bufio.Scanner`'s 65,536-byte default — from a single ordinary
+bash command, emitted as a streaming `bash_execution_update` chunk. Those chunks
+are *not* subject to the 51,200-byte truncation pi applies to `response`
+payloads, so the cap is reachable trivially. The same probe confirmed that
+`ReadBytes` preserves U+2028 inside a payload, where Node's `readline` would
+split on it.
 
 Event mapping:
 
@@ -288,6 +306,7 @@ Event mapping:
 | `agent_start` | `started` on first occurrence, else `turn_began` |
 | `turn_start` / `turn_end` | `turn_began` / `turn_ended` |
 | `tool_execution_end`, `bash_execution_update` | `tool_used` with `ToolUse` |
+| `queue_update` | `queue_changed` with pending counts |
 | `agent_settled` | `idle` |
 | `agent_end` | dropped deliberately |
 | `extension_error`, error frames | `errored` |
@@ -300,7 +319,7 @@ Command mapping:
 |---|---|
 | `Steer` | `{"type":"steer","message":…}` |
 | `Follow` | `{"type":"follow_up","message":…}` |
-| `Interrupt` | `clear_queue` then `abort` (pi's documented order; `abort` alone continues queued messages) |
+| `Interrupt` | `abort_bash` (if a tool is in flight), then `clear_queue`, then `abort` |
 | `Close` | `abort`, then terminate the process |
 
 pi's version is pinned per scenario. The conformance suite is the canary for
@@ -319,9 +338,20 @@ Claude Code.
 on the bus. Handlers translate intents into session verbs:
 
 ```text
-IntentBlock      -> session.Steer()    // urgent, mid-turn
-all other intents -> session.Follow()  // at the turn boundary
+IntentBlock       -> session.Steer()   // queued; applied at the next turn boundary
+all other intents -> session.Follow()  // queued behind pending work
 ```
+
+Neither path preempts. A `block` arriving while an agent is running its test
+suite waits for that suite to finish, which is the correct trade: aborting the
+tool would destroy work the agent is seconds from reporting. `Interrupt` — the
+only preempting verb — is reserved for operator stop and budget kill.
+
+**The courier drops any message whose `From.Agent` equals its own identity.** The
+spike found that `pkg/bus/sqlite` applies sender filtering only on the topic
+path, so a self-addressed direct message *is* delivered. Without this guard, a
+model that ran `pc send` addressed to itself would have its own message steered
+back at it.
 
 Because delivery is pushed, **`pc inbox` is unnecessary**, and with it the
 "did the model remember to poll?" failure mode.
@@ -467,7 +497,8 @@ would not be tested.
 ## Build order
 
 ```text
-day-0 spike
+day-0 spike  (complete — see the findings note)
+  -> pkg/bus/sqlite cursor monotonicity fix   (prerequisite, see below)
   -> pkg/workspace
   -> pkg/runtime + fake + runtimetest
   -> cmd/pc (submit, send, up, run-gate, watch)
@@ -482,36 +513,51 @@ surrounding it is proven.
 
 ## Day-0 spike
 
-Timeboxed to one day. The code is throwaway and labeled as such; the output is a
-findings note that amends this spec before implementation planning begins.
+**Complete.** All five questions answered against pi `0.84.4`; results and
+evidence in
+[2026-09-01-day-0-spike-findings.md](./2026-09-01-day-0-spike-findings.md). The
+amendments they produced are already folded into the sections above.
 
-1. Can Go spawn `pi --mode rpc`, prompt it, and read events through to
-   `agent_settled`?
-2. Does an injected `steer` land mid-turn and visibly change the agent's
-   behavior?
-3. Does `steer` land while a `bash` tool call is in flight? If it does not, the
-   courier must queue urgent messages and deliver them at the turn boundary,
-   which is a material change to the wiring above.
-4. Does the bus's skip-sender filter apply across processes keyed on agent name?
-   If it does not, a courier subscribed as `A` will receive `A`'s own outbound
-   `pc send` and steer the agent with its own message.
-5. Do real assistant and tool frames exceed 64KB in practice?
+### Prerequisite fix: cursor monotonicity
+
+The spike found a latent bug in shipped code. `saveCursor` upserts the stored
+position unconditionally, and two subscribers sharing an agent name share one
+`cursors` row. A short-lived subscriber exiting behind a long-lived one rewinds
+the stored cursor, so the next subscription under that name replays consumed
+messages — replaying a `block` would re-steer an agent about a resolved failure.
+
+Unreachable today, and reachable the moment the courier ships alongside
+`pc submit`. The fix guards monotonicity:
+
+```sql
+ON CONFLICT(agent) DO UPDATE SET last_seq = MAX(cursors.last_seq, excluded.last_seq)
+```
+
+It lands first, with a regression test in `pkg/bus/bustest` so both transports
+are held to it.
 
 ## Open questions
 
-- Whether pi's `steer` is accepted during an in-flight tool call (spike item 3).
-  The courier's urgent path depends on the answer.
-- Cross-process sender filtering in `pkg/bus/sqlite` (spike item 4).
 - Whether role framing in the initial prompt is sufficient to hold an agent
   inside its own service, or whether `.pi/APPEND_SYSTEM.md` with `-a` is needed.
 - Model selection per role, and its cost profile, which the PoC will measure
   rather than assume.
+- Whether the courier should ever escalate a `block` to a preempting
+  `Interrupt` — for instance when the in-flight tool has already outlived the
+  gate's own deadline. Deferred until the PoC shows real latencies.
+- Whether the `go 1.23` floor from `97664d7` can revert to `1.22` for this
+  slice, since it was forced solely by the MCP `go-sdk` and `pc mcp` is cut.
 
 ## Known limitations
 
 - Worktree isolation bounds visibility, not capability: an agent can still write
   outside its tree. Real containment requires the deferred container boundary.
 - Token budgets are observed, not enforced.
+- Urgent delivery is not preemption: a `block` reaches a working agent only at
+  its next turn boundary, bounded by the duration of the tool call in flight.
+- A parked agent — one blocked inside `pc submit` — cannot be reached by the push
+  path at all until that call returns, up to the submit timeout. Gate verdicts
+  arrive as the command's exit code precisely because of this.
 - Single machine, single repository, one gate.
 - pi is pinned; event-name churn across pi releases will surface as conformance
   failures requiring adapter updates.
