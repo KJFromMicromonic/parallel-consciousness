@@ -11,3 +11,6 @@ conclave.tar.gz
 
 # Local tooling index (not part of the project)
 .codegraph/
+
+# SDD scratch (ledger, briefs, review packages)
+.superpowers/
