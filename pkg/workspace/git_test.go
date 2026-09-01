@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,12 +42,46 @@ func TestWorktreeAddCreatesIsolatedTree(t *testing.T) {
 		t.Fatalf("worktree missing seed file: %v", err)
 	}
 
-	// A write in the worktree must not appear in the origin repo.
-	if err := os.WriteFile(filepath.Join(wt, "only-here.txt"), []byte("x\n"), 0o644); err != nil {
+	// Worktree is registered with git: verify it appears in worktree list.
+	out, err := exec.Command("git", "-C", repo, "worktree", "list").CombinedOutput()
+	if err != nil {
+		t.Fatalf("git worktree list: %v: %s", err, out)
+	}
+	if !contains(string(out), wt) {
+		t.Fatalf("worktree path not found in git worktree list:\n%s", out)
+	}
+
+	// Independent working trees: modify tracked file in the worktree.
+	// The worktree's index and working tree are independent from the origin repo.
+	wtContent := "modified in worktree\n"
+	if err := os.WriteFile(filepath.Join(wt, "README.md"), []byte(wtContent), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(repo, "only-here.txt")); !os.IsNotExist(err) {
-		t.Fatal("worktree write leaked into the origin repo")
+
+	// Verify origin repo's README.md still has original content.
+	repoContent, err := os.ReadFile(filepath.Join(repo, "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(repoContent) != "seed\n" {
+		t.Fatalf("origin repo README.md was modified: got %q", string(repoContent))
+	}
+
+	// Verify git status differs: worktree shows README.md modified, origin is clean.
+	wtStatus, err := exec.Command("git", "-C", wt, "status", "--porcelain").CombinedOutput()
+	if err != nil {
+		t.Fatalf("git -C worktree status: %v: %s", err, wtStatus)
+	}
+	if !contains(string(wtStatus), "README.md") {
+		t.Fatalf("worktree git status should show README.md modified, got:\n%s", wtStatus)
+	}
+
+	repoStatus, err := exec.Command("git", "-C", repo, "status", "--porcelain").CombinedOutput()
+	if err != nil {
+		t.Fatalf("git -C repo status: %v: %s", err, repoStatus)
+	}
+	if string(repoStatus) != "" {
+		t.Fatalf("origin repo should be clean, got status:\n%s", repoStatus)
 	}
 
 	if err := worktreeRemove(repo, wt); err != nil {
@@ -55,4 +90,9 @@ func TestWorktreeAddCreatesIsolatedTree(t *testing.T) {
 	if _, err := os.Stat(wt); !os.IsNotExist(err) {
 		t.Fatal("worktree directory still present after remove")
 	}
+}
+
+// contains is a helper to check if a substring is present in a string.
+func contains(haystack, needle string) bool {
+	return len(haystack) > 0 && len(needle) > 0 && (haystack == needle || bytes.Contains([]byte(haystack), []byte(needle)))
 }
