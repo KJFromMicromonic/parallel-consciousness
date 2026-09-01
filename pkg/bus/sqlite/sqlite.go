@@ -310,7 +310,7 @@ func buildMessage(id, conv, inReplyTo, fromAgent, toAgent, toTopic, intent, body
 func (b *Bus) saveCursor(ctx context.Context, agent string, seq int64) {
 	_, err := b.db.ExecContext(ctx,
 		`INSERT INTO cursors (agent, last_seq) VALUES (?, ?)
-		 ON CONFLICT(agent) DO UPDATE SET last_seq = excluded.last_seq`,
+		 ON CONFLICT(agent) DO UPDATE SET last_seq = MAX(cursors.last_seq, excluded.last_seq)`,
 		agent, seq)
 	if err != nil && ctx.Err() == nil {
 		b.onErr(fmt.Errorf("save cursor for %q: %w", agent, err))
