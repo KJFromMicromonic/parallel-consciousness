@@ -59,6 +59,32 @@ func TestStaleLeaseIsReclaimable(t *testing.T) {
 	}
 }
 
+func TestStaleLeaseBranchMismatchIsRejected(t *testing.T) {
+	ctx := context.Background()
+	repo := newRepo(t)
+	m := newManager(t, repo)
+	m.SetTTL(30 * time.Millisecond)
+
+	if _, err := m.Acquire(ctx, "gateway", "agent/gateway"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(60 * time.Millisecond) // holder "crashed": no heartbeat
+
+	_, err := m.Acquire(ctx, "gateway", "agent/gateway-v2")
+	if err == nil {
+		t.Fatal("reclaim with mismatched branch should have failed")
+	}
+	if !contains(err.Error(), "agent/gateway") || !contains(err.Error(), "agent/gateway-v2") {
+		t.Fatalf("error should name both branches, got: %v", err)
+	}
+
+	// Lease row must have been rolled back: a reclaim with the correct
+	// branch should now succeed.
+	if _, err := m.Acquire(ctx, "gateway", "agent/gateway"); err != nil {
+		t.Fatalf("reclaim with correct branch after rollback: %v", err)
+	}
+}
+
 func TestHeartbeatKeepsLeaseHeld(t *testing.T) {
 	ctx := context.Background()
 	repo := newRepo(t)

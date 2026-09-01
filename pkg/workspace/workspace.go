@@ -111,6 +111,24 @@ func (m *Manager) Acquire(ctx context.Context, agent, branch string) (*Lease, er
 			_, _ = m.db.ExecContext(ctx, `DELETE FROM leases WHERE path = ?`, path)
 			return nil, err
 		}
+	} else {
+		// Reattach path: the worktree on disk belongs to whatever branch the
+		// crashed holder had checked out, which may not be the branch this
+		// caller is asking for now (the lease is keyed by agent, not by
+		// branch). We never silently check out a different branch here —
+		// doing so during crash recovery could orphan or discard the crashed
+		// holder's committed work, and a reclaim naming a different branch is
+		// a genuine ownership conflict the caller needs to see, not something
+		// to paper over. So verify and fail loudly on mismatch instead.
+		onDisk, err := worktreeBranch(path)
+		if err != nil {
+			_, _ = m.db.ExecContext(ctx, `DELETE FROM leases WHERE path = ?`, path)
+			return nil, err
+		}
+		if onDisk != branch {
+			_, _ = m.db.ExecContext(ctx, `DELETE FROM leases WHERE path = ?`, path)
+			return nil, fmt.Errorf("workspace: reclaim of agent %q at %s found branch %q checked out, requested %q", agent, path, onDisk, branch)
+		}
 	}
 	return &Lease{Agent: agent, Path: path, Branch: branch, m: m}, nil
 }

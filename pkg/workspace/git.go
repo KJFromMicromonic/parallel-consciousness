@@ -7,6 +7,7 @@ package workspace
 import (
 	"fmt"
 	"os/exec"
+	"strings"
 )
 
 // worktreeAdd creates (or resets) branch at the repo's HEAD and checks it out
@@ -29,4 +30,15 @@ func worktreeRemove(repo, path string) error {
 		return fmt.Errorf("git worktree remove %s: %w: %s", path, err, out)
 	}
 	return nil
+}
+
+// worktreeBranch reports the branch currently checked out at path. Used by
+// Acquire to verify a reclaimed worktree is actually on the branch being
+// requested before handing it back as a Lease.
+func worktreeBranch(path string) (string, error) {
+	out, err := exec.Command("git", "-C", path, "symbolic-ref", "--short", "HEAD").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("git symbolic-ref %s: %w: %s", path, err, out)
+	}
+	return strings.TrimSpace(string(out)), nil
 }
