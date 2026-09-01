@@ -78,7 +78,7 @@ func (s *session) loop() {
 	for {
 		select {
 		case <-s.done:
-			s.emit(runtime.Event{Kind: runtime.KindExited})
+			s.emitFinal(runtime.Event{Kind: runtime.KindExited})
 			return
 		case actions := <-s.work:
 			s.emit(runtime.Event{Kind: runtime.KindTurnBegan})
@@ -122,6 +122,23 @@ func (s *session) emit(ev runtime.Event) {
 	select {
 	case s.events <- ev:
 	case <-s.done:
+	}
+}
+
+// emitFinal sends the exit-path event with a non-blocking send instead of
+// racing it against s.done via the ordinary emit select. By the time loop()
+// takes its <-s.done branch, done is already closed, so an ordinary select
+// {send, <-done} would have both cases ready and Go would pick uniformly at
+// random between them — dropping the terminal event roughly half the time
+// even with an active reader. A non-blocking send delivers it whenever the
+// buffer has room (with capacity 256, effectively always) while still never
+// blocking or leaking loop() if the buffer is somehow full.
+func (s *session) emitFinal(ev runtime.Event) {
+	ev.At = time.Now()
+	ev.Agent = s.spec.Agent
+	select {
+	case s.events <- ev:
+	default:
 	}
 }
 

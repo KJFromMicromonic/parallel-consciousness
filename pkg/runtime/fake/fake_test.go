@@ -14,7 +14,12 @@ import (
 func TestFakeConformance(t *testing.T) {
 	runtimetest.Run(t, func(t *testing.T) runtime.Runtime {
 		return fake.New(map[string]fake.Script{
-			"a": {OnStart: []fake.Action{fake.Emit{Tool: runtime.ToolUse{Name: "read", Target: "x", Ok: true}}}},
+			"a": {
+				OnStart: []fake.Action{fake.Emit{Tool: runtime.ToolUse{Name: "read", Target: "x", Ok: true}}},
+				OnSteer: func(text string) []fake.Action {
+					return []fake.Action{fake.Emit{Tool: runtime.ToolUse{Name: "read", Target: "steer", Ok: true}}}
+				},
+			},
 		})
 	}, runtime.Spec{Agent: "a", Workdir: t.TempDir()})
 }
