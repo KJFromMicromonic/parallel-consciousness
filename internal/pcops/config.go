@@ -42,7 +42,7 @@ type Config struct {
 	Agents        []AgentDef
 	Runner        AgentDef
 	SubmitTimeout time.Duration
-	Wall          time.Duration
+	Wall          time.Duration // zero means unbounded
 }
 
 type rawConfig struct {
