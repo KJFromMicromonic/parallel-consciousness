@@ -46,7 +46,13 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 		if !ok {
 			return nil // not a verdict broadcast
 		}
-		detail, _ := m.Body["text"].(string)
+		// The broadcast carries one "text" line for both outcomes ("<gate>
+		// PASSED" / "<gate> FAILED: <detail>"); Detail is documented as
+		// empty on pass, so only surface it on failure.
+		var detail string
+		if !passed {
+			detail, _ = m.Body["text"].(string)
+		}
 		select {
 		case verdicts <- gate.Verdict{GateID: gateID, Passed: passed, Detail: detail}:
 		default:
