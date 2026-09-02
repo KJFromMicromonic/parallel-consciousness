@@ -683,3 +683,116 @@ func TestManyIdenticalResubmitsResolveOneRoundEachWithoutRunningAway(t *testing.
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+// TestOtherParticipantMovingInvalidatesTheCacheForEveryone encodes the exact
+// live-run sequence that exposed the submitter-only version guard: round 1
+// fails with gateway still on its old version; gateway then commits a fix
+// and resubmits a NEW version; billing resubmits its UNCHANGED version
+// immediately after. The submitter-only guard answered billing from the
+// round-1 cache (still FAILED) because it only ever compared billing's own
+// version — even though gateway's fix had already made the remembered
+// verdict stale for the combination as a whole. Since the cached path skips
+// recording readiness, gateway's fix was then simply never picked up.
+//
+// The fix must invalidate the remembered verdict the moment ANY required
+// participant's version diverges from what the remembered round tested, so
+// billing's very next unchanged resubmit records ordinary readiness instead
+// of a second stale answer, quorum completes with gateway's new version, and
+// a fresh round runs immediately.
+func TestOtherParticipantMovingInvalidatesTheCacheForEveryone(t *testing.T) {
+	var calls int32
+	runnerFn := func(gateID string, versions map[string]string) gate.Verdict {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			return gate.Verdict{GateID: gateID, Passed: false, Detail: "gateway still EUR"}
+		}
+		return gate.Verdict{GateID: gateID, Passed: true} // round 2: reflects gateway's fix
+	}
+	h := setupGate(t, checkoutSpec(), runnerFn)
+	defer h.cancel()
+
+	// Round 1: fails (gateway on its old version).
+	h.ready(t, "billing", "b1")
+	h.ready(t, "gateway", "eur1")
+	v := recvVerdict(t, h.verdict)
+	if v.Passed {
+		t.Fatalf("round 1 verdict = %+v, want failed", v)
+	}
+	recvMsg(t, h.informs)
+	recvMsg(t, h.blocks)
+	recvMsg(t, h.blocks)
+
+	// gateway fixes and resubmits a NEW version: this must invalidate the
+	// remembered verdict for the gate as a whole, not just for gateway.
+	h.ready(t, "gateway", "usd1")
+
+	// billing resubmits its version UNCHANGED. It must be recorded as
+	// ordinary readiness — NOT answered from the now-stale round-1 cache —
+	// completing quorum with gateway's new version and triggering a fresh
+	// round.
+	h.ready(t, "billing", "b1")
+
+	v2 := recvVerdict(t, h.verdict)
+	if !v2.Passed {
+		t.Fatalf("round 2 verdict = %+v, want passed (a fresh round reflecting gateway's fix)", v2)
+	}
+	if v2.Versions["gateway"] != "usd1" || v2.Versions["billing"] != "b1" {
+		t.Fatalf("round 2 versions = %v, want gateway=usd1 billing=b1", v2.Versions)
+	}
+	m := recvMsg(t, h.informs)
+	if text, _ := m.Body["text"].(string); strings.Contains(text, "already tested") {
+		t.Fatalf("round 2 inform text = %q, must NOT carry the cached-answer marker: this must be a fresh run, not a cached reply", text)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("runner invoked %d times, want exactly 2 (round 1 + the fresh round 2)", got)
+	}
+
+	// After this genuine resolve, the cache works again from that point:
+	// billing resubmits its round-2 version unchanged and gets an immediate
+	// cached PASS, with no third runner invocation.
+	h.ready(t, "billing", "b1")
+	v3 := recvVerdict(t, h.verdict)
+	if !v3.Passed {
+		t.Fatalf("post-invalidation cached verdict = %+v, want passed", v3)
+	}
+	m3 := recvMsg(t, h.informs)
+	if text, _ := m3.Body["text"].(string); !strings.Contains(text, "already tested at this version") {
+		t.Fatalf("post-invalidation inform text = %q, want the cached-answer marker", text)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("runner invoked %d times after the cached resubmit, want still 2 (no extra run)", got)
+	}
+}
+
+// TestBothParticipantsUnchangedStillAnsweredFromCache is the case the cache
+// is actually for: neither participant's version differs from the
+// remembered round, so neither resubmit invalidates it — both are answered
+// promptly from cache, in either order.
+func TestBothParticipantsUnchangedStillAnsweredFromCache(t *testing.T) {
+	h := setupGate(t, checkoutSpec(), passRunner)
+	defer h.cancel()
+
+	h.ready(t, "billing", "b1")
+	h.ready(t, "gateway", "g1")
+	recvVerdict(t, h.verdict)
+	recvMsg(t, h.informs)
+
+	h.ready(t, "billing", "b1")
+	v1 := recvVerdict(t, h.verdict)
+	if !v1.Passed {
+		t.Fatalf("billing's cached verdict = %+v, want passed", v1)
+	}
+	m1 := recvMsg(t, h.informs)
+	if text, _ := m1.Body["text"].(string); !strings.Contains(text, "already tested at this version") {
+		t.Fatalf("billing's cached inform text = %q, want the marker", text)
+	}
+
+	h.ready(t, "gateway", "g1")
+	v2 := recvVerdict(t, h.verdict)
+	if !v2.Passed {
+		t.Fatalf("gateway's cached verdict = %+v, want passed", v2)
+	}
+	m2 := recvMsg(t, h.informs)
+	if text, _ := m2.Body["text"].(string); !strings.Contains(text, "already tested at this version") {
+		t.Fatalf("gateway's cached inform text = %q, want the marker", text)
+	}
+}

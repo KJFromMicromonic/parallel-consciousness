@@ -117,6 +117,16 @@ type gateState struct {
 	// OnVerdict hook that round-caps a stuck participant — exactly as they
 	// are for a fresh round, so a repeat offender is still bounded.
 	//
+	// A second design mistake, also caught in a live run: the guard that
+	// decides whether the cache still applies must not compare only the
+	// asking participant's own version. An earlier version did exactly
+	// that, and one participant's fresh, passing resubmit was ignored
+	// because the OTHER, unchanged participant's resubmit was answered from
+	// a now-stale FAILED verdict — the cache never noticed the first
+	// participant had moved on, because nothing prompted it to look. See
+	// onReady for the sticky-invalidation fix and the exact sequence that
+	// exposed it.
+	//
 	// Known limitation: this means a gate cannot be deliberately re-run on an
 	// unchanged version — e.g. to retry a flaky spanning test — since the
 	// recorded verdict wins instead. That is the right default; a forced
@@ -185,13 +195,35 @@ func (c *Coordinator) onReady(ctx context.Context, _ *agent.Agent, m protocol.Me
 		return nil
 	}
 	gs.mu.Lock()
-	// Not in flight and a previous round tested this exact sender at this
-	// exact version: resolve a synthetic round from the remembered verdict
-	// instead of recording new readiness. Exact string equality on purpose —
-	// any change since (even an uncommitted one that changed the version
-	// string) means this is a new state that has never been tested, so
-	// readiness must proceed normally.
-	if !gs.inflight && gs.lastVerdict != nil {
+	required := contains(gs.spec.Required, m.From.Agent)
+	// Not in flight, a verdict is remembered, and this required participant
+	// is exactly where the remembered round left it: resolve a synthetic
+	// round from the remembered verdict instead of recording new readiness.
+	// Exact string equality on purpose — any change since (even an
+	// uncommitted one that changed the version string) means this is a new
+	// state that has never been tested.
+	//
+	// A remembered verdict is only a valid answer to ANY participant when
+	// nothing relevant has changed since the round that produced it — not
+	// merely when the asking participant's own version is unchanged. A live
+	// run exposed the earlier, submitter-only comparison: participant A
+	// fixed its half and resubmitted a new version, then participant B
+	// resubmitted its own unchanged version and was wrongly answered with
+	// the pre-fix FAILED verdict from cache, because the guard never
+	// noticed A had already moved on. Since the cached path skips recording
+	// readiness, A's new version was then simply never picked up — the gate
+	// stayed stuck on a stale verdict until the participants worked around
+	// it out of band. See gateState's doc comment for the full account.
+	//
+	// The fix is sticky invalidation: the moment ANY required participant's
+	// version diverges from what the remembered round tested for it, the
+	// remembered verdict is discarded outright (not just skipped for that
+	// one sender), and stays discarded until the next genuine resolve
+	// stores a fresh one. That is simpler than comparing whole version sets
+	// on every submit, and it is what makes B's very next, unchanged
+	// resubmit fall through to ordinary readiness recording instead of a
+	// second stale answer.
+	if !gs.inflight && gs.lastVerdict != nil && required {
 		if tested, ok := gs.lastVerdict.Versions[m.From.Agent]; ok && tested == version {
 			cached := *gs.lastVerdict
 			stalled := gs.lastStalled
@@ -204,8 +236,8 @@ func (c *Coordinator) onReady(ctx context.Context, _ *agent.Agent, m protocol.Me
 			c.resolve(ctx, gs, cached, stalled, true)
 			return nil
 		}
+		gs.lastVerdict = nil
 	}
-	required := contains(gs.spec.Required, m.From.Agent)
 	if required && !gs.inflight {
 		gs.ready[m.From.Agent] = version // dedup by participant; last write wins
 	}
