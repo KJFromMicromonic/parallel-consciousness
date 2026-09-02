@@ -5,6 +5,7 @@ package fake
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -15,6 +16,14 @@ import (
 	"github.com/KJFromMicromonic/parallel-consciousness/pkg/runtime"
 )
 
+// ErrSessionEnding is returned by Steer/Follow when the session ended — via
+// Close, Interrupt, or a scripted Exit — before the message could be handed
+// to loop() at all. Returning nil in that race would tell the caller
+// "accepted" for a message that will now never run and never drain; a caller
+// checking errors.Is(err, ErrSessionEnding) can tell that apart from a real
+// delivery.
+var ErrSessionEnding = errors.New("fake: session ended before the message could be accepted")
+
 // Action is one scripted thing a fake agent does.
 type Action interface{ isAction() }
 
@@ -22,7 +31,9 @@ type Action interface{ isAction() }
 type Write struct{ Path, Content string }
 
 // Exec runs a command in the session's workdir with the session's env. This is
-// how a fake agent calls `pc submit`.
+// how a fake agent calls `pc submit`. It runs under the session's internal
+// workCtx, so an Interrupt or Close arriving while it is in flight actually
+// kills it rather than waiting it out — see session.workCtx.
 type Exec struct{ Args []string }
 
 // Emit reports a tool use without doing anything, for evidence assertions.
@@ -83,13 +94,16 @@ func (r *Runtime) Start(ctx context.Context, spec runtime.Spec) (runtime.Session
 		transcript = f
 	}
 
+	workCtx, cancelWork := context.WithCancel(context.Background())
 	s := &session{
 		spec:       spec,
 		script:     r.scripts[spec.Agent],
 		events:     make(chan runtime.Event, 256),
 		work:       make(chan queuedWork, 8),
-		receipts:   make(chan runtime.Event, 8),
 		done:       make(chan struct{}),
+		stopped:    make(chan struct{}),
+		workCtx:    workCtx,
+		cancelWork: cancelWork,
 		start:      time.Now(),
 		transcript: transcript,
 	}
@@ -109,10 +123,24 @@ const (
 )
 
 // queuedWork is one turn's worth of scripted actions, tagged with which queue
-// (if any) it came from so the loop can emit an accurate drain receipt.
+// (if any) it came from, and — when it does come from Steer or Follow — the
+// exact Queue snapshot to report as that message's accept receipt.
+//
+// The receipt travels inside this same struct, over the same s.work channel
+// as the actions it accepts, rather than over a second channel. That is what
+// gives receipt-before-drain ordering for free: Go only guarantees FIFO
+// within one channel, not across two, so an earlier version that sent the
+// receipt over its own channel had that ordering only incidentally — it held
+// because loop() happened to already be parked in select when both sends
+// landed. Nothing enforced it against two back-to-back Steer/Follow calls
+// with no intervening idle, or scheduling pressure on a loaded box, either
+// of which could have delivered the drained {0,0} before the accepted
+// {Steering:1}. Folding the receipt in here removes that whole race surface
+// instead of papering over it.
 type queuedWork struct {
 	actions []Action
 	kind    workKind
+	accept  *runtime.Queue
 }
 
 type session struct {
@@ -122,18 +150,30 @@ type session struct {
 	events chan runtime.Event
 	work   chan queuedWork
 
-	// receipts carries KindQueueChanged events from Steer/Follow — called
-	// from the caller's own goroutine — into loop(), which is the only
-	// goroutine allowed to call emit(). emit() assumes it is never called
-	// concurrently with loop()'s own shutdown; routing external events
-	// through this channel instead of emitting them directly from Steer/
-	// Follow's goroutine preserves that invariant rather than reintroducing
-	// the send-on-a-closing-channel race emitFinal's doc comment already
-	// warns about.
-	receipts chan runtime.Event
-
 	once sync.Once
 	done chan struct{}
+
+	// stopped is closed by loop() itself, only once loop() has actually
+	// returned — after any in-flight action has genuinely stopped running,
+	// not merely after a termination signal was issued. done closing tells
+	// loop() to stop; stopped closing is loop() reporting that it has.
+	// Wait() blocks on stopped, not done: a Wait that returned the instant
+	// Interrupt was called would be true regardless of whether the fake
+	// actually killed anything in flight, which is exactly the gap
+	// InterruptPreemptsInFlightWork exists to catch — it needs "the session
+	// has ended" to mean the goroutine (and the process it may still be
+	// running) has actually stopped, not just that a signal was accepted.
+	stopped chan struct{}
+
+	// workCtx is cancelled by Interrupt or Close (via closeWithReason) so
+	// that an in-flight Exec action can actually be killed instead of run to
+	// completion, and so loop() can abandon the rest of a turn's scripted
+	// actions once cancellation is observed. Steer and Follow deliberately
+	// never touch workCtx: the Session contract documents Steer as NOT
+	// preemption ("delivered at the next turn boundary"), so only Interrupt
+	// — and Close, which ends everything — may cut work off early.
+	workCtx    context.Context
+	cancelWork context.CancelFunc
 
 	mu        sync.Mutex
 	endReason runtime.ExitReason
@@ -147,6 +187,11 @@ type session struct {
 }
 
 func (s *session) loop() {
+	// LIFO: closeTranscript runs first, then close(events), then
+	// close(stopped) last — so a caller unblocked by stopped sees a fully
+	// wound-down session: transcript flushed and closed, events channel
+	// already closed too.
+	defer close(s.stopped)
 	defer close(s.events)
 	defer s.closeTranscript()
 	s.emit(runtime.Event{Kind: runtime.KindStarted})
@@ -155,12 +200,25 @@ func (s *session) loop() {
 		case <-s.done:
 			s.emitFinal(runtime.Event{Kind: runtime.KindExited})
 			return
-		case ev := <-s.receipts:
-			s.emit(ev)
 		case qw := <-s.work:
 			s.emit(runtime.Event{Kind: runtime.KindTurnBegan})
+			if qw.accept != nil {
+				s.emit(runtime.Event{Kind: runtime.KindQueueChanged, Pending: qw.accept})
+			}
+		actions:
 			for _, a := range qw.actions {
-				s.run(a)
+				select {
+				case <-s.workCtx.Done():
+					// Interrupt or Close fired mid-turn: abandon the rest of
+					// this turn's scripted actions instead of running them to
+					// completion. This — plus Exec running under workCtx — is
+					// what makes Interrupt an actual preemption primitive,
+					// rather than "wait for the current turn, then stop,"
+					// which is already what Steer/Follow give you for free.
+					break actions
+				default:
+					s.run(a)
+				}
 			}
 			// The initial OnStart turn carries no queue receipt: it was never
 			// accepted via Steer or Follow, so there is nothing to drain.
@@ -190,7 +248,11 @@ func (s *session) run(a Action) {
 		}})
 		s.trace("write", v.Path, err == nil)
 	case Exec:
-		cmd := exec.Command(v.Args[0], v.Args[1:]...)
+		// CommandContext, not Command: workCtx is cancelled by Interrupt or
+		// Close, and this is the one place a scripted action can genuinely
+		// block for a long time, so it is the one place that needs killing
+		// rather than just not-being-started next.
+		cmd := exec.CommandContext(s.workCtx, v.Args[0], v.Args[1:]...)
 		cmd.Dir = s.spec.Workdir
 		cmd.Env = os.Environ()
 		for k, val := range s.spec.Env {
@@ -278,11 +340,10 @@ func pick(own, fallback func(string) []Action) func(string) []Action {
 // queue accepts a steer or follow message: it checks ctx first (an
 // already-cancelled ctx must return promptly regardless of whether a hook is
 // even set), then — mirroring the day-0 spike's queue_update, which fired
-// immediately on injection — hands the KindQueueChanged receipt to loop() via
-// s.receipts before handing the scripted actions to loop() via s.work. The
-// receipt travels through a channel rather than a direct s.emit call because
-// this method runs on the CALLER's goroutine, and only loop() may call emit
-// safely (see the receipts field doc).
+// immediately on injection — bundles the accept receipt into the same
+// queuedWork value as the scripted actions, so loop() emits the receipt
+// before running them (see queuedWork's doc comment for why that ordering
+// needs to be structural rather than incidental).
 func (s *session) queue(ctx context.Context, hook func(string) []Action, text string, kind workKind) error {
 	select {
 	case <-ctx.Done():
@@ -295,17 +356,14 @@ func (s *session) queue(ctx context.Context, hook func(string) []Action, text st
 	actions := hook(text)
 	q := s.enqueue(kind)
 	select {
-	case s.receipts <- runtime.Event{Kind: runtime.KindQueueChanged, Pending: &q}:
-	case <-s.done:
-		return nil
-	case <-ctx.Done():
-		return fmt.Errorf("fake: queue message: %w", ctx.Err())
-	}
-	select {
-	case s.work <- queuedWork{actions: actions, kind: kind}:
+	case s.work <- queuedWork{actions: actions, kind: kind, accept: &q}:
 		return nil
 	case <-s.done:
-		return nil
+		// The counter was already incremented above, but nothing will ever
+		// dequeue and drain it now — the session is ending. That is harmless
+		// (no further receipt will ever be observed), but the caller must
+		// NOT be told "accepted": this message will never run.
+		return fmt.Errorf("fake: queue message: %w", ErrSessionEnding)
 	case <-ctx.Done():
 		return fmt.Errorf("fake: queue message: %w", ctx.Err())
 	}
@@ -353,29 +411,38 @@ func (s *session) Interrupt(ctx context.Context) error {
 	return nil
 }
 
+// Close never blocks — closeWithReason only takes a mutex, cancels workCtx,
+// and closes a channel — so there is no operation here for a ctx deadline to
+// interrupt. That is why, unlike Interrupt, Close does not select on
+// ctx.Done(): honouring cancellation on a call that already returns
+// immediately would add a branch that could never fire, not real ctx
+// support. This is deliberate, not an inconsistency with the contract's
+// "every method MUST honour ctx" — there is nothing here to honour it against.
 func (s *session) Close(ctx context.Context) error {
 	s.closeWithReason(runtime.ExitInterrupted)
 	return nil
 }
 
-// closeWithReason records why the session ended and closes s.done exactly
-// once. The once-guard means the FIRST caller to reach here wins the reason:
-// an external Close or Interrupt racing a scripted Exit does not overwrite a
-// natural end already recorded, and a scripted Exit that has already fired
-// leaves a later Close's ExitInterrupted attempt a no-op, matching Close's
-// documented idempotency.
+// closeWithReason records why the session ended, cancels workCtx so any
+// in-flight Exec is killed and loop() abandons the rest of its turn, and
+// closes s.done — all exactly once. The once-guard means the FIRST caller to
+// reach here wins the reason: an external Close or Interrupt racing a
+// scripted Exit does not overwrite a natural end already recorded, and a
+// scripted Exit that has already fired leaves a later Close's
+// ExitInterrupted attempt a no-op, matching Close's documented idempotency.
 func (s *session) closeWithReason(reason runtime.ExitReason) {
 	s.once.Do(func() {
 		s.mu.Lock()
 		s.endReason = reason
 		s.mu.Unlock()
+		s.cancelWork()
 		close(s.done)
 	})
 }
 
 func (s *session) Wait(ctx context.Context) (runtime.Outcome, error) {
 	select {
-	case <-s.done:
+	case <-s.stopped:
 		s.mu.Lock()
 		reason := s.endReason
 		s.mu.Unlock()

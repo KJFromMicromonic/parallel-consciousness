@@ -24,11 +24,18 @@ func TestFakeConformance(t *testing.T) {
 		"b": {
 			OnStart: []fake.Action{fake.Exit{}},
 		},
+		// "c" spends 30s in a single Exec so InterruptPreemptsInFlightWork
+		// can catch it genuinely mid-flight and prove Interrupt cuts it off
+		// in seconds rather than waiting the 30s out.
+		"c": {
+			OnStart: []fake.Action{fake.Exec{Args: []string{"sh", "-c", "sleep 30"}}},
+		},
 	}
 	runtimetest.Run(t, func(t *testing.T) runtime.Runtime {
 		return fake.New(scripts)
 	}, runtime.Spec{Agent: "a", Workdir: t.TempDir()}, runtimetest.Options{
-		Completes: runtime.Spec{Agent: "b", Workdir: t.TempDir()},
+		Completes:   runtime.Spec{Agent: "b", Workdir: t.TempDir()},
+		LongRunning: runtime.Spec{Agent: "c", Workdir: t.TempDir()},
 	})
 }
 

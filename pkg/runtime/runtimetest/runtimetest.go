@@ -6,6 +6,7 @@ package runtimetest
 import (
 	"context"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -24,11 +25,21 @@ type Options struct {
 	// something to observe that is provably not an externally-terminated
 	// session.
 	Completes runtime.Spec
+
+	// LongRunning is a Spec whose session, once started, spends tens of
+	// seconds doing one thing — long enough that a property can reliably
+	// catch it mid-flight and assert Interrupt cuts it off in a few seconds,
+	// nowhere near its natural duration. Without a genuinely long action
+	// there is no way to tell "Interrupt preempted this" apart from "this
+	// happened to finish on its own before Interrupt was even checked."
+	LongRunning runtime.Spec
 }
 
 // Run executes the suite. newRuntime must return a fresh Runtime; spec must be
 // a task the adapter can actually complete; opts.Completes must be a task
-// whose session ends on its own.
+// whose session ends on its own; opts.LongRunning must be a task that stays
+// busy for tens of seconds so InterruptPreemptsInFlightWork has something
+// genuinely in flight to interrupt.
 //
 // This certifies lifecycle behaviour only: that a session reaches idle, that
 // Close ends the event stream and unblocks Wait, and that a steer is accepted
@@ -282,6 +293,135 @@ func Run(t *testing.T, newRuntime func(t *testing.T) runtime.Runtime, spec runti
 
 		if !dirHasContent(t, ts.TranscriptDir) {
 			t.Fatalf("TranscriptDir %s has no content by the time the session settled", ts.TranscriptDir)
+		}
+	})
+
+	t.Run("TranscriptDirThatCannotBeCreatedFailsStart", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		// A regular file where a directory needs to go: os.MkdirAll cannot
+		// create anything under it, so this reliably reproduces "the
+		// requested directory cannot be honoured" without depending on
+		// filesystem permissions, which behave inconsistently across CI
+		// environments (and not at all for a process running as root).
+		blocker := filepath.Join(t.TempDir(), "blocker")
+		if err := os.WriteFile(blocker, []byte("not a directory"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		ts := spec
+		ts.TranscriptDir = filepath.Join(blocker, "transcripts")
+
+		if _, err := newRuntime(t).Start(ctx, ts); err == nil {
+			t.Fatal("Start succeeded with a TranscriptDir that cannot be created, want an error")
+		}
+	})
+
+	t.Run("FollowProducesAQueueReceiptThatDrains", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		s, err := newRuntime(t).Start(ctx, spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close(ctx)
+
+		waitForIdle(t, ctx, s)
+
+		if err := s.Follow(ctx, "follow receipt check"); err != nil {
+			t.Fatalf("Follow: %v", err)
+		}
+
+		var sawReceipt bool
+		deadline := time.After(30 * time.Second)
+		for {
+			select {
+			case ev, ok := <-s.Events():
+				if !ok {
+					t.Fatal("event stream closed before the queue drained")
+				}
+				if ev.Kind != runtime.KindQueueChanged {
+					continue
+				}
+				if ev.Pending == nil {
+					t.Fatal("KindQueueChanged event with a nil Pending")
+				}
+				if !sawReceipt {
+					if ev.Pending.FollowUp < 1 {
+						// Not the receipt for our follow; keep scanning.
+						continue
+					}
+					sawReceipt = true
+					continue
+				}
+				if ev.Pending.Steering == 0 && ev.Pending.FollowUp == 0 {
+					return // queue drained back to zero: property satisfied
+				}
+			case <-deadline:
+				t.Fatalf("timed out waiting for the queue to drain (receipt seen=%v)", sawReceipt)
+			case <-ctx.Done():
+				t.Fatalf("context done waiting for the queue to drain: %v", ctx.Err())
+			}
+		}
+	})
+
+	t.Run("InterruptPreemptsInFlightWork", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		s, err := newRuntime(t).Start(ctx, opts.LongRunning)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close(ctx)
+
+		// Wait for genuine evidence the long-running action is in flight —
+		// KindTurnBegan, not KindIdle. Waiting for idle here would prove
+		// nothing: idle means the action already finished, which is exactly
+		// the case a preemption property must NOT exercise.
+		inFlight := time.After(10 * time.Second)
+	waitInFlight:
+		for {
+			select {
+			case ev, ok := <-s.Events():
+				if !ok {
+					t.Fatal("event stream closed before the long-running turn began")
+				}
+				if ev.Kind == runtime.KindTurnBegan {
+					break waitInFlight
+				}
+			case <-inFlight:
+				t.Fatal("timed out waiting for the long-running turn to begin")
+			}
+		}
+
+		if err := s.Interrupt(ctx); err != nil {
+			t.Fatalf("Interrupt: %v", err)
+		}
+
+		type result struct {
+			out runtime.Outcome
+			err error
+		}
+		done := make(chan result, 1)
+		go func() {
+			out, err := s.Wait(ctx)
+			done <- result{out, err}
+		}()
+
+		// Bounded well inside the long-running action's own duration: a fake
+		// (or adapter) that let the action run to completion instead of
+		// actually preempting it would blow this deadline.
+		select {
+		case r := <-done:
+			if r.err != nil {
+				t.Fatalf("Wait after Interrupt: %v", r.err)
+			}
+			if r.out.Reason != runtime.ExitInterrupted {
+				t.Fatalf("Outcome.Reason = %q, want %q", r.out.Reason, runtime.ExitInterrupted)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("session did not settle within 5s of Interrupt while a long-running action was in flight: Interrupt did not preempt it")
 		}
 	})
 }
