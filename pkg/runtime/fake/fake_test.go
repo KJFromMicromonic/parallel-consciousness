@@ -30,12 +30,35 @@ func TestFakeConformance(t *testing.T) {
 		"c": {
 			OnStart: []fake.Action{fake.Exec{Args: []string{"sh", "-c", "sleep 30"}}},
 		},
+		// "d" spends 3s in a single Exec, then reports a distinctive
+		// completion marker — short enough that AnInFlightSteerDoesNotPreempt
+		// and AnInFlightFollowDoesNotPreempt (run under -count=5) don't stall
+		// on tens of seconds of real sleep the way "c" deliberately does.
+		// Its steer/follow scripts each report their own distinctive marker
+		// once run, so the properties can assert the order those three
+		// markers arrive in.
+		"d": {
+			OnStart: []fake.Action{
+				fake.Exec{Args: []string{"sh", "-c", "sleep 3"}},
+				fake.Emit{Tool: runtime.ToolUse{Name: "exec", Target: "work-done", Ok: true}},
+			},
+			OnSteer: func(text string) []fake.Action {
+				return []fake.Action{fake.Emit{Tool: runtime.ToolUse{Name: "steer", Target: "steer-applied", Ok: true}}}
+			},
+			OnFollow: func(text string) []fake.Action {
+				return []fake.Action{fake.Emit{Tool: runtime.ToolUse{Name: "follow", Target: "follow-applied", Ok: true}}}
+			},
+		},
 	}
 	runtimetest.Run(t, func(t *testing.T) runtime.Runtime {
 		return fake.New(scripts)
 	}, runtime.Spec{Agent: "a", Workdir: t.TempDir()}, runtimetest.Options{
-		Completes:   runtime.Spec{Agent: "b", Workdir: t.TempDir()},
-		LongRunning: runtime.Spec{Agent: "c", Workdir: t.TempDir()},
+		Completes:           runtime.Spec{Agent: "b", Workdir: t.TempDir()},
+		LongRunning:         runtime.Spec{Agent: "c", Workdir: t.TempDir()},
+		InFlightWork:        runtime.Spec{Agent: "d", Workdir: t.TempDir()},
+		WorkDoneMarker:      "work-done",
+		SteerAppliedMarker:  "steer-applied",
+		FollowAppliedMarker: "follow-applied",
 	})
 }
 

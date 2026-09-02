@@ -33,6 +33,30 @@ type Options struct {
 	// there is no way to tell "Interrupt preempted this" apart from "this
 	// happened to finish on its own before Interrupt was even checked."
 	LongRunning runtime.Spec
+
+	// InFlightWork is used by AnInFlightSteerDoesNotPreempt and
+	// AnInFlightFollowDoesNotPreempt to prove the mirror image of
+	// InterruptPreemptsInFlightWork: that Steer and Follow do NOT cut off
+	// work already in flight. Its session's OnStart behaviour must be a
+	// several-second action followed by one KindToolUsed event whose
+	// Tool.Target equals WorkDoneMarker, reporting that the in-flight work
+	// has completed. It needs to be its own short spec — not opts.LongRunning
+	// reused — because LongRunning's own action deliberately runs tens of
+	// seconds (room for InterruptPreemptsInFlightWork's few-second deadline
+	// to mean something); forcing these ordering properties onto that same
+	// duration would mean waiting out tens of seconds of real time, several
+	// times over under -count=5, just to observe an event order that a
+	// several-second action already proves.
+	InFlightWork runtime.Spec
+
+	// WorkDoneMarker is the Tool.Target of InFlightWork's completion event.
+	WorkDoneMarker string
+	// SteerAppliedMarker is the Tool.Target InFlightWork's OnSteer path must
+	// report once its own action runs, at the next turn boundary.
+	SteerAppliedMarker string
+	// FollowAppliedMarker is the Tool.Target InFlightWork's OnFollow path
+	// must report once its own action runs, at the next turn boundary.
+	FollowAppliedMarker string
 }
 
 // Run executes the suite. newRuntime must return a fresh Runtime; spec must be
@@ -424,6 +448,129 @@ func Run(t *testing.T, newRuntime func(t *testing.T) runtime.Runtime, spec runti
 			t.Fatal("session did not settle within 5s of Interrupt while a long-running action was in flight: Interrupt did not preempt it")
 		}
 	})
+
+	t.Run("AnInFlightSteerDoesNotPreempt", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		s, err := newRuntime(t).Start(ctx, opts.InFlightWork)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close(ctx)
+
+		waitForTurnBegan(t, ctx, s)
+
+		if err := s.Steer(ctx, "steer while busy"); err != nil {
+			t.Fatalf("Steer: %v", err)
+		}
+
+		assertVerbDoesNotPreempt(t, ctx, s, "Steer", opts.WorkDoneMarker, opts.SteerAppliedMarker,
+			func(q runtime.Queue) int { return q.Steering })
+	})
+
+	t.Run("AnInFlightFollowDoesNotPreempt", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		s, err := newRuntime(t).Start(ctx, opts.InFlightWork)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close(ctx)
+
+		waitForTurnBegan(t, ctx, s)
+
+		if err := s.Follow(ctx, "follow while busy"); err != nil {
+			t.Fatalf("Follow: %v", err)
+		}
+
+		assertVerbDoesNotPreempt(t, ctx, s, "Follow", opts.WorkDoneMarker, opts.FollowAppliedMarker,
+			func(q runtime.Queue) int { return q.FollowUp })
+	})
+}
+
+// waitForTurnBegan drains events until KindTurnBegan arrives, failing the
+// test if the stream closes or ctx expires first. Unlike waitForIdle, this is
+// evidence a turn has genuinely STARTED — used by properties that need to
+// catch a session while its current turn's action is still in flight, where
+// waiting for idle would prove nothing (idle means that action already
+// finished, which is exactly the case such a property must not exercise).
+func waitForTurnBegan(t *testing.T, ctx context.Context, s runtime.Session) {
+	t.Helper()
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case ev, ok := <-s.Events():
+			if !ok {
+				t.Fatal("event stream closed before the turn began")
+			}
+			if ev.Kind == runtime.KindTurnBegan {
+				return
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for the turn to begin")
+		case <-ctx.Done():
+			t.Fatalf("context done before the turn began: %v", ctx.Err())
+		}
+	}
+}
+
+// assertVerbDoesNotPreempt is shared by AnInFlightSteerDoesNotPreempt and
+// AnInFlightFollowDoesNotPreempt: everything about the property is identical
+// between the two verbs except which Queue counter counts as that verb's
+// accept receipt, so callers pass queueField to select it.
+//
+// The assertion is ordering-based, not timing-based, on purpose — a timing
+// threshold here would be flaky against a real adapter. It requires BOTH:
+//
+//  1. the accept receipt (KindQueueChanged with queueField(Pending) >= 1)
+//     arrives before workDoneMarker — proving the message really was
+//     accepted while the in-flight action was still running, not after it
+//     happened to finish; and
+//  2. appliedMarker (the verb's own scripted action, run once loop() reaches
+//     the next turn boundary) arrives after workDoneMarker — proving it did
+//     NOT cut the in-flight action off early.
+//
+// Either check alone would be meaningless: without (1), a verb that silently
+// waited for idle before even accepting the message would pass; without (2),
+// nothing distinguishes non-preemption from preemption at all.
+func assertVerbDoesNotPreempt(t *testing.T, ctx context.Context, s runtime.Session, verb, workDoneMarker, appliedMarker string, queueField func(runtime.Queue) int) {
+	t.Helper()
+	var receiptSeenBeforeCompletion, workDone bool
+	deadline := time.After(30 * time.Second)
+	for {
+		select {
+		case ev, ok := <-s.Events():
+			if !ok {
+				t.Fatalf("event stream closed before both %s markers arrived", verb)
+			}
+			switch ev.Kind {
+			case runtime.KindQueueChanged:
+				if !workDone && ev.Pending != nil && queueField(*ev.Pending) >= 1 {
+					receiptSeenBeforeCompletion = true
+				}
+			case runtime.KindToolUsed:
+				if ev.Tool == nil {
+					continue
+				}
+				switch ev.Tool.Target {
+				case workDoneMarker:
+					workDone = true
+				case appliedMarker:
+					if !workDone {
+						t.Fatalf("%s's marker arrived before the in-flight work's completion marker: %s preempted work in flight", verb, verb)
+					}
+					if !receiptSeenBeforeCompletion {
+						t.Fatalf("the %s queue receipt never arrived before the in-flight work completed: cannot prove the message was accepted while work was in flight", verb)
+					}
+					return
+				}
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for %s non-preemption evidence (workDone=%v)", verb, workDone)
+		case <-ctx.Done():
+			t.Fatalf("context done waiting for %s non-preemption evidence: %v", verb, ctx.Err())
+		}
+	}
 }
 
 // waitForIdle drains events until KindIdle arrives, failing the test if the
