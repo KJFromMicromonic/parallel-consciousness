@@ -164,6 +164,80 @@ submit again" on exit 0 and that did not suppress it, so this needs a mechanism,
 not wording: `pc submit` should decline (or return immediately) when the agent's
 current version has already been accepted in a resolved round.
 
+## F2 fixed, in two attempts — both of my designs were wrong first
+
+**Attempt 1 (rejected): answer a redundant submit with a direct message to the sender.**
+It created an unbounded feedback loop. Couriers subscribe with `nil` topics, so
+they forward *direct* messages into the agent's live session; a cached verdict
+sent direct was forwarded back into the agent, which resubmitted, which produced
+another cached reply. Because the cache path bypassed `resolve`, the round
+counter never advanced and nothing bounded it — 2,589 goroutines in 8 seconds.
+The implementer stopped and reported rather than editing `courier.go` to make
+the instruction work, which was the right call.
+
+**Attempt 2 (rejected): compare only the submitting agent's version.**
+Fixed the hang — a live run went from timing out past 560s to converging in
+212s — but served a **stale verdict**:
+
+```
+ 5 coordinator -> #gate.currency [inform] currency FAILED          (round 1, gateway still EUR)
+ 9 gateway     -> #gate.currency [ready]  version 08cab33c         <- NEW commit: fixed to USD
+10 billing     -> #gate.currency [ready]  version acef4043         <- unchanged since round 1
+11 coordinator -> #gate.currency [inform] currency FAILED (cached) <- WRONG
+```
+
+Billing's own version was unchanged, so the guard answered from cache — but
+gateway had already moved. The cached path does not record readiness, so quorum
+was never reached and gateway's fix was ignored. Cost: an extra round trip and an
+unnecessary billing commit.
+
+**Shipped: sticky invalidation.** Any participant declaring a version that
+differs from the remembered round invalidates the cached verdict for that gate,
+so a cached answer is only ever served when genuinely nothing has moved.
+
+Teeth-verified by removing the invalidation and reproducing the exact stale log
+line. `pkg/gate` is at 19 passing tests.
+
+### F6 revisited — three unprompted peer messages, none of them asked for
+
+The contract snippet documents only `pc submit`. `pc send` is mentioned nowhere
+in it. Agents nonetheless used the bus three separate times:
+
+1. **billing -> gateway**, after a failing round: *"currency gate failed after
+   billing now renders charge.Currency: … was "charged 100 (EUR)", want
+   "charged 100 (USD)". Billing branch committed as ae7015b; gateway appears to
+   still send EUR"* — a diagnosis of the other service's fault.
+2. **gateway -> billing**, catching a defect in the coordinator: *"Stale
+   verdict — gateway already sends USD. Gateway commit 08cab33 changed
+   gateway.Send() … The FAIL you read showing EUR was the coordinator's cached
+   verdict"* — an agent diagnosing the bug in attempt 2 above and warning its
+   peer.
+3. **gateway -> billing**, after waiting 7m45s with no peer ever appearing:
+   *"gateway is ready on agent/gateway @585bc3c: Charge.Currency is now "USD".
+   The currency gate still fails, and the remaining gap is on billing side
+   only"* — correct attribution of the remaining work, with its own commit named.
+
+This is the conversation-layer thesis arriving unbidden, and case 2 is an agent
+finding a coordinator bug before the author did.
+
+### F4 reinforced — a missing peer is indistinguishable from a slow one
+
+Case 3 above is F4 with a number attached: gateway had no way to learn that
+billing was never coming, so it waited **7 minutes 45 seconds** and then
+improvised. A "no other participant has been seen for this gate" signal would
+turn that into an immediate, accurate escalation. This is now the highest-value
+remaining fix.
+
+### A note on live-run reliability
+
+Two of five live runs failed for reasons outside the system: one because I built
+the binary from the wrong directory and silently tested a stale build, one
+because pi produced no output at all (a smoke test passed immediately
+afterwards, so most likely subscription rate-limiting after many runs in a day).
+Neither was a defect in `pc`. Worth knowing that live validation against real
+harnesses has a meaningful flake rate of its own, and that a run should always
+begin by asserting which build is under test.
+
 ## Still untested
 
 **The exit-1 branch.** Stage 0's model got the task right first time; Stage 1
