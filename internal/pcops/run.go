@@ -3,6 +3,7 @@ package pcops
 import (
 	"context"
 	"fmt"
+	"log"
 	"path/filepath"
 	"time"
 
@@ -11,6 +12,17 @@ import (
 	"github.com/KJFromMicromonic/parallel-consciousness/pkg/runtime"
 	"github.com/KJFromMicromonic/parallel-consciousness/pkg/workspace"
 )
+
+// leaseTTL mirrors workspace.Manager's default lease TTL (see
+// workspace.New). Run never calls SetTTL, so this is the TTL every lease it
+// acquires actually has.
+const leaseTTL = 30 * time.Second
+
+// heartbeatInterval is how often Run renews a lease it still holds. It must
+// stay well under leaseTTL so a single missed tick can never let a live
+// lease go stale before the next one; a third of the TTL leaves two full
+// cycles of margin.
+const heartbeatInterval = leaseTTL / 3
 
 // Run executes one scenario: lease a workspace per participant, launch each
 // agent, bridge them onto the bus, host the gate, and wait for a verdict.
@@ -43,7 +55,16 @@ func Run(ctx context.Context, cfg Config, r runtime.Runtime) (gate.Verdict, erro
 	defer wm.Close()
 
 	verdicts := make(chan gate.Verdict, 4)
-	cstop, err := StartCoordinator(ctx, cfg, func(v gate.Verdict) { verdicts <- v })
+	cstop, err := StartCoordinator(ctx, cfg, func(v gate.Verdict) {
+		// Non-blocking: a slow or absent consumer must never stall the
+		// coordinator's own dispatch goroutine, which is what calls this
+		// hook. submit.go's verdict delivery uses the same shape for the
+		// same reason.
+		select {
+		case verdicts <- v:
+		default:
+		}
+	})
 	if err != nil {
 		return gate.Verdict{}, fmt.Errorf("start coordinator: %w", err)
 	}
@@ -55,6 +76,10 @@ func Run(ctx context.Context, cfg Config, r runtime.Runtime) (gate.Verdict, erro
 		return gate.Verdict{}, fmt.Errorf("lease runner workspace: %w", err)
 	}
 	defer runnerLease.Release(context.Background())
+	// See heartbeatLease: the runner holds its lease for the life of the
+	// scenario too, so it must be kept fresh for just as long.
+	stopRunnerHeartbeat := startHeartbeat(ctx, runnerLease)
+	defer stopRunnerHeartbeat()
 
 	branches := make([]string, 0, len(cfg.Agents))
 	for _, a := range cfg.Agents {
@@ -78,6 +103,8 @@ func Run(ctx context.Context, cfg Config, r runtime.Runtime) (gate.Verdict, erro
 			return gate.Verdict{}, fmt.Errorf("lease workspace for %s: %w", def.Name, err)
 		}
 		defer lease.Release(context.Background())
+		stopHeartbeat := startHeartbeat(ctx, lease)
+		defer stopHeartbeat()
 
 		sess, err := r.Start(ctx, runtime.Spec{
 			Agent:   def.Name,
@@ -116,5 +143,52 @@ func Run(ctx context.Context, cfg Config, r runtime.Runtime) (gate.Verdict, erro
 // with the domain store; for now the events must simply not back up.
 func drainEvents(s runtime.Session) {
 	for range s.Events() {
+	}
+}
+
+// startHeartbeat begins renewing l on a ticker and returns a stop func that
+// ends it. The returned func must be deferred AFTER (so it runs BEFORE, since
+// defers are LIFO) the lease's own Release, so the heartbeat goroutine is
+// guaranteed to have stopped issuing renewals before the lease row is deleted.
+func startHeartbeat(ctx context.Context, l *workspace.Lease) (stop func()) {
+	hctx, cancel := context.WithCancel(ctx)
+	go heartbeatLease(hctx, l)
+	return cancel
+}
+
+// heartbeatLease renews l on a ticker until ctx ends.
+//
+// This exists because workspace.Manager reclaims a lease that has gone stale
+// — no heartbeat within its TTL, 30s by default — and Run holds every lease
+// it acquires for the entire scenario: this package's own whole-loop test
+// sets a 90s wall budget, and StartCoordinator configures a 10-minute runner
+// timeout for real gate checks. Without a heartbeat, every lease Run holds
+// goes stale while still in active use.
+//
+// The consequence is worse than a passive expiry. When the on-disk worktree
+// still matches the branch being requested — the ordinary case, since Run's
+// own holder is still using it — Manager.Acquire's reclaim path does not
+// merely fail on a stale row: a second Acquire for the same agent and branch
+// SILENTLY SUCCEEDS and hands back a live *Lease pointing at the very
+// directory the original session is still working in, with no signal to
+// either holder. That reattach-on-match behaviour is deliberate (it is how
+// crash recovery works), which is exactly why a holder that is genuinely
+// still alive must keep renewing for as long as it holds the lease.
+func heartbeatLease(ctx context.Context, l *workspace.Lease) {
+	t := time.NewTicker(heartbeatInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			// A transient heartbeat failure must not kill the run — the
+			// lease may simply outlive one blip before the next tick
+			// renews it. Reporting it is enough; pkg/agent uses the same
+			// log.Printf style for its own message trace.
+			if err := l.Heartbeat(ctx); err != nil {
+				log.Printf("pcops: heartbeat lease %s: %v", l.Path, err)
+			}
+		}
 	}
 }

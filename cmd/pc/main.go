@@ -10,7 +10,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -68,9 +67,9 @@ func cmdSubmit(ctx context.Context, args []string) int {
 	verdict, err := pcops.Submit(ctx, cfg, *gateID, name, v)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "pc submit: %v\n", err)
-		if errors.Is(err, pcops.ErrNoVerdict) {
-			return 2
-		}
+		// Every error Submit can return — opening the bus, joining as the
+		// named agent, declaring readiness, or timing out — means no
+		// verdict was obtained, so they all map to the same exit code.
 		return 2
 	}
 	fmt.Println(verdict.Detail)
