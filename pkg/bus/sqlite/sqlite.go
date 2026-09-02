@@ -11,11 +11,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"strings"
 	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
+	msqlite "modernc.org/sqlite"
 
 	"github.com/KJFromMicromonic/parallel-consciousness/pkg/protocol"
 )
@@ -73,23 +74,9 @@ type Bus struct {
 
 // Open opens (creating if needed) the SQLite database at path and ensures the schema exists.
 func Open(ctx context.Context, path string, opts ...Option) (*Bus, error) {
-	// Pragma ORDER MATTERS, and busy_timeout must come first. modernc.org/sqlite
-	// applies _pragma params in DSN order on each new connection, so any pragma
-	// listed before busy_timeout runs with a zero busy handler. journal_mode(WAL)
-	// takes an exclusive lock, and it collides with another pool's connection
-	// finalising the WAL on the same file: without the busy handler already
-	// installed that pragma gets SQLITE_BUSY with no retry and the very next
-	// PingContext fails. Measured: 5 failures in 40 runs with journal_mode first,
-	// 0 in 100 with busy_timeout first. Do not "tidy" this back into a prettier
-	// order.
-	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
-	db, err := sql.Open("sqlite", dsn)
+	db, err := OpenDB(ctx, path)
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite %q: %w", path, err)
-	}
-	if err := db.PingContext(ctx); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("connect sqlite %q: %w", path, err)
+		return nil, err
 	}
 	b := &Bus{
 		db:     db,
@@ -106,6 +93,138 @@ func Open(ctx context.Context, path string, opts ...Option) (*Bus, error) {
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
 	return b, nil
+}
+
+// OpenDB is the single place that owns "how this project opens its database
+// file". Every package that touches this SQLite file — the bus and the
+// workspace lease store alike — must go through it rather than building its
+// own DSN, because the two already diverged once: workspace.go copied
+// sqlite.go's DSN (including a since-fixed pragma-order bug) and inherited
+// its flaw. One helper means one thing to get right.
+//
+// It builds the DSN with busy_timeout first and synchronous(NORMAL), pings to
+// establish the connection, and then — deliberately as a separate step, see
+// below — sets WAL explicitly with a bounded, jittered retry.
+//
+// # Why WAL is not in the DSN
+//
+// journal_mode(WAL) used to be a third `_pragma` param applied during
+// connection establishment, same as busy_timeout and synchronous. That races
+// on a COLD (not-yet-existing) database file: setting journal_mode takes
+// SQLite's exclusive lock, and — unlike an ordinary write — SQLite does not
+// route that lock through the busy handler. It returns SQLITE_BUSY
+// immediately instead of retrying, so two processes opening the same fresh
+// path at once can both hit it, and raising busy_timeout does not help (a
+// throwaway probe measured a 6x longer timeout leaving the failure rate
+// unchanged). The same probe reproduced the race 5 times in 15 trials with
+// just two processes racing a cold DSN-embedded journal_mode(WAL); a warm
+// database (schema and WAL already established), or the same cold DSN with
+// journal_mode removed, never failed once. Do NOT "tidy" this back into the
+// DSN — that reintroduces the cold-start race this function exists to avoid.
+//
+// Because the journal mode SQLite settles on is persisted in the database
+// file's header, this cost is paid only once per fresh file: whichever
+// process gets there first sets it, and every later Open (including from
+// other processes) observes "wal" already on the row PRAGMA returns and never
+// enters the retry loop.
+func OpenDB(ctx context.Context, path string) (*sql.DB, error) {
+	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite %q: %w", path, err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("connect sqlite %q: %w", path, err)
+	}
+	if err := ensureWAL(ctx, db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("enable WAL on %q: %w", path, err)
+	}
+	return db, nil
+}
+
+// walRetryAttempts, walRetryCap and walRetryBudget bound ensureWAL's retry: a
+// handful of attempts, each waiting a short jittered backoff, totalling no
+// more than about two seconds before giving up.
+const (
+	walRetryAttempts = 8
+	walRetryCap      = 250 * time.Millisecond
+	walRetryBudget   = 2 * time.Second
+)
+
+// ensureWAL sets journal_mode=WAL as a query (not a connection-time pragma —
+// see OpenDB) and retries on SQLITE_BUSY with a jittered backoff. Jitter
+// matters: without it, two processes racing the same cold file back off in
+// lockstep and collide again on their very next attempt.
+//
+// PRAGMA journal_mode returns the mode SQLite actually settled on as a row;
+// this reads it and refuses to proceed unless it really is "wal" (SQLite
+// silently falls back to a different mode in some configurations, e.g. an
+// in-memory or read-only database, and proceeding on such a database would
+// leave callers believing they have WAL's concurrent-access guarantees when
+// they don't).
+func ensureWAL(ctx context.Context, db *sql.DB) error {
+	deadline := time.Now().Add(walRetryBudget)
+	var lastErr error
+	for attempt := 0; attempt < walRetryAttempts; attempt++ {
+		mode, err := readJournalMode(ctx, db)
+		if err == nil {
+			if !strings.EqualFold(mode, "wal") {
+				return fmt.Errorf("sqlite reported journal_mode %q, want wal", mode)
+			}
+			return nil
+		}
+		if !isSQLiteBusy(err) {
+			return fmt.Errorf("set journal_mode=WAL: %w", err)
+		}
+		lastErr = err
+		if attempt == walRetryAttempts-1 || !time.Now().Before(deadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(walBackoff(attempt)):
+		}
+	}
+	return fmt.Errorf("set journal_mode=WAL: gave up after %d attempts: %w", walRetryAttempts, lastErr)
+}
+
+func readJournalMode(ctx context.Context, db *sql.DB) (string, error) {
+	var mode string
+	err := db.QueryRowContext(ctx, `PRAGMA journal_mode=WAL`).Scan(&mode)
+	return mode, err
+}
+
+// walBackoff is full-jitter exponential backoff capped at walRetryCap: attempt
+// 0 waits up to ~15ms, doubling each attempt until the cap.
+func walBackoff(attempt int) time.Duration {
+	base := 15 * time.Millisecond << attempt
+	if base <= 0 || base > walRetryCap { // <=0 catches overflow from the shift
+		base = walRetryCap
+	}
+	return time.Duration(rand.Int63n(int64(base) + 1))
+}
+
+// sqliteBusyCode is SQLITE_BUSY from sqlite3.h. It's hardcoded rather than
+// imported from modernc.org/sqlite/lib (a codegen'd implementation package
+// not meant as a stable public surface) — the numeric SQLite result codes are
+// part of SQLite's own C ABI and have not changed across any released
+// version.
+const sqliteBusyCode = 5
+
+// isSQLiteBusy reports whether err is (or wraps) SQLITE_BUSY. modernc.org/sqlite
+// returns a typed *msqlite.Error whose Code() is the numeric result code; the
+// string fallback covers the (unobserved but cheap-to-guard) case where a
+// future driver version reports busy without that concrete type.
+func isSQLiteBusy(err error) bool {
+	var sqlErr *msqlite.Error
+	if errors.As(err, &sqlErr) {
+		return sqlErr.Code() == sqliteBusyCode
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "SQLITE_BUSY") || strings.Contains(msg, "database is locked")
 }
 
 // Close stops all subscription pollers and closes the underlying database.
