@@ -27,9 +27,16 @@ type Exec struct{ Args []string }
 // Emit reports a tool use without doing anything, for evidence assertions.
 type Emit struct{ Tool runtime.ToolUse }
 
+// Exit ends the session where it stands, so a script can play the failure mode
+// the spec cares about: a session that dies mid-task and never reaches a
+// verdict. The session emits its terminal event exactly as a real adapter does
+// when its process goes away.
+type Exit struct{}
+
 func (Write) isAction() {}
 func (Exec) isAction()  {}
 func (Emit) isAction()  {}
+func (Exit) isAction()  {}
 
 // Script is one agent's behaviour: what it does on start, and what it does when
 // a message is delivered.
@@ -123,6 +130,10 @@ func (s *session) run(a Action) {
 	case Emit:
 		t := v.Tool
 		s.emit(runtime.Event{Kind: runtime.KindToolUsed, Tool: &t})
+	case Exit:
+		// Close, not a direct close(s.done), so the once guard still holds when
+		// the owner closes the session afterwards too.
+		_ = s.Close(context.Background())
 	}
 }
 

@@ -2,6 +2,7 @@ package pcops_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -155,3 +156,128 @@ func gitShow(t *testing.T, repo, branch, path string) string {
 // commitAll is how a fake agent publishes its work to its branch.
 var commitAll = fake.Exec{Args: []string{"sh", "-c",
 	"git add -A && git -c user.email=t@example.com -c user.name=t commit -q -m work"}}
+
+// scenario builds a one-agent scenario over the fixture repo, so the tests
+// below differ only in the script they give the agent.
+func scenario(t *testing.T, repo string, agents []pcops.AgentDef) pcops.Config {
+	t.Helper()
+	required := make([]string, 0, len(agents))
+	for _, a := range agents {
+		required = append(required, a.Name)
+	}
+	return pcops.Config{
+		Repo:   repo,
+		DB:     filepath.Join(t.TempDir(), "bus.db"),
+		GateID: "checkout",
+		Gate: pcops.GateDef{
+			Required: required,
+			Runner:   "integrator",
+			Run:      "sh check.sh",
+		},
+		Agents:        agents,
+		Runner:        pcops.AgentDef{Name: "integrator", Branch: "agent/integration"},
+		SubmitTimeout: 45 * time.Second,
+		Wall:          120 * time.Second,
+	}
+}
+
+// A session that dies mid-task must fail the run promptly and WITH
+// ATTRIBUTION. Before this, drainEvents discarded every event including
+// exited, so Run waited out the entire wall budget for a verdict that could
+// never arrive and then blamed the budget.
+//
+// The wall budget here is 120s and the assertion is that Run returns inside
+// 30s: waiting the budget out is exactly the old behaviour, so the deadline is
+// the point of the test, not incidental.
+func TestRunFailsWithAttributionWhenASessionDies(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	cfg := scenario(t, twoServiceRepo(t), []pcops.AgentDef{
+		{Name: "billing", Branch: "agent/billing", Role: "implementer", Task: "add currency"},
+	})
+	r := fake.New(map[string]fake.Script{
+		// Dies before submitting anything: no verdict can ever arrive.
+		"billing": {OnStart: []fake.Action{fake.Exit{}}},
+	})
+
+	start := time.Now()
+	_, err := pcops.Run(ctx, cfg, r)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, pcops.ErrSessionDied) {
+		t.Fatalf("Run err = %v, want ErrSessionDied", err)
+	}
+	if !strings.Contains(err.Error(), "billing") {
+		t.Fatalf("Run err = %v, want it to name the agent that died", err)
+	}
+	if elapsed > 30*time.Second {
+		t.Fatalf("Run took %v with a %v wall budget: it waited the budget out instead of detecting the death", elapsed, cfg.Wall)
+	}
+}
+
+// A gate that fails every round must stop at the cap rather than retry until
+// the wall budget — and cfg.Wall == 0 is documented as unbounded, so without a
+// cap a scenario file with no budget.wall retried forever. The spec's Negative
+// Result section makes three attempts the answer, not a number to retry past.
+func TestRunStopsAfterTheRoundCap(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	pc := buildPC(t)
+	cfg := scenario(t, twoServiceRepo(t), []pcops.AgentDef{
+		{Name: "billing", Branch: "agent/billing", Role: "implementer", Task: "add currency"},
+	})
+	submit := fake.Exec{Args: []string{pc, "submit", "--gate", "checkout"}}
+	r := fake.New(map[string]fake.Script{
+		// Submits, is blocked, resubmits unchanged: gateway.txt never gains the
+		// currency field, so the spanning check can never pass.
+		"billing": {
+			OnStart: []fake.Action{submit},
+			OnSteer: func(string) []fake.Action { return []fake.Action{submit} },
+		},
+	})
+
+	v, err := pcops.Run(ctx, cfg, r)
+	if err == nil {
+		t.Fatal("Run returned nil error for a gate that never passes")
+	}
+	if v.Passed {
+		t.Fatalf("verdict = %+v, want a failing one", v)
+	}
+	if !strings.Contains(err.Error(), "3 rounds") {
+		t.Fatalf("Run err = %v, want it to name the round count", err)
+	}
+}
+
+// budget.submit_timeout was dead configuration: Run injected only PC_AGENT and
+// PC_DB, so every `pc submit` a spawned agent ran parked for the 5-minute
+// default whatever the scenario said. The agent here records the environment it
+// was given, outside its worktree so the record survives the lease being
+// released.
+func TestRunInjectsTheConfiguredSubmitTimeout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	record := filepath.Join(t.TempDir(), "env.txt")
+	cfg := scenario(t, twoServiceRepo(t), []pcops.AgentDef{
+		{Name: "billing", Branch: "agent/billing", Role: "implementer", Task: "add currency"},
+	})
+	r := fake.New(map[string]fake.Script{
+		"billing": {OnStart: []fake.Action{
+			fake.Exec{Args: []string{"sh", "-c", "printenv PC_SUBMIT_TIMEOUT > " + record}},
+			fake.Exit{},
+		}},
+	})
+
+	if _, err := pcops.Run(ctx, cfg, r); !errors.Is(err, pcops.ErrSessionDied) {
+		t.Fatalf("Run err = %v, want ErrSessionDied after the scripted exit", err)
+	}
+	got, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("the session never recorded its environment: %v", err)
+	}
+	if strings.TrimSpace(string(got)) != cfg.SubmitTimeout.String() {
+		t.Fatalf("PC_SUBMIT_TIMEOUT = %q, want %q", strings.TrimSpace(string(got)), cfg.SubmitTimeout)
+	}
+}
