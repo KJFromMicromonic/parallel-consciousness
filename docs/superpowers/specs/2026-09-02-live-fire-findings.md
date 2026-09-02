@@ -106,6 +106,64 @@ It refused to claim success, cited the contract's exit-0 rule back, and correctl
 identified the missing component. A model honouring the contract while *failing*
 is far better evidence than one honouring it on the happy path.
 
+## Stage 1, re-run — the full loop, two vendors, including the failure branch
+
+With F3 fixed the coordinator stayed up, and the loop ran to convergence. The
+currency code the two services had to agree on was supplied by the integration
+environment (`EXPECTED_CURRENCY=USD` on the gate command) and was verified absent
+from both agents' worktrees, so neither could discover it locally.
+
+```
+ 1|gateway    |#gate.currency|ready   |version 9c06c1cd   (unchanged — still EUR)
+ 2|billing    |#gate.currency|ready   |version ae7015b3   (renders the currency)
+ 3|coordinator|integrator    |request |both versions
+ 4|integrator |coordinator   |disagree|SPANNING FAILURE ... = "charged 100 (EUR)", want "charged 100 (USD)"
+ 5|coordinator|#gate.currency|inform  |currency FAILED           13:10:09
+ 6|coordinator|billing       |block   |with the detail
+ 7|coordinator|gateway       |block   |with the detail
+ 9|billing    |#gate.currency|ready   |ae7015b3 (unchanged — correctly concluded its half was fine)
+10|gateway    |#gate.currency|ready   |version 8f338e61   ← new commit: "send USD, the currency billing expects"
+12|coordinator|integrator    |request |both versions
+13|integrator |coordinator   |done    |
+14|coordinator|#gate.currency|inform  |currency PASSED           13:10:23
+```
+
+**The exit-1 branch works.** Gateway received exit 1, read the detail, learned a
+value it could not have known from its own worktree, fixed only its own service,
+committed, and re-submitted. Its own log: *"the billing side was already
+correct … My local code just needed the fix. I did not change anything in
+`billing/`."* — it respected the ownership boundary while fixing its half.
+
+**Two rounds, two vendors, failure routing and convergence: 14 seconds.**
+
+### F6 — agents coordinate without being asked to
+
+Billing sent gateway an unprompted `pc send`, carrying a real diagnosis:
+
+> `currency gate failed after billing now renders charge.Currency:`
+> `billing.Accept(gateway.Send()) was "charged 100 (EUR)", want "charged 100 (USD)".`
+> `Billing branch committed as ae7015b; gateway appears to still send EUR …`
+
+Nothing in the task or the contract snippet asked for this. The contract only
+documents `pc submit`; `pc send` was mentioned nowhere. pi worked out that
+another participant needed information it had, named its own commit, and
+diagnosed the other service's fault. This is the conversation-layer thesis
+arriving on its own, and it is the strongest single result of the exercise.
+
+### F2 revisited — redundant submits cost 25× the loop itself
+
+Billing submitted four times: `13:10:08`, `13:10:21`, `13:10:28`, `13:15:56`.
+The last two landed **after** the gate had already passed at `13:10:23`. With
+gateway finished, quorum was unreachable, so each blocked for the full
+`submit_timeout` before returning exit 2.
+
+**The loop took 14 seconds. The redundant submits took about six minutes** — they
+are the entire reason the run exceeded a nine-minute budget. F2 is not cosmetic;
+it is the dominant cost in a real run. The contract snippet already says "Do not
+submit again" on exit 0 and that did not suppress it, so this needs a mechanism,
+not wording: `pc submit` should decline (or return immediately) when the agent's
+current version has already been accepted in a resolved round.
+
 ## Still untested
 
 **The exit-1 branch.** Stage 0's model got the task right first time; Stage 1
