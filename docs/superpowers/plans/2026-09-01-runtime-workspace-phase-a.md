@@ -2608,4 +2608,18 @@ Every in-scope item from the design spec, and where it lands:
 | `fixtures/two-service` Go fixture repository | B — Phase A's loop test uses a minimal inline fixture |
 | Manual end-to-end PoC and its six success criteria | B |
 
-Nothing in the spec is dropped; the split is only about what can be proven without a harness.
+The spec's **Failure modes** table is a specification too, and the first version of this map did not track it — which is how five specified detections ended up assigned to no phase at all, two of them shipping as real defects found in whole-branch review (session death, merge-conflict classification) and one ("three attempts") going unimplemented as an uncapped retry loop. Each row now has an honest phase:
+
+| Spec failure mode | Detection | Phase |
+|---|---|---|
+| Agent process dies mid-task | `exited` with no prior `idle` | A — the drainer forwards terminal events and `Run` fails with attribution. Phase A treats ANY terminal event as a death; distinguishing "no prior `idle`" needs an adapter whose sessions have an orderly finish, so that refinement is B |
+| Agent parks indefinitely | `pc submit` timeout | A — `Submit` returns `ErrNoVerdict` and `pc submit` exits 2, with the timeout now taken from `budget.submit_timeout`. Marking the RUN stalled (rather than just the one submit) is B |
+| Runner never executes | gate runner-timeout | A — already `pkg/gate`; `StartCoordinator` sets the 10-minute runner timeout for real test commands |
+| Merge conflict in the integrator | `git merge` exit status | A — `mergeAll` classifies a genuine conflict (exit 1 + `CONFLICT`, or a non-empty `git ls-files -u`) separately from any other git failure, because routing "conflict" for a missing branch or a stale `index.lock` sends agents hunting one that does not exist |
+| Agent never calls `pc submit` | absent from tool events | A only as the scenario-wide `budget.wall`; the spec's wording implies a per-agent kill, which does not exist and is B |
+| Agent edits outside its service | `tool_used` paths | B — recording evidence needs the domain store; Phase A drains tool events without persisting them |
+| Token runaway | `Outcome.Tokens` | B — the fake spends no tokens, so there is nothing to report until the real adapter exists |
+| Harness renames an event | conformance run fails | B — `runtimetest` exists in A, but there is no adapter for it to be a canary over yet |
+| Three attempts cannot converge (Negative Result) | round count | A — `Run` caps failing rounds at `maxRounds` (3) and fails naming the count, instead of retrying to the wall budget |
+
+So: the split is about what can be proven without a harness, and the table above is now the whole tracked surface — packages, commands, and failure-mode detections. The earlier claim that "nothing in the spec is dropped" was stronger than a coverage map over packages and commands could support; what is true is that every item listed here has a phase, and anything the spec asks for that is missing from these tables is untracked rather than deliberately deferred.

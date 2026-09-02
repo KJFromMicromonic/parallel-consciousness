@@ -147,7 +147,7 @@ type Spec struct {
 }
 
 type Budget struct {
-	Wall   time.Duration // enforced
+	Wall   time.Duration // enforced by the caller, not by the session; see below
 	Tokens int64         // reported only; 0 means unbounded
 }
 
@@ -229,9 +229,15 @@ Design decisions:
   "deliver at the next turn boundary." `IntentBlock` maps to `Steer`, ordinary
   intents map to `Follow`, and only an operator stop or budget kill maps to
   `Interrupt`, which alone preempts in-flight work.
-- **Wall-clock budget is enforced; tokens are reported.** Token enforcement
-  requires a policy decision (kill, warn, or degrade the model) that this slice
-  does not need to make.
+- **Wall-clock budget is enforced by the caller and scenario-wide; tokens are
+  reported.** `pkg/runtime` documents `Budget.Wall` as enforced by the caller —
+  no adapter is required to kill its own session — and `internal/pcops.Run`
+  applies `budget.wall` as a single context deadline over the WHOLE scenario,
+  not per session. The same value is passed down in `Spec.Budget` so an adapter
+  may also honour it, and none does in Phase A. There is therefore no per-agent
+  wall-clock kill: one slow agent ends the entire run rather than being
+  terminated on its own. Token enforcement requires a policy decision (kill,
+  warn, or degrade the model) that this slice does not need to make.
 
 ## `pkg/workspace`
 
@@ -356,10 +362,26 @@ back at it.
 Because delivery is pushed, **`pc inbox` is unnecessary**, and with it the
 "did the model remember to poll?" failure mode.
 
-A parked agent — one blocked inside `pc submit` — receives a gate verdict as that
-command's exit code and detail, not through `Steer`. The two paths therefore
-cover different agent states, which is why the PoC scenario includes an
-unsolicited mid-task message: it is the only step that exercises the steer path.
+A parked agent — one blocked inside `pc submit` — receives a failing gate verdict
+**both ways, not one or the other**. Its `pc submit` returns the verdict as an
+exit code and detail, and its courier is subscribed for the whole run and is a
+separate process from the parked command, so the coordinator's `IntentBlock` —
+sent on the direct path, which `pkg/bus/sqlite` does not sender-filter — is also
+accepted and queued as a `Steer`, applied at the first turn boundary after the
+park ends. `pkg/agent` additionally auto-acks that block, so the log carries an
+extra `Ack` from the parked agent.
+
+The consequence is a duplicate: the agent is told about the same failure twice,
+once synchronously and once as queued steering. Suppressing it is **deferred to
+Phase B**, where a real agent branches on `pc submit`'s exit code and the
+courier can drop a block whose verdict the agent has already consumed. Phase A's
+scripted fake never branches on the exit code, so the duplicate is invisible to
+it and cannot be designed against yet.
+
+The unsolicited mid-task message in the PoC scenario is still worth keeping: it
+is the only step that exercises the steer path against an agent that is
+*working* rather than parked, which is the state where next-turn-boundary
+delivery is the interesting behaviour.
 
 ## `cmd/pc` surface for this slice
 
@@ -463,7 +485,7 @@ absorbed by additional retries.
 | Agent parks indefinitely | `pc submit` timeout | exit 2 (distinct from failure); the run is marked stalled |
 | Runner never executes | gate runner-timeout | already handled by `pkg/gate` |
 | Merge conflict in the integrator | `git merge` exit status | verdict FAILED with the conflict as detail, routed to both owners |
-| Agent never calls `pc submit` | absent from tool events | wall-clock budget terminates it; recorded as a loop-design failure, not a code defect |
+| Agent never calls `pc submit` | absent from tool events | the scenario-wide wall-clock budget ends the RUN (there is no per-agent kill — see the Budget note above); recorded as a loop-design failure, not a code defect |
 | Agent edits outside its service | `tool_used` paths | recorded, not prevented; prevention requires the container milestone |
 | Token runaway | `Outcome.Tokens` | reported, not enforced |
 | pi renames an event | pi conformance run fails | pinned pi version; the suite is the canary |
@@ -555,9 +577,13 @@ are held to it.
 - Token budgets are observed, not enforced.
 - Urgent delivery is not preemption: a `block` reaches a working agent only at
   its next turn boundary, bounded by the duration of the tool call in flight.
-- A parked agent — one blocked inside `pc submit` — cannot be reached by the push
-  path at all until that call returns, up to the submit timeout. Gate verdicts
-  arrive as the command's exit code precisely because of this.
+- A parked agent — one blocked inside `pc submit` — cannot *act* on the push path
+  until that call returns, up to the submit timeout. Gate verdicts arrive as the
+  command's exit code precisely because of this. The push message is still
+  accepted and queued meanwhile, so a failing verdict reaches a parked agent
+  twice; de-duplicating that is Phase B work (see Hybrid communication wiring).
+- `Budget.Wall` bounds the whole scenario from `pc run`, not each session
+  individually. A single agent that never finishes cannot be killed on its own.
 - Single machine, single repository, one gate.
 - pi is pinned; event-name churn across pi releases will surface as conformance
   failures requiring adapter updates.
