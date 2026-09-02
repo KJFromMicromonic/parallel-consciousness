@@ -138,6 +138,16 @@ func (m *Manager) Acquire(ctx context.Context, agent, branch string) (*Lease, er
 		return nil, ErrLeased
 	}
 
+	// rollbackCtx deliberately outlives ctx's cancellation: git invocations
+	// below honour ctx (see git.go), so a cancellation timed inside e.g.
+	// worktreeAdd would fail both the add AND a rollback DELETE that used the
+	// same ctx, leaving a claimed lease row with no worktree behind it. That
+	// self-heals after the lease TTL, but there is no reason to leave a
+	// reclaimable-only-by-timeout row when the compensating delete could just
+	// run to completion instead. Cleanup running on a cancelled ctx's request
+	// is the whole point of cleanup, so it gets its own, uncancellable ctx.
+	rollbackCtx := context.WithoutCancel(ctx)
+
 	// Reclaiming a stale lease is crash recovery: the previous holder never
 	// called Release, so its worktree directory is still on disk. git worktree
 	// add fails outright on an existing directory (-B only resets the branch
@@ -145,11 +155,11 @@ func (m *Manager) Acquire(ctx context.Context, agent, branch string) (*Lease, er
 	// path doesn't already exist; otherwise reattach to what's there.
 	if _, statErr := os.Stat(path); statErr != nil {
 		if !os.IsNotExist(statErr) {
-			_, _ = m.db.ExecContext(ctx, `DELETE FROM leases WHERE path = ?`, path)
+			_, _ = m.db.ExecContext(rollbackCtx, `DELETE FROM leases WHERE path = ?`, path)
 			return nil, fmt.Errorf("stat worktree %s: %w", path, statErr)
 		}
 		if err := worktreeAdd(ctx, m.repo, path, branch); err != nil {
-			_, _ = m.db.ExecContext(ctx, `DELETE FROM leases WHERE path = ?`, path)
+			_, _ = m.db.ExecContext(rollbackCtx, `DELETE FROM leases WHERE path = ?`, path)
 			return nil, err
 		}
 	} else {
@@ -163,11 +173,11 @@ func (m *Manager) Acquire(ctx context.Context, agent, branch string) (*Lease, er
 		// to paper over. So verify and fail loudly on mismatch instead.
 		onDisk, err := worktreeBranch(ctx, path)
 		if err != nil {
-			_, _ = m.db.ExecContext(ctx, `DELETE FROM leases WHERE path = ?`, path)
+			_, _ = m.db.ExecContext(rollbackCtx, `DELETE FROM leases WHERE path = ?`, path)
 			return nil, err
 		}
 		if onDisk != branch {
-			_, _ = m.db.ExecContext(ctx, `DELETE FROM leases WHERE path = ?`, path)
+			_, _ = m.db.ExecContext(rollbackCtx, `DELETE FROM leases WHERE path = ?`, path)
 			return nil, fmt.Errorf("workspace: reclaim of agent %q at %s found branch %q checked out, requested %q", agent, path, onDisk, branch)
 		}
 	}
