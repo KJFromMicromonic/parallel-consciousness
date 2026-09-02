@@ -39,10 +39,16 @@ type Manager struct {
 // repository, root is the directory worktrees are created under, dbPath is the
 // bus's SQLite file.
 func New(ctx context.Context, repo, root, dbPath string) (*Manager, error) {
-	// Same pragmas as pkg/bus/sqlite.Open. Without WAL and a busy timeout this
-	// connection contends with the bus's writes on the very same file and fails
-	// with "database is locked".
-	dsn := "file:" + dbPath + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)"
+	// Same pragmas, in the same order, as pkg/bus/sqlite.Open. Without WAL and a
+	// busy timeout this connection contends with the bus's writes on the very
+	// same file and fails with "database is locked".
+	//
+	// busy_timeout MUST stay first: modernc.org/sqlite applies _pragma params in
+	// DSN order, so anything ahead of it — journal_mode(WAL) in particular, which
+	// takes an exclusive lock — executes with a zero busy handler and fails
+	// outright against another pool finalising the WAL on this file. Do not
+	// reorder these for tidiness; see the comment in pkg/bus/sqlite.Open.
+	dsn := "file:" + dbPath + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open lease store: %w", err)

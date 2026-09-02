@@ -73,7 +73,16 @@ type Bus struct {
 
 // Open opens (creating if needed) the SQLite database at path and ensures the schema exists.
 func Open(ctx context.Context, path string, opts ...Option) (*Bus, error) {
-	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)"
+	// Pragma ORDER MATTERS, and busy_timeout must come first. modernc.org/sqlite
+	// applies _pragma params in DSN order on each new connection, so any pragma
+	// listed before busy_timeout runs with a zero busy handler. journal_mode(WAL)
+	// takes an exclusive lock, and it collides with another pool's connection
+	// finalising the WAL on the same file: without the busy handler already
+	// installed that pragma gets SQLITE_BUSY with no retry and the very next
+	// PingContext fails. Measured: 5 failures in 40 runs with journal_mode first,
+	// 0 in 100 with busy_timeout first. Do not "tidy" this back into a prettier
+	// order.
+	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite %q: %w", path, err)
@@ -222,10 +231,10 @@ func (b *Bus) deliverBatch(ctx context.Context, agent string, topics []string, c
 	last := cursor
 	for rows.Next() {
 		var (
-			seq                                                              int64
+			seq                                                             int64
 			id, conv, inReplyTo, fromAgent, toAgent, toTopic, intent, bodyS string
-			ts                                                               string
-			deadline                                                         sql.NullString
+			ts                                                              string
+			deadline                                                        sql.NullString
 		)
 		if err := rows.Scan(&seq, &id, &conv, &inReplyTo, &fromAgent, &toAgent, &toTopic, &intent, &bodyS, &ts, &deadline); err != nil {
 			return n, last, err
@@ -307,6 +316,11 @@ func buildMessage(id, conv, inReplyTo, fromAgent, toAgent, toTopic, intent, body
 
 // saveCursor persists an agent's read position. Errors are non-fatal (reported
 // via the error hook); the read side is wired in Task 4.
+//
+// The upsert is monotonic (MAX): two subscribers sharing an agent name share one
+// cursors row, and a short-lived one exiting behind a long-lived one must never
+// rewind the stored position, or the next subscription under that name replays
+// already-consumed messages.
 func (b *Bus) saveCursor(ctx context.Context, agent string, seq int64) {
 	_, err := b.db.ExecContext(ctx,
 		`INSERT INTO cursors (agent, last_seq) VALUES (?, ?)
