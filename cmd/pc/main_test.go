@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -213,5 +214,107 @@ func TestUnknownSubcommandExits2(t *testing.T) {
 func TestNoSubcommandExits2(t *testing.T) {
 	if got := run(context.Background(), nil); got != 2 {
 		t.Errorf("run with no subcommand = %d, want 2", got)
+	}
+}
+
+// chdir points the process's cwd at dir and returns a func that restores the
+// original directory. resolveVersion's git step deliberately reads the
+// process cwd (not a path derived from config), so exercising it means
+// actually moving the process there — which is why the tests that use this
+// cannot run in parallel with anything else that depends on cwd.
+func chdir(t *testing.T, dir string) {
+	t.Helper()
+	orig, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(orig); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+// An explicit --version wins outright: it must not consult git at all, which
+// this proves by resolving it from a directory that is not a git repository.
+func TestResolveVersionExplicitWinsWithoutGit(t *testing.T) {
+	chdir(t, t.TempDir())
+	got, err := resolveVersion(context.Background(), "v1.2.3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "v1.2.3" {
+		t.Errorf("resolveVersion(explicit) = %q, want %q", got, "v1.2.3")
+	}
+}
+
+// With no --version, resolveVersion falls back to the cwd's git HEAD — the
+// committed state the gate will actually merge and test, not whatever is
+// sitting uncommitted in the tree.
+func TestResolveVersionFallsBackToGitHEAD(t *testing.T) {
+	dir := t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	runGit("init")
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "f.txt")
+	runGit("commit", "-m", "initial")
+
+	wantOut, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.TrimSpace(string(wantOut))
+
+	chdir(t, dir)
+	got, err := resolveVersion(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Errorf("resolveVersion(\"\") = %q, want HEAD %q", got, want)
+	}
+}
+
+// Outside a git repository and with no --version, there is nothing to
+// attribute a verdict to, so resolveVersion must error rather than fall back
+// to a placeholder like "unversioned" — a made-up version is the defect this
+// fixes, not an acceptable degraded mode.
+func TestResolveVersionErrorsOutsideGitRepo(t *testing.T) {
+	chdir(t, t.TempDir())
+	_, err := resolveVersion(context.Background(), "")
+	if err == nil {
+		t.Fatal("resolveVersion(\"\") outside a git repo = nil error, want one")
+	}
+	if !strings.Contains(err.Error(), "--version") {
+		t.Errorf("error %q does not tell the caller they can pass --version explicitly", err.Error())
+	}
+}
+
+// A submit that cannot identify its own version is an identity error, not a
+// gate verdict, so it must exit 2 — never 0 or 1, which are reserved for an
+// actual verdict from the gate.
+func TestCmdSubmitExits2WhenVersionCannotBeResolved(t *testing.T) {
+	chdir(t, t.TempDir())
+	t.Setenv("PC_DB", filepath.Join(t.TempDir(), "pc.db"))
+	t.Setenv("PC_AGENT", "billing")
+
+	got := cmdSubmit(context.Background(), []string{"--gate", "checkout"})
+	if got != 2 {
+		t.Errorf("cmdSubmit with unresolvable version = %d, want 2", got)
 	}
 }

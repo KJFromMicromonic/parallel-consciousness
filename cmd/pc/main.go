@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -78,9 +79,12 @@ func cmdSubmit(ctx context.Context, args []string) int {
 		fmt.Fprintln(os.Stderr, "pc submit: --gate and an identity (--as or $PC_AGENT) are required")
 		return 2
 	}
-	v := *version
-	if v == "" {
-		v = "unversioned"
+	v, err := resolveVersion(ctx, *version)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pc submit: %v\n", err)
+		// Cannot identify what state is being submitted — an identity error,
+		// not a gate verdict, so it must not be conflated with exit 1.
+		return 2
 	}
 
 	verdict, err := pcops.Submit(ctx, cfg, *gateID, name, v)
@@ -243,6 +247,31 @@ func exitForDaemon(err error) int {
 	}
 	fmt.Fprintln(os.Stderr, err)
 	return 2
+}
+
+// resolveVersion implements the design spec's resolution order for `pc
+// submit`: --version, when the caller passed one, wins outright and git is
+// never consulted. Otherwise fall back to `git rev-parse HEAD` run in the
+// process's current working directory — deliberately the cwd, not the repo
+// root and not a path derived from config, because an agent runs `pc submit`
+// from inside its own git worktree and that worktree's HEAD is precisely the
+// version being declared. HEAD is the right answer even with uncommitted
+// changes in the tree: the gate merges committed branches, so uncommitted
+// work is invisible to it regardless, and HEAD is what the gate will
+// actually test. Reporting anything else would overstate what was submitted.
+// With no explicit version and no git repository to fall back to, there is
+// nothing left to attribute a verdict to, so this returns an error rather
+// than a placeholder constant — an unattributable "unversioned" readiness
+// declaration was the defect this replaces.
+func resolveVersion(ctx context.Context, explicit string) (string, error) {
+	if explicit != "" {
+		return explicit, nil
+	}
+	out, err := exec.CommandContext(ctx, "git", "rev-parse", "HEAD").Output()
+	if err != nil {
+		return "", fmt.Errorf("no version: not in a git repository and --version was not passed; pass --version explicitly: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // loadConfig prefers an explicit scenario file and otherwise synthesises the
