@@ -12,16 +12,24 @@ import (
 )
 
 func TestFakeConformance(t *testing.T) {
-	runtimetest.Run(t, func(t *testing.T) runtime.Runtime {
-		return fake.New(map[string]fake.Script{
-			"a": {
-				OnStart: []fake.Action{fake.Emit{Tool: runtime.ToolUse{Name: "read", Target: "x", Ok: true}}},
-				OnSteer: func(text string) []fake.Action {
-					return []fake.Action{fake.Emit{Tool: runtime.ToolUse{Name: "read", Target: "steer", Ok: true}}}
-				},
+	scripts := map[string]fake.Script{
+		"a": {
+			OnStart: []fake.Action{fake.Emit{Tool: runtime.ToolUse{Name: "read", Target: "x", Ok: true}}},
+			OnSteer: func(text string) []fake.Action {
+				return []fake.Action{fake.Emit{Tool: runtime.ToolUse{Name: "read", Target: "steer", Ok: true}}}
 			},
-		})
-	}, runtime.Spec{Agent: "a", Workdir: t.TempDir()})
+		},
+		// "b" ends on its own with no Close/Interrupt, so the suite's
+		// natural-end property has something to observe.
+		"b": {
+			OnStart: []fake.Action{fake.Exit{}},
+		},
+	}
+	runtimetest.Run(t, func(t *testing.T) runtime.Runtime {
+		return fake.New(scripts)
+	}, runtime.Spec{Agent: "a", Workdir: t.TempDir()}, runtimetest.Options{
+		Completes: runtime.Spec{Agent: "b", Workdir: t.TempDir()},
+	})
 }
 
 func TestSteerRunsTheSteerScript(t *testing.T) {
