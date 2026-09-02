@@ -23,7 +23,14 @@ var ErrNoVerdict = errors.New("pcops: no verdict before timeout")
 // This is the whole harness-agnostic contract: a gate id, an opaque version, an
 // agent name. Any tool that can run a shell command can participate.
 func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) (gate.Verdict, error) {
-	ctx, cancel := context.WithTimeout(ctx, cfg.SubmitTimeout)
+	// A zero SubmitTimeout means "unset", not "already expired": callers that
+	// build a Config by hand (and every test that does) would otherwise get an
+	// instantly cancelled context and ErrNoVerdict.
+	timeout := cfg.SubmitTimeout
+	if timeout <= 0 {
+		timeout = DefaultSubmitTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	b, err := sqlite.Open(ctx, cfg.DB, sqlite.WithPollInterval(25*time.Millisecond))
@@ -37,6 +44,18 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 		return gate.Verdict{}, fmt.Errorf("join as %q: %w", agentName, err)
 	}
 
+	// readyAt is captured before gate.Ready below and fences off every verdict
+	// from a previous round. The gate id plus a `passed` bool does not identify
+	// a round, and pkg/bus/sqlite resumes a subscription from the STORED cursor
+	// whenever a row exists for this agent name — so an earlier round's Inform
+	// can still be sitting unread in the log and would be returned instantly as
+	// this round's answer. Two paths reach that state: a PASSING verdict routes
+	// no blocks, so nothing advances the courier past its Inform; and an agent
+	// with no in-process courier only ever has short-lived submit processes,
+	// whose `defer b.Close()` makes the poller skip saveCursor entirely.
+	// protocol.New stamps Timestamp, so the round boundary is simply time.
+	var readyAt time.Time
+
 	verdicts := make(chan gate.Verdict, 1)
 	a.On(protocol.IntentInform, func(_ context.Context, _ *agent.Agent, m protocol.Message) *protocol.Message {
 		if id, _ := m.Body["gate"].(string); id != gateID {
@@ -45,6 +64,9 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 		passed, ok := m.Body["passed"].(bool)
 		if !ok {
 			return nil // not a verdict broadcast
+		}
+		if m.Timestamp.Before(readyAt) {
+			return nil // a previous round's verdict, replayed from the cursor
 		}
 		// The broadcast carries one "text" line for both outcomes ("<gate>
 		// PASSED" / "<gate> FAILED: <detail>"); Detail is documented as
@@ -59,6 +81,11 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 		}
 		return nil
 	})
+	// Set before a.Run starts, never after: handlers only run from that
+	// goroutine, so starting it after the write is what publishes readyAt to
+	// them without a mutex. It is still the instant before Ready, and the
+	// coordinator cannot broadcast this round's verdict before it sees Ready.
+	readyAt = time.Now()
 	go a.Run(ctx)
 
 	if err := gate.Ready(ctx, a, gateID, version); err != nil {
