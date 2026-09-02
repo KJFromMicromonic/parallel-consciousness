@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/KJFromMicromonic/parallel-consciousness/pkg/agent"
@@ -16,6 +18,26 @@ import (
 // distinct from a failing verdict: "did not run" and "ran and failed" demand
 // different responses from an agent.
 var ErrNoVerdict = errors.New("pcops: no verdict before timeout")
+
+// ErrNotAcknowledged means readiness was declared but nothing acknowledged
+// it within AckTimeout. Callers must keep this distinct from ErrNoVerdict:
+// "the gate hasn't run yet" (a live coordinator that just hasn't reached
+// quorum) and "nothing is listening at all" are different failures that
+// demand different responses — the F4 finding in
+// docs/superpowers/specs/2026-09-02-live-fire-findings.md is exactly this
+// confusion, observed live as an 8-minute silent block with a dead
+// coordinator and, separately, a 7m45s wait for a peer that was never
+// coming. gate.go's onReady now acks every readiness it records for exactly
+// this reason.
+var ErrNotAcknowledged = errors.New("pcops: gate did not acknowledge readiness")
+
+// AckTimeout bounds how long Submit waits for the coordinator's IntentAck
+// after declaring readiness, before concluding no coordinator is listening.
+// This is deliberately much shorter than SubmitTimeout: it tolerates a
+// coordinator that is merely slow to start, while still turning a genuinely
+// missing one into a diagnosis in seconds rather than the minutes a live run
+// actually lost to silence (see ErrNotAcknowledged and gate.go's onReady).
+const AckTimeout = 10 * time.Second
 
 // Submit declares readiness for a gate and blocks until the coordinator
 // broadcasts a verdict for it.
@@ -81,6 +103,24 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 		}
 		return nil
 	})
+	// acked carries the coordinator's IntentAck for THIS gate, decoded to the
+	// required participants it is still waiting on. See gate.go's onReady:
+	// every readiness it records gets one of these back, which is F4's whole
+	// fix — a blocked submit gets a prompt, positive signal instead of total
+	// silence. Buffered 1 like verdicts, for the same reason: the handler
+	// must never block the agent's dispatch loop on a send nobody is
+	// reading yet.
+	acked := make(chan []string, 1)
+	a.On(protocol.IntentAck, func(_ context.Context, _ *agent.Agent, m protocol.Message) *protocol.Message {
+		if id, _ := m.Body["gate"].(string); id != gateID {
+			return nil
+		}
+		select {
+		case acked <- outstandingFromBody(m.Body["outstanding"]):
+		default:
+		}
+		return nil
+	})
 	// Set before a.Run starts, never after: handlers only run from that
 	// goroutine, so starting it after the write is what publishes readyAt to
 	// them without a mutex. It is still the instant before Ready, and the
@@ -92,10 +132,63 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 		return gate.Verdict{}, fmt.Errorf("declare ready: %w", err)
 	}
 
+	// First wait for the acknowledgement — bounded by AckTimeout, not the
+	// full submit timeout, so a missing coordinator is diagnosed in seconds.
+	// A verdict is also accepted here and satisfies the wait outright: the
+	// F2 cache path (see gate.go's gateState doc comment) answers a
+	// redundant identical resubmit straight from a remembered verdict
+	// without recording readiness at all, so no ack is ever sent for it.
+	// Treating "verdict arrived" as "acknowledged" is what keeps that path
+	// from regressing into a spurious ErrNotAcknowledged.
+	ackTimer := time.NewTimer(AckTimeout)
+	defer ackTimer.Stop()
+	select {
+	case outstanding := <-acked:
+		if len(outstanding) > 0 {
+			// Surfaced directly here, not threaded back through the return
+			// value: Submit's signature is a fixed public contract (just a
+			// verdict and an error), and this is informational only — it
+			// does not change what Submit ultimately returns. A caller
+			// blocked on `pc submit` sees this on the process's own stderr
+			// the moment the coordinator responds, which is exactly the
+			// "waiting on a peer, not on nothing" signal F4 is about.
+			fmt.Fprintf(os.Stderr, "pc submit: gate %q acknowledged; still waiting on %s\n",
+				gateID, strings.Join(outstanding, ", "))
+		}
+	case v := <-verdicts:
+		return v, nil
+	case <-ackTimer.C:
+		return gate.Verdict{}, fmt.Errorf("gate %q: %w", gateID, ErrNotAcknowledged)
+	case <-ctx.Done():
+		return gate.Verdict{}, ErrNoVerdict
+	}
+
 	select {
 	case v := <-verdicts:
 		return v, nil
 	case <-ctx.Done():
 		return gate.Verdict{}, ErrNoVerdict
+	}
+}
+
+// outstandingFromBody coerces a wire "outstanding" value into []string,
+// accepting both the in-memory []string (pkg/gate builds it that way
+// directly, and the in-memory bus passes values through unchanged) and a
+// JSON []any (what pkg/bus/sqlite delivers after a round trip through the
+// database). Mirrors gate.go's versionsFromBody for the same reason.
+func outstandingFromBody(v any) []string {
+	switch vv := v.(type) {
+	case []string:
+		return vv
+	case []any:
+		out := make([]string, 0, len(vv))
+		for _, e := range vv {
+			if s, ok := e.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
 	}
 }
