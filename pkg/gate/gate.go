@@ -90,6 +90,39 @@ type gateState struct {
 	ready    map[string]string // participant -> version
 	inflight bool              // a run is awaiting the runner's verdict
 	gen      int               // bumped on each resolution; invalidates stale timers
+
+	// lastVerdict and lastStalled remember the most recently resolved round:
+	// who was tested at which version (Verdict.Versions), whether it passed,
+	// and whether that resolution came from a stalled runner. onReady
+	// consults this before recording a new readiness signal: a participant
+	// re-submitting at the identical version a completed round already
+	// covered is asking "is my version good?", and the honest, immediate
+	// answer is the recorded verdict — not silence until submit_timeout,
+	// which a quorum that can never re-form would otherwise guarantee.
+	//
+	// The remembered round is replayed through resolve (see onReady), the
+	// same path a freshly-computed verdict takes — not delivered by some
+	// separate, bespoke message. An earlier version of this mechanism sent a
+	// direct IntentInform straight to the resubmitting sender instead. That
+	// looked correct in isolation, but internal/pcops's courier forwards any
+	// non-block intent addressed to an agent into that agent's live session
+	// (the same path that carries peer `pc send` traffic) — so the "answer"
+	// was also delivered to the courier, which nudged the session, which
+	// resubmitted, which produced another cached answer, forwarded again,
+	// forever. Because that direct send bypassed resolve, the round-cap
+	// counter (driven by OnVerdict) never advanced either, so nothing bounded
+	// it: an unbounded busy loop, worse than the multi-minute hang it was
+	// meant to fix. Routing through resolve keeps every existing consumer of
+	// a round's outcome — the topic broadcast, the failure blocks, and the
+	// OnVerdict hook that round-caps a stuck participant — exactly as they
+	// are for a fresh round, so a repeat offender is still bounded.
+	//
+	// Known limitation: this means a gate cannot be deliberately re-run on an
+	// unchanged version — e.g. to retry a flaky spanning test — since the
+	// recorded verdict wins instead. That is the right default; a forced
+	// re-run would need an explicit opt-in, which is not implemented here.
+	lastVerdict *Verdict
+	lastStalled bool
 }
 
 // NewCoordinator wires gate handlers onto an agent.
@@ -152,6 +185,26 @@ func (c *Coordinator) onReady(ctx context.Context, _ *agent.Agent, m protocol.Me
 		return nil
 	}
 	gs.mu.Lock()
+	// Not in flight and a previous round tested this exact sender at this
+	// exact version: resolve a synthetic round from the remembered verdict
+	// instead of recording new readiness. Exact string equality on purpose —
+	// any change since (even an uncommitted one that changed the version
+	// string) means this is a new state that has never been tested, so
+	// readiness must proceed normally.
+	if !gs.inflight && gs.lastVerdict != nil {
+		if tested, ok := gs.lastVerdict.Versions[m.From.Agent]; ok && tested == version {
+			cached := *gs.lastVerdict
+			stalled := gs.lastStalled
+			// Mirror what open does to gs.inflight before handing off to
+			// resolve: resolve requires it (its guard would otherwise
+			// silently no-op this synthetic round) and it also blocks any
+			// readiness recorded concurrently from folding into it.
+			gs.inflight = true
+			gs.mu.Unlock()
+			c.resolve(ctx, gs, cached, stalled, true)
+			return nil
+		}
+	}
 	required := contains(gs.spec.Required, m.From.Agent)
 	if required && !gs.inflight {
 		gs.ready[m.From.Agent] = version // dedup by participant; last write wins
@@ -190,7 +243,7 @@ func (c *Coordinator) open(ctx context.Context, gs *gateState) {
 		if stale {
 			return // this run already resolved; ignore
 		}
-		c.resolve(ctx, gs, Verdict{GateID: gateID, Passed: false, Detail: "runner unresponsive"}, true)
+		c.resolve(ctx, gs, Verdict{GateID: gateID, Passed: false, Detail: "runner unresponsive"}, true, false)
 	})
 }
 
@@ -201,11 +254,17 @@ func (c *Coordinator) onVerdictMsg(ctx context.Context, _ *agent.Agent, m protoc
 		return nil
 	}
 	detail, _ := m.Body["detail"].(string)
-	c.resolve(ctx, gs, Verdict{GateID: gateID, Passed: m.Intent == protocol.IntentDone, Detail: detail}, false)
+	c.resolve(ctx, gs, Verdict{GateID: gateID, Passed: m.Intent == protocol.IntentDone, Detail: detail}, false, false)
 	return nil
 }
 
-func (c *Coordinator) resolve(ctx context.Context, gs *gateState, v Verdict, stalled bool) {
+// resolve settles an in-flight round — real or, when fromCache is true,
+// synthetic — and is the single place that broadcasts a verdict, routes
+// failure blocks, remembers the round, and fires OnVerdict. Routing the
+// cached-answer path through here (see onReady) rather than around it is
+// what keeps a repeated identical resubmit visible to everything that
+// already watches a round's outcome, the round cap included.
+func (c *Coordinator) resolve(ctx context.Context, gs *gateState, v Verdict, stalled, fromCache bool) {
 	gs.mu.Lock()
 	if !gs.inflight {
 		gs.mu.Unlock()
@@ -219,7 +278,6 @@ func (c *Coordinator) resolve(ctx context.Context, gs *gateState, v Verdict, sta
 	gs.ready = make(map[string]string) // re-arm for the next round
 	owners := append([]string(nil), gs.spec.Required...)
 	gateID := gs.spec.ID
-	gs.mu.Unlock()
 
 	var text string
 	switch {
@@ -230,6 +288,19 @@ func (c *Coordinator) resolve(ctx context.Context, gs *gateState, v Verdict, sta
 	default:
 		text = fmt.Sprintf("%s FAILED: %s", gateID, v.Detail)
 	}
+	if fromCache {
+		// Visible marker: an operator reading the log, or an agent reading
+		// its own submit output, can tell this was answered from a
+		// completed round rather than a freshly run spanning test.
+		text += " (already tested at this version)"
+	}
+	// Remember this round so a participant that re-submits at the same
+	// version gets it back immediately instead of hanging. See onReady.
+	remembered := v
+	gs.lastVerdict = &remembered
+	gs.lastStalled = stalled
+	gs.mu.Unlock()
+
 	_ = c.a.Send(ctx, protocol.New(
 		protocol.Address{Agent: c.a.Name},
 		protocol.Address{Topic: Topic(gateID)},
