@@ -2,6 +2,7 @@ package pcops
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -38,7 +39,7 @@ func StartRunner(ctx context.Context, cfg Config, workdir string, branches []str
 		return nil, fmt.Errorf("join as %q: %w", cfg.Gate.Runner, err)
 	}
 	gate.ServeRunner(a, func(ctx context.Context, gateID string, versions map[string]string) gate.Verdict {
-		if detail, err := mergeAll(workdir, branches); err != nil {
+		if detail, err := mergeAll(ctx, workdir, branches); err != nil {
 			return gate.Verdict{GateID: gateID, Passed: false, Detail: detail, Versions: versions}
 		}
 		out, err := runShell(ctx, workdir, cfg.Gate.Run)
@@ -73,7 +74,7 @@ func RunGate(ctx context.Context, cfg Config, workdir string, branches []string)
 
 // mergeAll resets the runner's worktree to main and merges each branch in turn.
 // The reset makes every round independent of the last.
-func mergeAll(workdir string, branches []string) (string, error) {
+func mergeAll(ctx context.Context, workdir string, branches []string) (string, error) {
 	// Deliberately no `checkout main`: main is checked out in the primary
 	// worktree, and git refuses to check out a branch twice. Resetting the
 	// runner's own branch to main achieves the same clean baseline.
@@ -81,22 +82,54 @@ func mergeAll(workdir string, branches []string) (string, error) {
 		{"reset", "--hard", "-q", "main"},
 		{"clean", "-qfd"},
 	} {
-		if out, err := gitIn(workdir, args...); err != nil {
+		if out, err := gitIn(ctx, workdir, args...); err != nil {
 			return trim(out), err
 		}
 	}
 	for _, br := range branches {
-		out, err := gitIn(workdir, "merge", "--no-edit", "-q", br)
-		if err != nil {
-			_, _ = gitIn(workdir, "merge", "--abort")
+		out, err := gitIn(ctx, workdir, "merge", "--no-edit", "-q", br)
+		if err == nil {
+			continue
+		}
+		// Classify before aborting: `merge --abort` clears the unmerged index
+		// this reads. Calling every non-zero exit a conflict sent both owners
+		// hunting a conflict that did not exist whenever the real cause was a
+		// missing branch or transient ref/index.lock contention — the detail an
+		// agent is steered with has to name what actually happened.
+		conflict := isMergeConflict(err, out) || hasUnmergedPaths(ctx, workdir)
+		_, _ = gitIn(ctx, workdir, "merge", "--abort")
+		if conflict {
 			return fmt.Sprintf("merge conflict on %s: %s", br, trim(out)), err
 		}
+		return fmt.Sprintf("merge failed on %s: %v: %s", br, err, trim(out)), err
 	}
 	return "", nil
 }
 
-func gitIn(dir string, args ...string) (string, error) {
-	out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
+// isMergeConflict reports whether a failed `git merge` failed because of a
+// content conflict. git exits 1 and prints CONFLICT for that case, and uses
+// other statuses for "not something we can merge", a locked index, and the rest.
+func isMergeConflict(err error, out string) bool {
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.ExitCode() != 1 {
+		return false
+	}
+	return strings.Contains(out, "CONFLICT")
+}
+
+// hasUnmergedPaths asks git directly, so a conflict is still classified as one
+// if a future git release changes its wording or its exit status.
+func hasUnmergedPaths(ctx context.Context, workdir string) bool {
+	out, err := gitIn(ctx, workdir, "ls-files", "-u")
+	return err == nil && strings.TrimSpace(out) != ""
+}
+
+// gitIn runs one git command in dir. exec.CommandContext, not exec.Command: a
+// stale index.lock makes git wait forever, and the caller's wall budget has to
+// bound that instead of the run hanging past it. runShell below already did
+// this correctly.
+func gitIn(ctx context.Context, dir string, args ...string) (string, error) {
+	out, err := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...).CombinedOutput()
 	return string(out), err
 }
 
