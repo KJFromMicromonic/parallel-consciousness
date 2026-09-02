@@ -14,14 +14,19 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/KJFromMicromonic/parallel-consciousness/internal/pcops"
 )
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: pc <submit|send|up|run-gate> [flags]")
+		// Only the commands main actually dispatches: up and run-gate are
+		// library functions in pcops, not CLI subcommands, until Phase B wires
+		// them, and advertising them here only earns an exit 2.
+		fmt.Fprintln(os.Stderr, "usage: pc <submit|send> [flags]")
 		os.Exit(2)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -72,7 +77,11 @@ func cmdSubmit(ctx context.Context, args []string) int {
 		// verdict was obtained, so they all map to the same exit code.
 		return 2
 	}
-	fmt.Println(verdict.Detail)
+	// Detail is documented as empty on a pass, and printing it unconditionally
+	// put a bare blank line on stdout for every passing submit.
+	if verdict.Detail != "" {
+		fmt.Println(verdict.Detail)
+	}
 	if verdict.Passed {
 		return 0
 	}
@@ -100,7 +109,10 @@ func cmdSend(ctx context.Context, args []string) int {
 		fmt.Fprintln(os.Stderr, `usage: pc send --to <agent> [--intent inform] "message"`)
 		return 2
 	}
-	if err := pcops.Send(ctx, cfg, name, *to, *intent, fs.Arg(0)); err != nil {
+	// Join every argument: an unquoted `pc send --to x hello world` used to send
+	// just "hello", silently dropping the rest of the message.
+	text := strings.Join(fs.Args(), " ")
+	if err := pcops.Send(ctx, cfg, name, *to, *intent, text); err != nil {
 		fmt.Fprintf(os.Stderr, "pc send: %v\n", err)
 		return 2
 	}
@@ -109,6 +121,13 @@ func cmdSend(ctx context.Context, args []string) int {
 
 // loadConfig prefers an explicit scenario file and otherwise synthesises the
 // minimum from the environment, so an agent needs only $PC_DB to participate.
+//
+// $PC_SUBMIT_TIMEOUT applies only on the env-only path, and deliberately so: a
+// scenario file already carries budget.submit_timeout, and pcops.Run injects
+// that same value into the session's environment, so the two agree. Hardcoding
+// DefaultSubmitTimeout here was what made budget.submit_timeout dead
+// configuration — every spawned agent parked for five minutes whatever the
+// scenario said.
 func loadConfig(path string) (pcops.Config, error) {
 	if path != "" {
 		return pcops.LoadConfig(path)
@@ -117,5 +136,21 @@ func loadConfig(path string) (pcops.Config, error) {
 	if db == "" {
 		return pcops.Config{}, fmt.Errorf("no config: pass --config or set $PC_DB")
 	}
-	return pcops.Config{DB: db, SubmitTimeout: pcops.DefaultSubmitTimeout}, nil
+	return pcops.Config{DB: db, SubmitTimeout: submitTimeoutFromEnv()}, nil
+}
+
+// submitTimeoutFromEnv reads $PC_SUBMIT_TIMEOUT, falling back to the default
+// when it is absent or unparseable. An unusable value must not turn into a
+// zero timeout, which would report "no verdict" instantly.
+func submitTimeoutFromEnv() time.Duration {
+	v := os.Getenv("PC_SUBMIT_TIMEOUT")
+	if v == "" {
+		return pcops.DefaultSubmitTimeout
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		fmt.Fprintf(os.Stderr, "pc: ignoring unusable $PC_SUBMIT_TIMEOUT %q, using %v\n", v, pcops.DefaultSubmitTimeout)
+		return pcops.DefaultSubmitTimeout
+	}
+	return d
 }
