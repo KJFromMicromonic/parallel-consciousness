@@ -25,6 +25,17 @@ type Spec struct {
 	Env     map[string]string // e.g. PC_AGENT, PC_DB, provider credentials
 	Model   string            // opaque; the adapter maps it
 	Budget  Budget
+
+	// TranscriptDir is the directory where the adapter writes its raw native
+	// frames. Event deliberately carries no raw adapter payload — that would
+	// be the seam through which harness specifics leak into callers — so the
+	// transcript is where debuggability actually lives, and without a field
+	// naming it a caller has no way to find it. An adapter that cannot honour
+	// the requested directory MUST fail at Start rather than silently write
+	// somewhere else: a debugging aid that might not be where it claims is
+	// worse than an explicit error. An empty TranscriptDir means the caller
+	// does not want a transcript.
+	TranscriptDir string
 }
 
 // Budget bounds a session. Wall is enforced by the caller; Tokens is reported
@@ -39,12 +50,23 @@ type Budget struct {
 // Steer is NOT preemption. Adapters deliver it at the next turn boundary, so a
 // message sent while a tool call is in flight waits for that call to finish.
 // Interrupt is the only verb that preempts in-flight work.
+//
+// Every method MUST honour context cancellation and return promptly with a
+// non-nil error rather than blocking. Every method here already takes a ctx;
+// a contract where it is decorative — accepted but never selected on — is
+// worse than one that never took it at all, because a caller who times out or
+// shuts down has no way to trust that the call will ever return.
 type Session interface {
 	Events() <-chan Event
 	Steer(ctx context.Context, s string) error
 	Follow(ctx context.Context, s string) error
 	Interrupt(ctx context.Context) error
 	Close(ctx context.Context) error
+
+	// Wait returns once the session has ended — by natural completion,
+	// budget exhaustion, an interrupt, or Close — whichever happens first.
+	// Outcome.Reason says which. Wait does not itself end anything; it only
+	// reports an ending that happens by one of those means.
 	Wait(ctx context.Context) (Outcome, error)
 }
 
@@ -53,10 +75,20 @@ type Session interface {
 type EventKind string
 
 const (
-	KindStarted      EventKind = "started"
-	KindTurnBegan    EventKind = "turn_began"
-	KindTurnEnded    EventKind = "turn_ended"
-	KindToolUsed     EventKind = "tool_used"
+	KindStarted   EventKind = "started"
+	KindTurnBegan EventKind = "turn_began"
+	KindTurnEnded EventKind = "turn_ended"
+	KindToolUsed  EventKind = "tool_used"
+	// KindQueueChanged is REQUIRED, not optional: an adapter MUST emit it
+	// when it accepts a steer or a follow, and again when the queue drains,
+	// with Event.Pending set both times. Queue{0,0} is a valid, honest
+	// answer for a harness with no introspectable queue — the requirement is
+	// the receipt, not a non-zero count. This exists because the day-0 spike
+	// (Q3) measured delivery and action diverging by as much as the length
+	// of an in-flight tool call (23s behind a sleep 25 in the measured
+	// case); this event is the only thing that makes that gap observable to
+	// the control plane instead of a silent black box between "accepted"
+	// and "acted on."
 	KindQueueChanged EventKind = "queue_changed"
 	KindIdle         EventKind = "idle"
 	KindErrored      EventKind = "errored"

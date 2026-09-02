@@ -5,6 +5,8 @@ package fake
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +16,14 @@ import (
 	"github.com/KJFromMicromonic/parallel-consciousness/pkg/runtime"
 )
 
+// ErrSessionEnding is returned by Steer/Follow when the session ended — via
+// Close, Interrupt, or a scripted Exit — before the message could be handed
+// to loop() at all. Returning nil in that race would tell the caller
+// "accepted" for a message that will now never run and never drain; a caller
+// checking errors.Is(err, ErrSessionEnding) can tell that apart from a real
+// delivery.
+var ErrSessionEnding = errors.New("fake: session ended before the message could be accepted")
+
 // Action is one scripted thing a fake agent does.
 type Action interface{ isAction() }
 
@@ -21,7 +31,9 @@ type Action interface{ isAction() }
 type Write struct{ Path, Content string }
 
 // Exec runs a command in the session's workdir with the session's env. This is
-// how a fake agent calls `pc submit`.
+// how a fake agent calls `pc submit`. It runs under the session's internal
+// workCtx, so an Interrupt or Close arriving while it is in flight actually
+// kills it rather than waiting it out — see session.workCtx.
 type Exec struct{ Args []string }
 
 // Emit reports a tool use without doing anything, for evidence assertions.
@@ -30,7 +42,9 @@ type Emit struct{ Tool runtime.ToolUse }
 // Exit ends the session where it stands, so a script can play the failure mode
 // the spec cares about: a session that dies mid-task and never reaches a
 // verdict. The session emits its terminal event exactly as a real adapter does
-// when its process goes away.
+// when its process goes away. Because this is a scripted natural end, Wait
+// reports runtime.ExitCompleted for it — as opposed to Close or Interrupt,
+// which report runtime.ExitInterrupted.
 type Exit struct{}
 
 func (Write) isAction() {}
@@ -63,17 +77,70 @@ func New(scripts map[string]Script) *Runtime { return &Runtime{scripts: scripts}
 func (r *Runtime) Name() string { return "fake" }
 
 func (r *Runtime) Start(ctx context.Context, spec runtime.Spec) (runtime.Session, error) {
+	var transcript *os.File
+	if spec.TranscriptDir != "" {
+		// A real adapter that cannot honour TranscriptDir must fail Start
+		// rather than write elsewhere; the fake honours it by actually
+		// creating the directory, so a failure here is the same kind of
+		// failure a real adapter would report.
+		if err := os.MkdirAll(spec.TranscriptDir, 0o755); err != nil {
+			return nil, fmt.Errorf("fake: create transcript dir %s: %w", spec.TranscriptDir, err)
+		}
+		f, err := os.OpenFile(filepath.Join(spec.TranscriptDir, "transcript.log"),
+			os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return nil, fmt.Errorf("fake: open transcript in %s: %w", spec.TranscriptDir, err)
+		}
+		transcript = f
+	}
+
+	workCtx, cancelWork := context.WithCancel(context.Background())
 	s := &session{
-		spec:   spec,
-		script: r.scripts[spec.Agent],
-		events: make(chan runtime.Event, 256),
-		work:   make(chan []Action, 8),
-		done:   make(chan struct{}),
-		start:  time.Now(),
+		spec:       spec,
+		script:     r.scripts[spec.Agent],
+		events:     make(chan runtime.Event, 256),
+		work:       make(chan queuedWork, 8),
+		done:       make(chan struct{}),
+		stopped:    make(chan struct{}),
+		workCtx:    workCtx,
+		cancelWork: cancelWork,
+		start:      time.Now(),
+		transcript: transcript,
 	}
 	go s.loop()
-	s.work <- s.script.OnStart
+	s.work <- queuedWork{actions: s.script.OnStart, kind: kindInitial}
 	return s, nil
+}
+
+// workKind distinguishes the initial OnStart script, which carries no queue
+// receipt, from a Steer- or Follow-triggered turn, which does.
+type workKind int
+
+const (
+	kindInitial workKind = iota
+	kindSteer
+	kindFollow
+)
+
+// queuedWork is one turn's worth of scripted actions, tagged with which queue
+// (if any) it came from, and — when it does come from Steer or Follow — the
+// exact Queue snapshot to report as that message's accept receipt.
+//
+// The receipt travels inside this same struct, over the same s.work channel
+// as the actions it accepts, rather than over a second channel. That is what
+// gives receipt-before-drain ordering for free: Go only guarantees FIFO
+// within one channel, not across two, so an earlier version that sent the
+// receipt over its own channel had that ordering only incidentally — it held
+// because loop() happened to already be parked in select when both sends
+// landed. Nothing enforced it against two back-to-back Steer/Follow calls
+// with no intervening idle, or scheduling pressure on a loaded box, either
+// of which could have delivered the drained {0,0} before the accepted
+// {Steering:1}. Folding the receipt in here removes that whole race surface
+// instead of papering over it.
+type queuedWork struct {
+	actions []Action
+	kind    workKind
+	accept  *runtime.Queue
 }
 
 type session struct {
@@ -81,30 +148,93 @@ type session struct {
 	script Script
 
 	events chan runtime.Event
-	work   chan []Action
+	work   chan queuedWork
 
 	once sync.Once
 	done chan struct{}
+
+	// stopped is closed by loop() itself, only once loop() has actually
+	// returned — after any in-flight action has genuinely stopped running,
+	// not merely after a termination signal was issued. done closing tells
+	// loop() to stop; stopped closing is loop() reporting that it has.
+	// Wait() blocks on stopped, not done: a Wait that returned the instant
+	// Interrupt was called would be true regardless of whether the fake
+	// actually killed anything in flight, which is exactly the gap
+	// InterruptPreemptsInFlightWork exists to catch — it needs "the session
+	// has ended" to mean the goroutine (and the process it may still be
+	// running) has actually stopped, not just that a signal was accepted.
+	stopped chan struct{}
+
+	// workCtx is cancelled by Interrupt or Close (via closeWithReason) so
+	// that an in-flight Exec action can actually be killed instead of run to
+	// completion, and so loop() can abandon the rest of a turn's scripted
+	// actions once cancellation is observed. Steer and Follow deliberately
+	// never touch workCtx: the Session contract documents Steer as NOT
+	// preemption ("delivered at the next turn boundary"), so only Interrupt
+	// — and Close, which ends everything — may cut work off early.
+	workCtx    context.Context
+	cancelWork context.CancelFunc
+
+	mu        sync.Mutex
+	endReason runtime.ExitReason
+	pending   runtime.Queue
+
+	// transcript is the raw-frame record for Spec.TranscriptDir. Only loop()
+	// (a single goroutine) ever writes through it, so no lock is needed.
+	transcript *os.File
 
 	start time.Time
 }
 
 func (s *session) loop() {
+	// LIFO: closeTranscript runs first, then close(events), then
+	// close(stopped) last — so a caller unblocked by stopped sees a fully
+	// wound-down session: transcript flushed and closed, events channel
+	// already closed too.
+	defer close(s.stopped)
 	defer close(s.events)
+	defer s.closeTranscript()
 	s.emit(runtime.Event{Kind: runtime.KindStarted})
 	for {
 		select {
 		case <-s.done:
 			s.emitFinal(runtime.Event{Kind: runtime.KindExited})
 			return
-		case actions := <-s.work:
+		case qw := <-s.work:
 			s.emit(runtime.Event{Kind: runtime.KindTurnBegan})
-			for _, a := range actions {
-				s.run(a)
+			if qw.accept != nil {
+				s.emit(runtime.Event{Kind: runtime.KindQueueChanged, Pending: qw.accept})
+			}
+		actions:
+			for _, a := range qw.actions {
+				select {
+				case <-s.workCtx.Done():
+					// Interrupt or Close fired mid-turn: abandon the rest of
+					// this turn's scripted actions instead of running them to
+					// completion. This — plus Exec running under workCtx — is
+					// what makes Interrupt an actual preemption primitive,
+					// rather than "wait for the current turn, then stop,"
+					// which is already what Steer/Follow give you for free.
+					break actions
+				default:
+					s.run(a)
+				}
+			}
+			// The initial OnStart turn carries no queue receipt: it was never
+			// accepted via Steer or Follow, so there is nothing to drain.
+			if qw.kind != kindInitial {
+				q := s.dequeue(qw.kind)
+				s.emit(runtime.Event{Kind: runtime.KindQueueChanged, Pending: &q})
 			}
 			s.emit(runtime.Event{Kind: runtime.KindTurnEnded})
 			s.emit(runtime.Event{Kind: runtime.KindIdle})
 		}
+	}
+}
+
+func (s *session) closeTranscript() {
+	if s.transcript != nil {
+		s.transcript.Close()
 	}
 }
 
@@ -116,8 +246,13 @@ func (s *session) run(a Action) {
 		s.emit(runtime.Event{Kind: runtime.KindToolUsed, Tool: &runtime.ToolUse{
 			Name: "write", Target: v.Path, Ok: err == nil,
 		}})
+		s.trace("write", v.Path, err == nil)
 	case Exec:
-		cmd := exec.Command(v.Args[0], v.Args[1:]...)
+		// CommandContext, not Command: workCtx is cancelled by Interrupt or
+		// Close, and this is the one place a scripted action can genuinely
+		// block for a long time, so it is the one place that needs killing
+		// rather than just not-being-started next.
+		cmd := exec.CommandContext(s.workCtx, v.Args[0], v.Args[1:]...)
 		cmd.Dir = s.spec.Workdir
 		cmd.Env = os.Environ()
 		for k, val := range s.spec.Env {
@@ -127,14 +262,30 @@ func (s *session) run(a Action) {
 		s.emit(runtime.Event{Kind: runtime.KindToolUsed, Tool: &runtime.ToolUse{
 			Name: "bash", Target: v.Args[0], Detail: string(out), Ok: err == nil,
 		}})
+		s.trace("exec", fmt.Sprint(v.Args), err == nil)
 	case Emit:
 		t := v.Tool
 		s.emit(runtime.Event{Kind: runtime.KindToolUsed, Tool: &t})
+		s.trace("emit", t.Name+" "+t.Target, t.Ok)
 	case Exit:
-		// Close, not a direct close(s.done), so the once guard still holds when
-		// the owner closes the session afterwards too.
-		_ = s.Close(context.Background())
+		s.trace("exit", "", true)
+		// closeWithReason, not a direct close(s.done), so the once guard
+		// still holds when the owner Closes or Interrupts the session
+		// afterwards too. ExitCompleted (not ExitInterrupted, which Close and
+		// Interrupt record) is what lets Wait tell a scripted natural end
+		// apart from an externally terminated one.
+		s.closeWithReason(runtime.ExitCompleted)
 	}
+}
+
+// trace appends one line to Spec.TranscriptDir's transcript file, giving that
+// field a real consumer instead of leaving it speculative. No-op when no
+// TranscriptDir was requested.
+func (s *session) trace(kind, detail string, ok bool) {
+	if s.transcript == nil {
+		return
+	}
+	fmt.Fprintf(s.transcript, "%s %s %s ok=%t\n", time.Now().Format(time.RFC3339Nano), kind, detail, ok)
 }
 
 func (s *session) emit(ev runtime.Event) {
@@ -168,14 +319,14 @@ func (s *session) Events() <-chan runtime.Event { return s.events }
 // Steer queues the steer script. Like a real adapter it does not preempt: the
 // actions run after whatever turn is currently in flight.
 func (s *session) Steer(ctx context.Context, text string) error {
-	return s.queue(pick(s.script.OnSteer, s.script.OnFollow), text)
+	return s.queue(ctx, pick(s.script.OnSteer, s.script.OnFollow), text, kindSteer)
 }
 
 // Follow queues the follow-up script. A real adapter queues this behind pending
 // work rather than at the next turn boundary; the fake's single work queue makes
 // both arrive in send order, which is enough to observe WHICH path was taken.
 func (s *session) Follow(ctx context.Context, text string) error {
-	return s.queue(pick(s.script.OnFollow, s.script.OnSteer), text)
+	return s.queue(ctx, pick(s.script.OnFollow, s.script.OnSteer), text, kindFollow)
 }
 
 // pick returns the verb's own hook, or the other one when it is unset.
@@ -186,25 +337,117 @@ func pick(own, fallback func(string) []Action) func(string) []Action {
 	return fallback
 }
 
-func (s *session) queue(hook func(string) []Action, text string) error {
+// queue accepts a steer or follow message: it checks ctx first (an
+// already-cancelled ctx must return promptly regardless of whether a hook is
+// even set), then — mirroring the day-0 spike's queue_update, which fired
+// immediately on injection — bundles the accept receipt into the same
+// queuedWork value as the scripted actions, so loop() emits the receipt
+// before running them (see queuedWork's doc comment for why that ordering
+// needs to be structural rather than incidental).
+func (s *session) queue(ctx context.Context, hook func(string) []Action, text string, kind workKind) error {
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("fake: queue message: %w", ctx.Err())
+	default:
+	}
 	if hook == nil {
 		return nil
 	}
+	actions := hook(text)
+	q := s.enqueue(kind)
 	select {
-	case s.work <- hook(text):
+	case s.work <- queuedWork{actions: actions, kind: kind, accept: &q}:
+		return nil
 	case <-s.done:
+		// The counter was already incremented above, but nothing will ever
+		// dequeue and drain it now — the session is ending. That is harmless
+		// (no further receipt will ever be observed), but the caller must
+		// NOT be told "accepted": this message will never run.
+		return fmt.Errorf("fake: queue message: %w", ErrSessionEnding)
+	case <-ctx.Done():
+		return fmt.Errorf("fake: queue message: %w", ctx.Err())
 	}
+}
+
+// enqueue records one more accepted message of kind and returns the resulting
+// snapshot for the receipt event.
+func (s *session) enqueue(kind workKind) runtime.Queue {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch kind {
+	case kindSteer:
+		s.pending.Steering++
+	case kindFollow:
+		s.pending.FollowUp++
+	}
+	return s.pending
+}
+
+// dequeue records that one message of kind has now been applied (its turn
+// ran) and returns the resulting snapshot for the drain event.
+func (s *session) dequeue(kind workKind) runtime.Queue {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch kind {
+	case kindSteer:
+		if s.pending.Steering > 0 {
+			s.pending.Steering--
+		}
+	case kindFollow:
+		if s.pending.FollowUp > 0 {
+			s.pending.FollowUp--
+		}
+	}
+	return s.pending
+}
+
+func (s *session) Interrupt(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("fake: interrupt: %w", ctx.Err())
+	default:
+	}
+	s.closeWithReason(runtime.ExitInterrupted)
 	return nil
 }
 
-func (s *session) Interrupt(ctx context.Context) error { return nil }
-
+// Close never blocks — closeWithReason only takes a mutex, cancels workCtx,
+// and closes a channel — so there is no operation here for a ctx deadline to
+// interrupt. That is why, unlike Interrupt, Close does not select on
+// ctx.Done(): honouring cancellation on a call that already returns
+// immediately would add a branch that could never fire, not real ctx
+// support. This is deliberate, not an inconsistency with the contract's
+// "every method MUST honour ctx" — there is nothing here to honour it against.
 func (s *session) Close(ctx context.Context) error {
-	s.once.Do(func() { close(s.done) })
+	s.closeWithReason(runtime.ExitInterrupted)
 	return nil
+}
+
+// closeWithReason records why the session ended, cancels workCtx so any
+// in-flight Exec is killed and loop() abandons the rest of its turn, and
+// closes s.done — all exactly once. The once-guard means the FIRST caller to
+// reach here wins the reason: an external Close or Interrupt racing a
+// scripted Exit does not overwrite a natural end already recorded, and a
+// scripted Exit that has already fired leaves a later Close's
+// ExitInterrupted attempt a no-op, matching Close's documented idempotency.
+func (s *session) closeWithReason(reason runtime.ExitReason) {
+	s.once.Do(func() {
+		s.mu.Lock()
+		s.endReason = reason
+		s.mu.Unlock()
+		s.cancelWork()
+		close(s.done)
+	})
 }
 
 func (s *session) Wait(ctx context.Context) (runtime.Outcome, error) {
-	<-s.done
-	return runtime.Outcome{Reason: runtime.ExitCompleted, Duration: time.Since(s.start)}, nil
+	select {
+	case <-s.stopped:
+		s.mu.Lock()
+		reason := s.endReason
+		s.mu.Unlock()
+		return runtime.Outcome{Reason: reason, Duration: time.Since(s.start)}, nil
+	case <-ctx.Done():
+		return runtime.Outcome{}, fmt.Errorf("fake: wait: %w", ctx.Err())
+	}
 }
