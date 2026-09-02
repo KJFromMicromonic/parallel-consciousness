@@ -5,17 +5,24 @@
 package workspace
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"strings"
 )
 
+// Every git invocation takes a context and uses exec.CommandContext. A stale
+// index.lock in the repository makes git block indefinitely, and a bare
+// exec.Command would hang past the caller's own deadline — Acquire accepting a
+// ctx it then ignored for the part that can actually hang was the worst version
+// of that. With CommandContext the caller's wall budget bounds git too.
+
 // worktreeAdd creates (or resets) branch at the repo's HEAD and checks it out
 // into its own worktree at path. -B resets the branch pointer to the repo's
 // HEAD so a re-created worktree starts from a known state. Reattaching to an
-// already-existing worktree directory is handled by Acquire in a later task.
-func worktreeAdd(repo, path, branch string) error {
-	out, err := exec.Command("git", "-C", repo, "worktree", "add", "-B", branch, path).CombinedOutput()
+// already-existing worktree directory is handled by Acquire.
+func worktreeAdd(ctx context.Context, repo, path, branch string) error {
+	out, err := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "add", "-B", branch, path).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("git worktree add %s: %w: %s", path, err, out)
 	}
@@ -24,8 +31,8 @@ func worktreeAdd(repo, path, branch string) error {
 
 // worktreeRemove detaches the worktree and deletes its directory. --force is
 // required because an agent almost always leaves uncommitted work behind.
-func worktreeRemove(repo, path string) error {
-	out, err := exec.Command("git", "-C", repo, "worktree", "remove", "--force", path).CombinedOutput()
+func worktreeRemove(ctx context.Context, repo, path string) error {
+	out, err := exec.CommandContext(ctx, "git", "-C", repo, "worktree", "remove", "--force", path).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("git worktree remove %s: %w: %s", path, err, out)
 	}
@@ -35,8 +42,8 @@ func worktreeRemove(repo, path string) error {
 // worktreeBranch reports the branch currently checked out at path. Used by
 // Acquire to verify a reclaimed worktree is actually on the branch being
 // requested before handing it back as a Lease.
-func worktreeBranch(path string) (string, error) {
-	out, err := exec.Command("git", "-C", path, "symbolic-ref", "--short", "HEAD").CombinedOutput()
+func worktreeBranch(ctx context.Context, path string) (string, error) {
+	out, err := exec.CommandContext(ctx, "git", "-C", path, "symbolic-ref", "--short", "HEAD").CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("git symbolic-ref %s: %w: %s", path, err, out)
 	}

@@ -2,6 +2,7 @@ package workspace
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,7 +36,7 @@ func TestWorktreeAddCreatesIsolatedTree(t *testing.T) {
 	repo := newRepo(t)
 	wt := filepath.Join(t.TempDir(), "billing")
 
-	if err := worktreeAdd(repo, wt, "agent/billing"); err != nil {
+	if err := worktreeAdd(context.Background(), repo, wt, "agent/billing"); err != nil {
 		t.Fatalf("worktreeAdd: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(wt, "README.md")); err != nil {
@@ -84,7 +85,7 @@ func TestWorktreeAddCreatesIsolatedTree(t *testing.T) {
 		t.Fatalf("origin repo should be clean, got status:\n%s", repoStatus)
 	}
 
-	if err := worktreeRemove(repo, wt); err != nil {
+	if err := worktreeRemove(context.Background(), repo, wt); err != nil {
 		t.Fatalf("worktreeRemove: %v", err)
 	}
 	if _, err := os.Stat(wt); !os.IsNotExist(err) {
