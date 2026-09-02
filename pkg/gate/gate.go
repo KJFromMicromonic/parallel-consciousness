@@ -234,19 +234,82 @@ func (c *Coordinator) onReady(ctx context.Context, _ *agent.Agent, m protocol.Me
 			gs.inflight = true
 			gs.mu.Unlock()
 			c.resolve(ctx, gs, cached, stalled, true)
+			// No IntentAck on this path, deliberately: the cache answers via
+			// resolve's own IntentInform broadcast without ever recording
+			// readiness, so there is nothing here for an ack to confirm. F4
+			// (see below) only concerns itself with recorded readiness;
+			// pcops.Submit treats a verdict's arrival as satisfying its ack
+			// wait too, precisely so a redundant identical resubmit answered
+			// from cache is never mistaken for an unacknowledged gate.
 			return nil
 		}
 		gs.lastVerdict = nil
 	}
-	if required && !gs.inflight {
+
+	// recorded is whether THIS call adds m.From.Agent to the round's
+	// readiness set — the same condition that used to gate the assignment
+	// below, now also gating the F4 acknowledgement so the two can never
+	// drift apart.
+	recorded := required && !gs.inflight
+	if recorded {
 		gs.ready[m.From.Agent] = version // dedup by participant; last write wins
 	}
-	full := required && !gs.inflight && len(gs.ready) == len(gs.spec.Required)
+	full := recorded && len(gs.ready) == len(gs.spec.Required)
+
+	var reply *protocol.Message
+	if recorded {
+		// F4: acknowledge every recorded readiness with who the gate is
+		// still waiting on. Without this, a blocked `pc submit` cannot tell
+		// "the gate hasn't run yet" from "no coordinator is running at all"
+		// from "a required peer is never coming" — all three looked
+		// identical (total silence) in a live run against real coding
+		// agents; see docs/superpowers/specs/2026-09-02-live-fire-findings.md,
+		// findings F4 and "F4 reinforced". outstandingFor reads gs.ready,
+		// which by construction already includes m.From.Agent, so a
+		// quorum-completing submit correctly gets back an empty list.
+		//
+		// IntentAck, not e.g. IntentInform or a direct reply, is the
+		// deliberate choice: internal/pcops's courier only registers
+		// handlers for IntentBlock and the six sendable intents (inform,
+		// request, propose, agree, disagree, done) — nothing forwards
+		// IntentAck into a live coding-agent session, so this reaches only
+		// pcops.Submit's own bus subscription. That matters because an
+		// earlier design in this project answered a cached verdict with a
+		// direct send instead of routing through resolve; the courier
+		// forwarded THAT straight into the agent's session, the agent
+		// reacted by resubmitting, and that produced an unbounded feedback
+		// loop (2,589 goroutines in 8 seconds — see gateState's doc comment
+		// above). Do not add a courier handler for IntentAck: that would
+		// reopen exactly that loop for this acknowledgement.
+		outstanding := outstandingFor(gs)
+		ack := m.Reply(protocol.Address{Agent: c.a.Name}, protocol.IntentAck, map[string]any{
+			"gate":        gateID,
+			"outstanding": outstanding,
+		})
+		reply = &ack
+	}
 	gs.mu.Unlock()
 	if full {
 		c.open(ctx, gs)
 	}
-	return nil // ready is terminal
+	// Returning reply (rather than nil, and rather than sending it here
+	// ourselves) lets the caller's normal dispatch mechanism publish it —
+	// ready itself stays terminal from the sender's point of view; this is
+	// just the coordinator choosing to speak up when it used to stay silent.
+	return reply
+}
+
+// outstandingFor lists the required participants that have not yet declared
+// readiness for gs's current round, in Spec.Required order. Callers must hold
+// gs.mu.
+func outstandingFor(gs *gateState) []string {
+	outstanding := make([]string, 0, len(gs.spec.Required))
+	for _, p := range gs.spec.Required {
+		if _, ok := gs.ready[p]; !ok {
+			outstanding = append(outstanding, p)
+		}
+	}
+	return outstanding
 }
 
 func (c *Coordinator) open(ctx context.Context, gs *gateState) {

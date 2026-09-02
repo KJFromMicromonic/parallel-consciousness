@@ -158,6 +158,7 @@ type harness struct {
 	verdict chan gate.Verdict
 	blocks  chan protocol.Message
 	informs chan protocol.Message
+	acks    chan protocol.Message
 	parts   map[string]*agent.Agent
 }
 
@@ -185,6 +186,7 @@ func setupGate(t *testing.T, spec gate.Spec, runnerFn func(string, map[string]st
 		verdict: make(chan gate.Verdict, 8),
 		blocks:  make(chan protocol.Message, 8),
 		informs: make(chan protocol.Message, 8),
+		acks:    make(chan protocol.Message, 8),
 		parts:   map[string]*agent.Agent{},
 	}
 	coord.OnVerdict(func(v gate.Verdict) { h.verdict <- v })
@@ -228,6 +230,10 @@ func (h *harness) part(t *testing.T, name string) *agent.Agent {
 	}
 	a.On(protocol.IntentBlock, func(ctx context.Context, ag *agent.Agent, m protocol.Message) *protocol.Message {
 		h.blocks <- m
+		return nil
+	})
+	a.On(protocol.IntentAck, func(ctx context.Context, ag *agent.Agent, m protocol.Message) *protocol.Message {
+		h.acks <- m
 		return nil
 	})
 	go a.Run(h.ctx)
@@ -794,5 +800,112 @@ func TestBothParticipantsUnchangedStillAnsweredFromCache(t *testing.T) {
 	m2 := recvMsg(t, h.informs)
 	if text, _ := m2.Body["text"].(string); !strings.Contains(text, "already tested at this version") {
 		t.Fatalf("gateway's cached inform text = %q, want the marker", text)
+	}
+}
+
+// --- F4: acknowledge every recorded readiness with who the gate is still
+// waiting on, so a blocked pc submit can tell "not run yet" from "no
+// coordinator" from "a peer is never coming". See onReady and
+// docs/superpowers/specs/2026-09-02-live-fire-findings.md, F4 and "F4
+// reinforced". ---
+
+// TestOnReadyAcksTheSubmitterWithOutstandingParticipants is the core F4 case:
+// a lone submitter to a two-participant gate gets back an immediate ack
+// naming the peer it is still waiting on, rather than the total silence a
+// live run against real coding agents actually produced.
+func TestOnReadyAcksTheSubmitterWithOutstandingParticipants(t *testing.T) {
+	h := setupGate(t, checkoutSpec(), passRunner)
+	defer h.cancel()
+
+	h.ready(t, "billing", "b1")
+
+	ack := recvMsg(t, h.acks)
+	if ack.Intent != protocol.IntentAck {
+		t.Fatalf("intent = %q, want ack", ack.Intent)
+	}
+	if ack.To.Agent != "billing" {
+		t.Fatalf("ack.To.Agent = %q, want billing", ack.To.Agent)
+	}
+	if ack.Body["gate"] != "checkout" {
+		t.Fatalf("ack.Body[gate] = %v, want checkout", ack.Body["gate"])
+	}
+	outstanding, ok := ack.Body["outstanding"].([]string)
+	if !ok || len(outstanding) != 1 || outstanding[0] != "gateway" {
+		t.Fatalf("ack.Body[outstanding] = %v, want [gateway]", ack.Body["outstanding"])
+	}
+
+	// Quorum is still incomplete: this must not have opened the gate.
+	select {
+	case v := <-h.verdict:
+		t.Fatalf("gate opened with partial readiness: %+v", v)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestOnReadyAcksWithEmptyOutstandingWhenQuorumCompletes covers the detail
+// called out explicitly in the design: the participant that completes
+// quorum is acknowledged too, with an EMPTY outstanding list, and the round
+// still opens and resolves normally right after — the ack does not replace
+// or delay the verdict.
+func TestOnReadyAcksWithEmptyOutstandingWhenQuorumCompletes(t *testing.T) {
+	h := setupGate(t, checkoutSpec(), passRunner)
+	defer h.cancel()
+
+	h.ready(t, "billing", "b1")
+	firstAck := recvMsg(t, h.acks)
+	if out, _ := firstAck.Body["outstanding"].([]string); len(out) != 1 || out[0] != "gateway" {
+		t.Fatalf("billing's ack outstanding = %v, want [gateway]", firstAck.Body["outstanding"])
+	}
+
+	h.ready(t, "gateway", "g1")
+	secondAck := recvMsg(t, h.acks)
+	if secondAck.To.Agent != "gateway" {
+		t.Fatalf("second ack.To.Agent = %q, want gateway", secondAck.To.Agent)
+	}
+	outstanding, ok := secondAck.Body["outstanding"].([]string)
+	if !ok || len(outstanding) != 0 {
+		t.Fatalf("gateway's ack outstanding = %v, want empty", secondAck.Body["outstanding"])
+	}
+
+	// The round still opens and resolves — the ack is additive, not a
+	// replacement for the verdict.
+	v := recvVerdict(t, h.verdict)
+	if !v.Passed {
+		t.Fatalf("verdict = %+v, want passed", v)
+	}
+}
+
+// TestOnReadyDoesNotAckACachedResubmit locks in the documented exception: the
+// F2 cache path (see gateState's doc comment) answers a redundant identical
+// resubmit via resolve's own IntentInform broadcast, without ever recording
+// readiness — so it must not also send an IntentAck. pcops.Submit relies on
+// this: it treats a verdict's arrival as satisfying its own ack wait, and a
+// spurious ack here would be harmless but would mean this test is the only
+// thing pinning down "cache hits skip the ack" as intentional rather than
+// accidental.
+func TestOnReadyDoesNotAckACachedResubmit(t *testing.T) {
+	h := setupGate(t, checkoutSpec(), passRunner)
+	defer h.cancel()
+
+	h.ready(t, "billing", "b1")
+	recvMsg(t, h.acks)
+	h.ready(t, "gateway", "g1")
+	recvMsg(t, h.acks)
+	recvVerdict(t, h.verdict)
+	recvMsg(t, h.informs) // drain round 1's broadcast
+
+	// billing resubmits the exact same version: answered from cache.
+	h.ready(t, "billing", "b1")
+
+	v2 := recvVerdict(t, h.verdict)
+	if !v2.Passed {
+		t.Fatalf("cached-round verdict = %+v, want passed", v2)
+	}
+	recvMsg(t, h.informs) // the cached-round broadcast, unaffected by this test
+
+	select {
+	case ack := <-h.acks:
+		t.Fatalf("unexpected ack on a cached resubmit: %+v", ack)
+	case <-time.After(200 * time.Millisecond):
 	}
 }
