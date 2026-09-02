@@ -32,10 +32,20 @@ func (Exec) isAction()  {}
 func (Emit) isAction()  {}
 
 // Script is one agent's behaviour: what it does on start, and what it does when
-// steered. OnSteer may be nil.
+// a message is delivered.
+//
+// OnSteer and OnFollow are kept separate because the courier's central policy —
+// IntentBlock takes the steer path, every other intent takes the follow path —
+// is otherwise unassertable: aliasing Follow to Steer made the whole suite pass
+// with that mapping inverted. A script that only cares THAT a message arrived
+// may set either hook alone; each verb prefers its own hook and falls back to
+// the other when it is nil, so existing steer-only scripts keep working. A
+// script asserting the routing sets BOTH, and then the two paths are
+// distinguishable. Both may be nil, in which case delivery is a no-op.
 type Script struct {
-	OnStart []Action
-	OnSteer func(text string) []Action
+	OnStart  []Action
+	OnSteer  func(text string) []Action
+	OnFollow func(text string) []Action
 }
 
 // Runtime is the fake. Scripts are keyed by Spec.Agent.
@@ -147,17 +157,34 @@ func (s *session) Events() <-chan runtime.Event { return s.events }
 // Steer queues the steer script. Like a real adapter it does not preempt: the
 // actions run after whatever turn is currently in flight.
 func (s *session) Steer(ctx context.Context, text string) error {
-	if s.script.OnSteer == nil {
+	return s.queue(pick(s.script.OnSteer, s.script.OnFollow), text)
+}
+
+// Follow queues the follow-up script. A real adapter queues this behind pending
+// work rather than at the next turn boundary; the fake's single work queue makes
+// both arrive in send order, which is enough to observe WHICH path was taken.
+func (s *session) Follow(ctx context.Context, text string) error {
+	return s.queue(pick(s.script.OnFollow, s.script.OnSteer), text)
+}
+
+// pick returns the verb's own hook, or the other one when it is unset.
+func pick(own, fallback func(string) []Action) func(string) []Action {
+	if own != nil {
+		return own
+	}
+	return fallback
+}
+
+func (s *session) queue(hook func(string) []Action, text string) error {
+	if hook == nil {
 		return nil
 	}
 	select {
-	case s.work <- s.script.OnSteer(text):
+	case s.work <- hook(text):
 	case <-s.done:
 	}
 	return nil
 }
-
-func (s *session) Follow(ctx context.Context, text string) error { return s.Steer(ctx, text) }
 
 func (s *session) Interrupt(ctx context.Context) error { return nil }
 

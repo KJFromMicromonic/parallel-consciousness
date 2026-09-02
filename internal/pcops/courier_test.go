@@ -147,3 +147,79 @@ func TestCourierIgnoresItsOwnMessages(t *testing.T) {
 		t.Fatal("courier steered the agent with its own message")
 	}
 }
+
+// The courier's central policy is the routing itself: IntentBlock takes the
+// steer path (urgent, delivered at the next turn boundary) and every other
+// intent takes the follow path (queued behind pending work). That policy came
+// straight out of the day-0 spike, so it needs an assertion that fails if the
+// mapping is ever inverted — which is why fake.Script keeps OnSteer and
+// OnFollow distinct.
+func TestCourierRoutesBlocksToSteerAndEverythingElseToFollow(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	dir := t.TempDir()
+	r := fake.New(map[string]fake.Script{
+		"gateway": {
+			OnSteer: func(text string) []fake.Action {
+				return []fake.Action{fake.Write{Path: "steered.txt", Content: text}}
+			},
+			OnFollow: func(text string) []fake.Action {
+				return []fake.Action{fake.Write{Path: "followed.txt", Content: text}}
+			},
+		},
+	})
+	sess, err := r.Start(ctx, runtime.Spec{Agent: "gateway", Workdir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close(ctx)
+
+	db := filepath.Join(t.TempDir(), "bus.db")
+	b, err := sqlite.Open(ctx, db, sqlite.WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+
+	if err := pcops.StartCourier(ctx, b, "gateway", sess, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := pcops.Config{DB: db}
+	if err := pcops.Send(ctx, cfg, "coordinator", "gateway", "block", "gate failing"); err != nil {
+		t.Fatal(err)
+	}
+	if err := pcops.Send(ctx, cfg, "billing", "gateway", "inform", "contract field is amount_minor"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Both files must appear, and each must carry the text sent down ITS path.
+	// Inverting the courier's mapping swaps the two contents, which fails here.
+	steered := waitForFile(t, filepath.Join(dir, "steered.txt"))
+	followed := waitForFile(t, filepath.Join(dir, "followed.txt"))
+	if steered != "gate failing" {
+		t.Errorf("steer path received %q, want the block", steered)
+	}
+	if followed != "contract field is amount_minor" {
+		t.Errorf("follow path received %q, want the inform", followed)
+	}
+}
+
+// waitForFile reads path once it appears, failing at a bounded deadline. The
+// deadline is a failure detector, not a synchronisation mechanism: delivery is
+// pushed, so the file shows up as soon as the courier has run.
+func waitForFile(t *testing.T, path string) string {
+	t.Helper()
+	deadline := time.After(10 * time.Second)
+	for {
+		if body, err := os.ReadFile(path); err == nil {
+			return string(body)
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("%s never appeared", path)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
