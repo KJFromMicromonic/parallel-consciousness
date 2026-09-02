@@ -158,6 +158,10 @@ func Run(ctx context.Context, cfg Config, r runtime.Runtime) (gate.Verdict, erro
 				"PC_SUBMIT_TIMEOUT": submitTimeout.String(),
 			},
 			Budget: runtime.Budget{Wall: cfg.Wall},
+			// A subdirectory of the run's own directory, named for the
+			// agent, so each session's raw adapter frames land somewhere
+			// findable without agents colliding with each other's transcripts.
+			TranscriptDir: filepath.Join(filepath.Dir(cfg.DB), "transcripts", def.Name),
 		})
 		if err != nil {
 			return gate.Verdict{}, fmt.Errorf("start %s: %w", def.Name, err)
