@@ -48,11 +48,15 @@ type Config struct {
 type rawConfig struct {
 	Repo string `yaml:"repo"`
 	DB   string `yaml:"db"`
+	// Gate embeds GateDef inline instead of redeclaring its fields, so
+	// GateDef's own yaml tags are what actually populate it. Two struct
+	// definitions carrying the same tags used to exist side by side, with
+	// LoadConfig manually copying field by field between them — which meant
+	// GateDef's tags were decorative: a field added there without also
+	// touching this struct and the copy was silently dropped, with no error.
 	Gate struct {
-		ID       string   `yaml:"id"`
-		Required []string `yaml:"required"`
-		Runner   string   `yaml:"runner"`
-		Run      string   `yaml:"run"`
+		ID      string `yaml:"id"`
+		GateDef `yaml:",inline"`
 	} `yaml:"gate"`
 	Agents []AgentDef `yaml:"agents"`
 	Runner AgentDef   `yaml:"runner"`
@@ -78,7 +82,7 @@ func LoadConfig(path string) (Config, error) {
 		Repo:          raw.Repo,
 		DB:            raw.DB,
 		GateID:        raw.Gate.ID,
-		Gate:          GateDef{Required: raw.Gate.Required, Runner: raw.Gate.Runner, Run: raw.Gate.Run},
+		Gate:          raw.Gate.GateDef,
 		Agents:        raw.Agents,
 		Runner:        raw.Runner,
 		SubmitTimeout: DefaultSubmitTimeout,
