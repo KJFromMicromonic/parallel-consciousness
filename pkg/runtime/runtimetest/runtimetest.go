@@ -486,6 +486,67 @@ func Run(t *testing.T, newRuntime func(t *testing.T) runtime.Runtime, spec runti
 		assertVerbDoesNotPreempt(t, ctx, s, "Follow", opts.WorkDoneMarker, opts.FollowAppliedMarker,
 			func(q runtime.Queue) int { return q.FollowUp })
 	})
+
+	t.Run("AnAlreadyCancelledCtxOnInterruptReturnsPromptly", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		s, err := newRuntime(t).Start(ctx, spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close(ctx)
+
+		waitForIdle(t, ctx, s)
+
+		cancelled, cancelNow := context.WithCancel(context.Background())
+		cancelNow()
+
+		errCh := make(chan error, 1)
+		go func() { errCh <- s.Interrupt(cancelled) }()
+
+		select {
+		case err := <-errCh:
+			if err == nil {
+				t.Fatal("Interrupt with an already-cancelled ctx returned a nil error")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Interrupt with an already-cancelled ctx did not return promptly")
+		}
+	})
+
+	t.Run("AnAlreadyCancelledCtxOnWaitReturnsPromptly", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		s, err := newRuntime(t).Start(ctx, spec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close(ctx)
+
+		waitForIdle(t, ctx, s)
+
+		cancelled, cancelNow := context.WithCancel(context.Background())
+		cancelNow()
+
+		type result struct {
+			out runtime.Outcome
+			err error
+		}
+		resCh := make(chan result, 1)
+		go func() {
+			out, err := s.Wait(cancelled)
+			resCh <- result{out, err}
+		}()
+
+		select {
+		case r := <-resCh:
+			if r.err == nil {
+				t.Fatal("Wait with an already-cancelled ctx returned a nil error")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("Wait with an already-cancelled ctx did not return promptly")
+		}
+	})
 }
 
 // waitForTurnBegan drains events until KindTurnBegan arrives, failing the
