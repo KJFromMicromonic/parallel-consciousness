@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/bus/sqlite"
 )
 
 // ErrLeased means a live holder already owns that workspace.
@@ -70,17 +70,13 @@ type Manager struct {
 // repository, root is the directory worktrees are created under, dbPath is the
 // bus's SQLite file.
 func New(ctx context.Context, repo, root, dbPath string) (*Manager, error) {
-	// Same pragmas, in the same order, as pkg/bus/sqlite.Open. Without WAL and a
-	// busy timeout this connection contends with the bus's writes on the very
-	// same file and fails with "database is locked".
-	//
-	// busy_timeout MUST stay first: modernc.org/sqlite applies _pragma params in
-	// DSN order, so anything ahead of it — journal_mode(WAL) in particular, which
-	// takes an exclusive lock — executes with a zero busy handler and fails
-	// outright against another pool finalising the WAL on this file. Do not
-	// reorder these for tidiness; see the comment in pkg/bus/sqlite.Open.
-	dsn := "file:" + dbPath + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
-	db, err := sql.Open("sqlite", dsn)
+	// dbPath is the same SQLite file the bus opens, so this goes through
+	// sqlite.OpenDB rather than building its own DSN — that used to be
+	// duplicated here, and the duplication is what let this file inherit a
+	// pragma-order bug from pkg/bus/sqlite before it was fixed there. One
+	// helper, one place to get "how this project opens its database file"
+	// right; see sqlite.OpenDB's doc comment for why WAL is set post-connect.
+	db, err := sqlite.OpenDB(ctx, dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open lease store: %w", err)
 	}
