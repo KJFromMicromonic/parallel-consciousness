@@ -238,18 +238,46 @@ Neither was a defect in `pc`. Worth knowing that live validation against real
 harnesses has a meaningful flake rate of its own, and that a run should always
 begin by asserting which build is under test.
 
-## Still untested
+## What has now been demonstrated
 
-**The exit-1 branch.** Stage 0's model got the task right first time; Stage 1
-never reached a verdict because the coordinator died. So no real model has yet
-read a failing gate's detail, fixed its own service, and re-submitted — the loop's
-central behaviour. Fix F3, re-run Stage 1, and it should follow: the fixture is
-already seeded so gateway inherits a wrong `"EUR"`.
+All five items this document originally left open have moved:
 
-## Recommended order
+- **F3 (cold-start daemon race) is fixed.** Measured 11/20 → 0/20 failing
+  starts. `pc up` and `pc run-gate` can now be started simultaneously against a
+  database file that does not yet exist.
+- **F2 (redundant submits) is fixed**, via sticky invalidation, after two
+  rejected designs (a direct-message reply that produced an unbounded feedback
+  loop, then a submitter-only version comparison that served a stale cached
+  verdict). See "F2 fixed, in two attempts" above.
+- **F4 (unacknowledged readiness) is fixed.** `pc submit` now diagnoses a
+  missing coordinator in about ten seconds instead of silently blocking for
+  the full submit timeout.
+- **The exit-1 branch has been exercised, successfully, by a real model.**
+  Gateway received a failing verdict, read the detail, learned a value (the
+  expected currency) it could not have known from its own worktree, fixed only
+  its own service — leaving billing untouched — and re-submitted to a pass.
+  See "Stage 1, re-run" above.
 
-1. **F3** — blocking; nothing else can be tested until two daemons can start.
-2. Re-run Stage 1 to exercise exit-1 and convergence.
-3. **F4** — makes every future failure diagnosable in seconds.
-4. Stage 2 — the mid-task `pc send` communication proof.
-5. **F2** — cheap, and it halves gate cost when it bites.
+## Still open
+
+- **Stage 2 as a deliberate test.** Every peer-to-peer `pc send` observed so
+  far (F6, F6 revisited) happened spontaneously, mid-task, without ever being
+  designed as an experiment. The conversation-layer thesis has evidence, not a
+  test: Stage 2 should set up a scenario that specifically requires unprompted
+  peer messaging to succeed, rather than continuing to rely on it showing up
+  on its own.
+- **The conformance gaps this closes.** Two gaps in `pkg/runtime/runtimetest`
+  — no property proving `Steer`/`Follow` do NOT preempt in-flight work, and no
+  ctx-cancellation coverage for `Interrupt` and `Wait` — are being closed
+  alongside this rewrite.
+- **The round fence is a timestamp, not a round id.** `pkg/gate`'s staleness
+  check compares heartbeat/round timestamps rather than an explicit round
+  identifier, which is weaker than it looks under clock skew or a very fast
+  re-run.
+- **`ErrLeaseLost` is logged but not acted on.** A holder that receives it
+  learns it no longer owns the workspace, but nothing today stops that holder
+  from continuing to use the worktree it was just fenced out of.
+- **No concurrent-`Acquire` test.** `pkg/workspace`'s exclusivity is enforced
+  by the `INSERT ... ON CONFLICT` in SQLite, which should make concurrent
+  `Acquire` calls for the same path safe by construction, but there is no test
+  that actually races two callers against it to confirm that in practice.
