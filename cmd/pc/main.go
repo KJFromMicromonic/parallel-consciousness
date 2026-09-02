@@ -89,10 +89,25 @@ func cmdSubmit(ctx context.Context, args []string) int {
 
 	verdict, err := pcops.Submit(ctx, cfg, *gateID, name, v)
 	if err != nil {
+		if errors.Is(err, pcops.ErrNotAcknowledged) {
+			// F4: this is an operational error — nothing acknowledged the
+			// readiness declaration within pcops.AckTimeout — not a gate
+			// verdict, so it must not read like exit 1. Named separately
+			// from the generic branch below so the message is actionable:
+			// a blocked agent that sees this should go check `pc up`, not
+			// keep waiting or start improvising a peer message the way a
+			// live run's agent did after 7m45s of silence (see
+			// docs/superpowers/specs/2026-09-02-live-fire-findings.md, F4
+			// and "F4 reinforced").
+			fmt.Fprintf(os.Stderr, "pc submit: gate %q was never acknowledged — is `pc up` running for this gate?\n", *gateID)
+			return 2
+		}
 		fmt.Fprintf(os.Stderr, "pc submit: %v\n", err)
-		// Every error Submit can return — opening the bus, joining as the
-		// named agent, declaring readiness, or timing out — means no
-		// verdict was obtained, so they all map to the same exit code.
+		// Every other error Submit can return — opening the bus, joining as
+		// the named agent, declaring readiness, or timing out waiting for a
+		// verdict — means no verdict was obtained, so they all map to the
+		// same exit code as ErrNotAcknowledged above: 2, not 1. Exit 1 is
+		// reserved for a verdict that actually arrived and failed.
 		return 2
 	}
 	// Detail is documented as empty on a pass, and printing it unconditionally

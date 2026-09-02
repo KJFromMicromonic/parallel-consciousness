@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -316,5 +317,52 @@ func TestCmdSubmitExits2WhenVersionCannotBeResolved(t *testing.T) {
 	got := cmdSubmit(context.Background(), []string{"--gate", "checkout"})
 	if got != 2 {
 		t.Errorf("cmdSubmit with unresolvable version = %d, want 2", got)
+	}
+}
+
+// captureStderr redirects os.Stderr for the duration of fn and returns
+// whatever was written to it. cmdSubmit's diagnostics are otherwise
+// invisible to a plain exit-code assertion.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	fn()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = orig
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(out)
+}
+
+// TestCmdSubmitExits2AndNamesTheGateWhenNotAcknowledged is F4's CLI-facing
+// regression test: no coordinator is running at all — pcops.Submit returns
+// pcops.ErrNotAcknowledged — and cmdSubmit must map that to exit 2 (an
+// operational error, never confusable with exit 1's "the gate failed") with
+// an actionable message naming the gate and pointing at `pc up`, distinct
+// from the CLI's generic "pc submit: %v" fallback used for every other
+// error. See docs/superpowers/specs/2026-09-02-live-fire-findings.md, F4:
+// this is exactly the case that used to be an 8-minute silent block.
+func TestCmdSubmitExits2AndNamesTheGateWhenNotAcknowledged(t *testing.T) {
+	t.Setenv("PC_DB", filepath.Join(t.TempDir(), "pc.db"))
+	t.Setenv("PC_AGENT", "billing")
+
+	var got int
+	stderr := captureStderr(t, func() {
+		got = cmdSubmit(context.Background(), []string{"--gate", "checkout", "--version", "v1"})
+	})
+	if got != 2 {
+		t.Errorf("cmdSubmit with no coordinator = %d, want 2", got)
+	}
+	if !strings.Contains(stderr, "checkout") || !strings.Contains(stderr, "pc up") {
+		t.Errorf("stderr = %q, want it to name the gate %q and mention `pc up`", stderr, "checkout")
 	}
 }
