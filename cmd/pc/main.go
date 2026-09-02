@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -19,27 +20,40 @@ import (
 	"time"
 
 	"github.com/KJFromMicromonic/parallel-consciousness/internal/pcops"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/gate"
 )
 
+// usage lists every subcommand main actually dispatches. An earlier review
+// flagged advertising a command that did not exist; keep this list exact in
+// both directions as commands are added.
+const usage = "usage: pc <submit|send|up|run-gate> [flags]"
+
 func main() {
-	if len(os.Args) < 2 {
-		// Only the commands main actually dispatches: up and run-gate are
-		// library functions in pcops, not CLI subcommands, until Phase B wires
-		// them, and advertising them here only earns an exit 2.
-		fmt.Fprintln(os.Stderr, "usage: pc <submit|send> [flags]")
-		os.Exit(2)
-	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	os.Exit(run(ctx, os.Args[1:]))
+}
 
-	switch os.Args[1] {
+// run dispatches one subcommand. It is separate from main so tests can drive
+// dispatch — including the no-args and unknown-command exit paths — without
+// going through os.Exit.
+func run(ctx context.Context, args []string) int {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, usage)
+		return 2
+	}
+	switch args[0] {
 	case "submit":
-		os.Exit(cmdSubmit(ctx, os.Args[2:]))
+		return cmdSubmit(ctx, args[1:])
 	case "send":
-		os.Exit(cmdSend(ctx, os.Args[2:]))
+		return cmdSend(ctx, args[1:])
+	case "up":
+		return cmdUp(ctx, args[1:])
+	case "run-gate":
+		return cmdRunGate(ctx, args[1:])
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
-		os.Exit(2)
+		fmt.Fprintf(os.Stderr, "unknown command %q\n", args[0])
+		return 2
 	}
 }
 
@@ -117,6 +131,118 @@ func cmdSend(ctx context.Context, args []string) int {
 		return 2
 	}
 	return 0
+}
+
+func cmdUp(ctx context.Context, args []string) int {
+	fs := flag.NewFlagSet("up", flag.ExitOnError)
+	config := fs.String("config", "", "scenario file (required)")
+	fs.Parse(args)
+
+	cfg, err := resolveUpConfig(*config)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+
+	return exitForDaemon(pcops.Up(ctx, cfg, printVerdict))
+}
+
+// resolveUpConfig is loadConfig's sibling for the daemon commands: unlike
+// submit/send, up cannot fall back to an env-only Config, because hosting a
+// coordinator needs the gate definition — required participants, runner name
+// — that only a scenario file carries. Falling back silently here would start
+// a coordinator registered for no gate at all.
+func resolveUpConfig(path string) (pcops.Config, error) {
+	if path == "" {
+		return pcops.Config{}, fmt.Errorf("pc up: --config is required (no gate definition without one)")
+	}
+	return pcops.LoadConfig(path)
+}
+
+// printVerdict is the operator's only view of a live `pc up` run, so it prints
+// one readable line per resolved verdict rather than a struct dump.
+func printVerdict(v gate.Verdict) {
+	status := "FAIL"
+	if v.Passed {
+		status = "PASS"
+	}
+	if v.Detail != "" {
+		fmt.Printf("gate %s: %s — %s\n", v.GateID, status, v.Detail)
+		return
+	}
+	fmt.Printf("gate %s: %s\n", v.GateID, status)
+}
+
+func cmdRunGate(ctx context.Context, args []string) int {
+	fs := flag.NewFlagSet("run-gate", flag.ExitOnError)
+	config := fs.String("config", "", "scenario file (required)")
+	workdir := fs.String("workdir", "", "runner's git worktree (default: current directory)")
+	fs.Parse(args)
+
+	cfg, wd, branches, err := resolveRunGateConfig(*config, *workdir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+
+	return exitForDaemon(pcops.RunGate(ctx, cfg, wd, branches))
+}
+
+// resolveRunGateConfig loads the scenario, derives the branches to merge from
+// cfg.Agents, and resolves the workdir default — all before anything touches
+// the bus or a git worktree, so a bad config fails fast instead of hanging
+// inside RunGate waiting for a gate opening that will never resolve.
+func resolveRunGateConfig(configPath, workdir string) (cfg pcops.Config, wd string, branches []string, err error) {
+	if configPath == "" {
+		return pcops.Config{}, "", nil, fmt.Errorf("pc run-gate: --config is required (no gate definition without one)")
+	}
+	cfg, err = pcops.LoadConfig(configPath)
+	if err != nil {
+		return pcops.Config{}, "", nil, err
+	}
+	branches, err = branchesFromConfig(cfg)
+	if err != nil {
+		return pcops.Config{}, "", nil, err
+	}
+	wd = workdir
+	if wd == "" {
+		wd, err = os.Getwd()
+		if err != nil {
+			return pcops.Config{}, "", nil, fmt.Errorf("pc run-gate: getwd: %w", err)
+		}
+	}
+	return cfg, wd, branches, nil
+}
+
+// branchesFromConfig is the branches a runner merges, taken from the scenario
+// file in agent order rather than a separate flag: the scenario is the single
+// source of truth for who participates. A config with no agents, or an agent
+// with no branch, is rejected here rather than left to become a runner that
+// merges nothing and hangs waiting for a gate opening forever.
+func branchesFromConfig(cfg pcops.Config) ([]string, error) {
+	if len(cfg.Agents) == 0 {
+		return nil, fmt.Errorf("pc run-gate: config has no agents to merge")
+	}
+	branches := make([]string, 0, len(cfg.Agents))
+	for _, a := range cfg.Agents {
+		if a.Branch == "" {
+			return nil, fmt.Errorf("pc run-gate: agent %q has no branch configured", a.Name)
+		}
+		branches = append(branches, a.Branch)
+	}
+	return branches, nil
+}
+
+// exitForDaemon maps a daemon's terminal error to an exit code. Up and
+// RunGate return ctx.Err() by design once ctx ends, and main wires ctx to
+// SIGINT/SIGTERM via signal.NotifyContext — so a context cancellation here is
+// a normal, requested shutdown, not a failure to report as one.
+func exitForDaemon(err error) int {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return 0
+	}
+	fmt.Fprintln(os.Stderr, err)
+	return 2
 }
 
 // loadConfig prefers an explicit scenario file and otherwise synthesises the
