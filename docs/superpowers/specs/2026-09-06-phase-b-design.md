@@ -99,6 +99,69 @@ which is stronger evidence than a designed test would produce. Once
 `scripts/live-run.sh` exists it is a variant scenario and nearly free, so it is
 worth doing if the phase has room — but it gates nothing.
 
+## Recorded for a later phase — context isolation is a per-role policy, not an invariant
+
+**This changes nothing in Phase B.** It is recorded here because Phase B's spec is
+the live planning document, and the finding must be seen before `pkg/loop` is
+designed — by which point it would be expensive to discover.
+
+### The finding
+
+Phase A made context isolation structural and global: a git worktree per agent,
+one active owner per work item, and the stated principle that *"an independent
+reviewer should not inherit the implementer's reasoning or incentive to accept
+its own work."*
+
+That principle is correct — but only for some loop shapes. Read as a global
+invariant it is wrong, and the loop engine must not encode it as one.
+
+### The evidence
+
+Five loop proposals were written out by hand for deliberately dissimilar goals: a
+cross-service contract change, a dependency upgrade across a monorepo, a flaky
+test investigation, a security audit, and a performance regression. The exercise
+was originally aimed at a UI question, but it surfaced this instead.
+
+Three of the five want isolation, and one wants it very strongly:
+
+- **Cross-service contract change** — each implementer must not see its peers'
+  worktrees; that is what makes the spanning test meaningful.
+- **Dependency upgrade** — each shard sees only its own packages.
+- **Security audit** — the strongest case of the five. The adjudicator deciding
+  whether a finding is real must *not* inherit the analyst's reasoning, or it
+  rubber-stamps false positives. Isolation is the mechanism of correctness here.
+
+But one wants the opposite:
+
+- **Flaky test investigation** — reproduce, hypothesise, instrument, re-measure,
+  repeat. A single investigator building an accumulated model across many
+  iterations is the entire value. Parallel isolated agents would each start from
+  nothing and rediscover the same dead ends. Here isolation is not a safeguard;
+  it is the failure mode.
+
+### The correction
+
+Phase A's mechanism stays right: worktrees and exclusive leases remain the way
+isolation is enforced, and isolation remains the sensible default. What changes is
+that **the loop proposal must be able to set a context policy per role** —
+isolate, or accumulate across iterations — rather than the engine assuming one
+globally.
+
+Concretely, when `pkg/loop` is designed, a role needs a context policy alongside
+its other attributes, and the spec's isolation principle should be restated as
+*"an independent reviewer must not inherit the implementer's reasoning"* — a
+constraint on the reviewer relationship specifically, not a property of every
+role in every loop.
+
+### Related, from the same exercise
+
+Not every loop terminates in success. Across the five, legitimate terminal states
+included green, partial success with a report ("47 shards done, 3 need you"),
+"could not fix it — here is what I ruled out", and "wrong shape, replan" when a
+bisect finds no single culprit. A loop engine that models only pass and fail
+would misrepresent three of the five. Recorded for the same reason and at the
+same time; no Phase B work implied.
+
 ## `pc watch`
 
 ### Why it cannot be built on the transport abstraction
