@@ -53,6 +53,12 @@ structurally impossible rather than merely discouraged.
    not know a language model is involved.
 3. **Isolation is structural, not advisory.** An agent's workspace is a git
    worktree it holds an exclusive lease on. It cannot see another agent's edits.
+   *Amended for later phases:* this remains the mechanism and the sensible
+   default, but it is not a global invariant — a loop engine must set context
+   policy per role, because some loop shapes (a flaky-test investigation, for
+   one) need context to accumulate across iterations rather than be isolated.
+   See "Recorded for a later phase" in
+   [2026-09-06-phase-b-design.md](./2026-09-06-phase-b-design.md).
 4. **Evidence is observed, not reported.** Tool-execution events give the control
    plane an attributable record of files touched and commands run.
 5. **The fake runtime comes first.** The loop must be testable in CI with no API
