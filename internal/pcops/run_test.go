@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/KJFromMicromonic/parallel-consciousness/internal/pcops"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/runtime"
 	"github.com/KJFromMicromonic/parallel-consciousness/pkg/runtime/fake"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/workspace"
 )
 
 // buildPC compiles cmd/pc so the fake agents can invoke the real CLI, exactly
@@ -279,5 +281,90 @@ func TestRunInjectsTheConfiguredSubmitTimeout(t *testing.T) {
 	}
 	if strings.TrimSpace(string(got)) != cfg.SubmitTimeout.String() {
 		t.Fatalf("PC_SUBMIT_TIMEOUT = %q, want %q", strings.TrimSpace(string(got)), cfg.SubmitTimeout)
+	}
+}
+
+// A fenced lease means this run no longer owns its worktree. Continuing to
+// work in it is worse than stopping: the heartbeat must stop and the run must
+// fail with attribution, the same shape as the session-death path.
+func TestRunFailsWhenALeaseIsLost(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	repo := twoServiceRepo(t)
+	db := filepath.Join(t.TempDir(), "bus.db")
+	cfg := pcops.Config{
+		Repo:   repo,
+		DB:     db,
+		GateID: "checkout",
+		Gate: pcops.GateDef{
+			Required: []string{"billing"},
+			Runner:   "integrator",
+			Run:      "sh check.sh",
+		},
+		Agents:        []pcops.AgentDef{{Name: "billing", Branch: "agent/billing", Role: "implementer", Task: "x"}},
+		Runner:        pcops.AgentDef{Name: "integrator", Branch: "agent/integration"},
+		SubmitTimeout: 20 * time.Second,
+		Wall:          50 * time.Second,
+	}
+
+	// An agent that never submits, so Run stays in its wait while the lease
+	// is stolen underneath it.
+	r := fake.New(map[string]fake.Script{
+		"billing": {OnStart: []fake.Action{fake.Emit{Tool: runtime.ToolUse{Name: "read", Target: "x", Ok: true}}}},
+	})
+
+	errs := make(chan error, 1)
+	go func() { _, err := pcops.Run(ctx, cfg, r); errs <- err }()
+
+	// Acquire commits the lease row BEFORE worktreeAdd creates the directory,
+	// so this directory appearing is proof Run's row already exists — the
+	// precondition for a steal to be a RECLAIM (rotating the holder token and
+	// fencing Run) rather than a plain first INSERT. Without this wait the
+	// stealer can win the race, Run then fails with ErrLeased during setup,
+	// and the test never reaches the heartbeat path it exists to exercise.
+	root := filepath.Join(filepath.Dir(db), "worktrees")
+	appeared := time.After(30 * time.Second)
+	for {
+		if _, err := os.Stat(filepath.Join(root, "billing")); err == nil {
+			break
+		}
+		select {
+		case <-appeared:
+			t.Fatal("Run never acquired billing's worktree")
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+
+	// Steal billing's lease: a second Manager with a very short TTL reclaims
+	// it, which rotates the holder token and fences the original holder.
+	stealer, err := workspace.New(ctx, repo, root, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stealer.Close()
+	stealer.SetTTL(1 * time.Nanosecond)
+	deadline := time.After(30 * time.Second)
+	for {
+		if _, err := stealer.Acquire(ctx, "billing", "agent/billing"); err == nil {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("never managed to reclaim billing's lease")
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+
+	select {
+	case err := <-errs:
+		if !errors.Is(err, pcops.ErrLeaseLost) {
+			t.Fatalf("Run err = %v, want ErrLeaseLost", err)
+		}
+		if !strings.Contains(err.Error(), "billing") {
+			t.Fatalf("error does not name the agent: %v", err)
+		}
+	case <-time.After(45 * time.Second):
+		t.Fatal("Run did not fail after its lease was lost")
 	}
 }
