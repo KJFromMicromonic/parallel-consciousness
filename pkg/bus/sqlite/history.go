@@ -44,10 +44,10 @@ func (b *Bus) History(ctx context.Context, fromSeq int64) ([]Record, error) {
 	var out []Record
 	for rows.Next() {
 		var (
-			seq                                                     int64
-			id, conv, inReplyTo, fromAgent, toAgent, toTopic        string
-			intent, bodyS, ts                                       string
-			deadline                                                sql.NullString
+			seq                                              int64
+			id, conv, inReplyTo, fromAgent, toAgent, toTopic string
+			intent, bodyS, ts                                string
+			deadline                                         sql.NullString
 		)
 		if err := rows.Scan(&seq, &id, &conv, &inReplyTo, &fromAgent, &toAgent,
 			&toTopic, &intent, &bodyS, &ts, &deadline); err != nil {
