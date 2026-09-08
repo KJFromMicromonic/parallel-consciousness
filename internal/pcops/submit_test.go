@@ -59,6 +59,28 @@ func TestSubmitReturnsThePassingVerdict(t *testing.T) {
 	}
 }
 
+// FIX 4: an empty version silently disables Submit's headline correctness
+// guard (versions[agentName] != version), because versionsFromBody returns
+// "" for a participant absent from a verdict entirely — so "" == "" would
+// PASS the guard for a verdict that never tested this agent at all. `pc
+// submit` cannot reach this (resolveVersion errors rather than returning a
+// placeholder), but Submit is a package-level function, so it must reject
+// this itself rather than rely on every caller getting resolveVersion right.
+// No bus, coordinator or runner needed: this must fail before Submit ever
+// opens one.
+func TestSubmitRejectsAnEmptyVersion(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := pcops.Submit(ctx, pcops.Config{DB: filepath.Join(t.TempDir(), "bus.db")}, "g", "billing", "")
+	if err == nil {
+		t.Fatal("Submit with an empty version = nil error, want one rejecting it")
+	}
+	if !strings.Contains(err.Error(), "version") {
+		t.Errorf("error %q does not mention the empty version", err.Error())
+	}
+}
+
 // A single-participant gate whose runner always fails: submit must return a
 // nil error alongside a non-passing verdict that carries the failure detail —
 // distinct from ErrNoVerdict, which means no verdict arrived at all.
@@ -263,6 +285,12 @@ func TestSubmitRedundantResubmitAnsweredFromCacheDoesNotErrorAsUnacknowledged(t 
 	}
 	if !v2.Passed {
 		t.Fatalf("redundant verdict = %+v, want passed", v2)
+	}
+	// FIX 6: the cache path is the one place a verdict is REPLAYED rather
+	// than freshly computed, which makes it the most load-bearing place to
+	// assert that Versions survives the replay rather than merely Passed.
+	if v2.Versions["billing"] != "v1" {
+		t.Fatalf("cached verdict versions = %+v, want billing=v1", v2.Versions)
 	}
 }
 

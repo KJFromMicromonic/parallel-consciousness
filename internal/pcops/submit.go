@@ -47,6 +47,17 @@ const AckTimeout = 10 * time.Second
 // This is the whole harness-agnostic contract: a gate id, an opaque version, an
 // agent name. Any tool that can run a shell command can participate.
 func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) (gate.Verdict, error) {
+	// The headline correctness guard this branch exists to deliver is
+	// versions[agentName] != version below. versionsFromBody returns "" for
+	// a participant absent from a verdict's Versions map, so an empty
+	// version here would compare "" against "" and PASS that guard for a
+	// verdict that never tested this agent at all. `pc submit` cannot reach
+	// this (resolveVersion errors rather than returning a placeholder), but
+	// Submit is a package-level function any caller can reach directly, and
+	// this is the one input that silently turns the guard off.
+	if version == "" {
+		return gate.Verdict{}, fmt.Errorf("pcops: version must not be empty")
+	}
 	// A zero SubmitTimeout means "unset", not "already expired": callers that
 	// build a Config by hand (and every test that does) would otherwise get an
 	// instantly cancelled context and ErrNoVerdict.
@@ -214,16 +225,26 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 	// mishandle.
 	for {
 		setReadyAt(time.Now())
-		// declined is signalled by ANY verdict for this gate that does not
-		// test this agent's version, at any point in the handler's lifetime —
-		// not only ones that arrive after a Nack. TestSubmitDeclinesAVerdict-
-		// ThatDidNotIncludeIt is exactly this: a foreign-version verdict can
-		// leave a stale signal buffered here long before any Nack exists. A
-		// later Nack's waitForRoundToResolve must not mistake that stale
-		// signal for proof about the round IT is waiting on, so drain
-		// anything predating this attempt's own Ready before declaring it.
+		// declined, acked and nacked are all cross-attempt state: any of the
+		// three can hold a stale signal from a previous attempt's reply,
+		// buffered here (capacity 1) before this attempt's own Ready is even
+		// declared. TestSubmitDeclinesAVerdictThatDidNotIncludeIt is exactly
+		// this for declined: a foreign-version verdict can leave a stale
+		// signal sitting here long before any Nack exists. The three
+		// handlers apply the readAt() fence uniformly against replay from
+		// the cursor, but a fence on arrival does not drain what an earlier
+		// attempt already buffered — so drain all three before declaring a
+		// fresh Ready, not just declined.
 		select {
 		case <-declined:
+		default:
+		}
+		select {
+		case <-acked:
+		default:
+		}
+		select {
+		case <-nacked:
 		default:
 		}
 		if err := gate.Ready(ctx, a, gateID, version); err != nil {
@@ -254,8 +275,12 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 		case testing := <-nacked:
 			fmt.Fprintf(os.Stderr, "pc submit: gate %q is mid-round (testing %s); waiting for it to finish\n",
 				gateID, describeVersions(testing))
-			if !waitForRoundToResolve(ctx, declined, verdicts) {
+			res := waitForRoundToResolve(ctx, declined, verdicts)
+			if !res.resolved {
 				return gate.Verdict{}, ErrNoVerdict
+			}
+			if res.hasVerdict {
+				return res.verdict, nil
 			}
 			continue
 		case v := <-verdicts:
@@ -287,8 +312,12 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 		case testing := <-nacked:
 			fmt.Fprintf(os.Stderr, "pc submit: gate %q is mid-round (testing %s); waiting for it to finish\n",
 				gateID, describeVersions(testing))
-			if !waitForRoundToResolve(ctx, declined, verdicts) {
+			res := waitForRoundToResolve(ctx, declined, verdicts)
+			if !res.resolved {
 				return gate.Verdict{}, ErrNoVerdict
+			}
+			if res.hasVerdict {
+				return res.verdict, nil
 			}
 			continue
 		case <-ctx.Done():
@@ -297,23 +326,40 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 	}
 }
 
+// roundResolution reports how waitForRoundToResolve concluded. resolved is
+// false only when ctx ended before the in-flight round did. hasVerdict is
+// set when the round resolved WITH a verdict that answers this attempt
+// directly (the race-won case below) — the caller must return it as-is
+// rather than looping back to re-declare readiness, which would publish a
+// second, spurious gate.Ready at a version the round already resolved.
+type roundResolution struct {
+	verdict    gate.Verdict
+	hasVerdict bool
+	resolved   bool
+}
+
 // waitForRoundToResolve blocks until the in-flight round that displaced our
-// readiness has resolved, reported by a verdict we declined. It returns false
-// when the context ended first. A verdict that DOES match ours can still
-// arrive here — a race we win — so it is drained into verdicts' buffer for the
-// caller's next select rather than dropped.
-func waitForRoundToResolve(ctx context.Context, declined <-chan struct{}, verdicts chan gate.Verdict) bool {
+// readiness has resolved. Two things can report that: declined, signalled by
+// a verdict for this gate that did not test our version (proof the round is
+// done, with nothing further to hand back); or verdicts, when the verdict
+// that resolves the round happens to be OUR OWN — a race this attempt wins
+// outright, since there is nothing left to wait for. Unlike an earlier
+// version of this function, that verdict is returned to the caller rather
+// than re-buffered into verdicts and left for the loop to pick up on its next
+// iteration: re-declaring readiness after a verdict already answered this
+// attempt would publish a redundant gate.Ready at the same version, and in
+// gate.go that hits the F2 cache and replays another resolve — another
+// broadcast, another block fanout on failure, another OnVerdict, and (via
+// pcops.Run's round counter) a run that can be failed a round early by a
+// purely spurious cache replay.
+func waitForRoundToResolve(ctx context.Context, declined <-chan struct{}, verdicts chan gate.Verdict) roundResolution {
 	select {
 	case <-declined:
-		return true
+		return roundResolution{resolved: true}
 	case v := <-verdicts:
-		select {
-		case verdicts <- v:
-		default:
-		}
-		return true
+		return roundResolution{verdict: v, hasVerdict: true, resolved: true}
 	case <-ctx.Done():
-		return false
+		return roundResolution{}
 	}
 }
 
