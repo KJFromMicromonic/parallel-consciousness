@@ -154,6 +154,20 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 		if id, _ := m.Body["gate"].(string); id != gateID {
 			return nil
 		}
+		// An Ack is a direct reply, exactly like the Nack below, so it sits on
+		// the same replay path the Inform handler guards against above: a
+		// submit process that was killed after being acked (or nacked) but
+		// before exiting cleanly leaves that reply sitting unread, and
+		// pkg/bus/sqlite resumes the next submit under this agent name from
+		// the stored cursor, handing it straight back as if it were fresh. An
+		// unfenced stale Ack here would satisfy the acknowledgement wait for a
+		// round that already ended, then block on the verdict wait until ctx
+		// expires — the same ErrNoVerdict-instead-of-ErrNotAcknowledged
+		// misdiagnosis Ruling 1 exists to prevent, just arriving from this
+		// handler instead of the timer.
+		if m.Timestamp.Before(readAt()) {
+			return nil // a previous round's ack, replayed from the cursor
+		}
 		select {
 		case acked <- outstandingFromBody(m.Body["outstanding"]):
 		default:
@@ -169,6 +183,19 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 	a.On(protocol.IntentNack, func(_ context.Context, _ *agent.Agent, m protocol.Message) *protocol.Message {
 		if id, _ := m.Body["gate"].(string); id != gateID {
 			return nil
+		}
+		// A Nack is a direct reply too, so it is just as exposed to a lagging
+		// cursor as the Inform and Ack handlers: a submit killed right after
+		// being nacked (F2 measured models doing exactly this) leaves the
+		// Nack unread, and the next submit under this agent name is handed it
+		// back as its first message. Without this fence that stale Nack would
+		// print a false "gate is mid-round" line and enter
+		// waitForRoundToResolve for a round that is not this attempt's round
+		// at all — and that wait has no AckTimeout bound, so with no
+		// coordinator left to signal declined it would block the full
+		// SubmitTimeout instead of failing fast with ErrNotAcknowledged.
+		if m.Timestamp.Before(readAt()) {
+			return nil // a previous round's nack, replayed from the cursor
 		}
 		select {
 		case nacked <- versionsFromBody(m.Body["testing"]):
@@ -187,6 +214,18 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 	// mishandle.
 	for {
 		setReadyAt(time.Now())
+		// declined is signalled by ANY verdict for this gate that does not
+		// test this agent's version, at any point in the handler's lifetime —
+		// not only ones that arrive after a Nack. TestSubmitDeclinesAVerdict-
+		// ThatDidNotIncludeIt is exactly this: a foreign-version verdict can
+		// leave a stale signal buffered here long before any Nack exists. A
+		// later Nack's waitForRoundToResolve must not mistake that stale
+		// signal for proof about the round IT is waiting on, so drain
+		// anything predating this attempt's own Ready before declaring it.
+		select {
+		case <-declined:
+		default:
+		}
 		if err := gate.Ready(ctx, a, gateID, version); err != nil {
 			return gate.Verdict{}, fmt.Errorf("declare ready: %w", err)
 		}
@@ -231,6 +270,20 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 		select {
 		case v := <-verdicts:
 			return v, nil
+		// A Nack arriving here, for an attempt that was already acked, looks
+		// impossible from onReady's logic alone: it answers one Ready with
+		// exactly one of {ack, nack}, never both. But that mutual exclusion
+		// is a property of the coordinator's in-process logic, not of
+		// delivery over a durable, replayable log — and delivery guarantees
+		// are not this code's assumption to make. Two live paths reach here
+		// regardless: a stale Nack replayed from a lagging cursor (the fence
+		// above rejects a stale nack for THIS agent's own earlier attempt,
+		// but not one whose timestamp happens to postdate readAt() while
+		// still answering a round this attempt no longer cares about); and
+		// two coordinators on one database, since nothing prevents a second
+		// `pc up` from also joining as "coordinator" — both subscribe to the
+		// same topic and share one cursor row, and either can answer the same
+		// Ready differently. Keep this arm.
 		case testing := <-nacked:
 			fmt.Fprintf(os.Stderr, "pc submit: gate %q is mid-round (testing %s); waiting for it to finish\n",
 				gateID, describeVersions(testing))
@@ -271,8 +324,8 @@ func describeVersions(vs map[string]string) string {
 		return "an unreported version set"
 	}
 	parts := make([]string, 0, len(vs))
-	for agent, v := range vs {
-		parts = append(parts, agent+"@"+abbrevVersion(v))
+	for name, v := range vs {
+		parts = append(parts, name+"@"+abbrevVersion(v))
 	}
 	sort.Strings(parts)
 	return strings.Join(parts, ", ")

@@ -981,7 +981,11 @@ func TestReadinessDroppedMidRoundIsNacked(t *testing.T) {
 		if testing["billing"] != "v1" || testing["gateway"] != "v1" {
 			t.Fatalf("nack testing = %+v, want billing=v1 gateway=v1", testing)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(3 * time.Second):
+		// Not the full 10s SetRunnerTimeout: the nack arrives in milliseconds
+		// on the in-memory bus, and waiting the round's whole lifetime here
+		// would let a genuine regression race the stall's own resolution
+		// instead of failing promptly.
 		t.Fatal("readiness dropped mid-round produced no Nack")
 	}
 }

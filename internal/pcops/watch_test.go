@@ -79,6 +79,22 @@ func TestFormatRecord(t *testing.T) {
 			in:   rec("coordinator", "billing", "", protocol.IntentBlock, map[string]any{"gate": "currency", "text": "currency gate failing: boom"}),
 			want: []string{"billing", "block", "currency gate failing"},
 		},
+		{
+			name: "ack shows who it is still waiting on",
+			in:   rec("coordinator", "billing", "", protocol.IntentAck, map[string]any{"gate": "currency", "outstanding": []any{"gateway"}}),
+			want: []string{"billing", "ack", "waiting on gateway"},
+		},
+		{
+			name: "nack shows what the in-flight round is testing, not outstanding",
+			in: rec("coordinator", "gateway", "", protocol.IntentNack, map[string]any{
+				"gate": "currency",
+				"testing": map[string]any{
+					"billing": "acef4043778b966dc1cae9819e282d65f6b95e22",
+					"gateway": "v1",
+				},
+			}),
+			want: []string{"gateway", "nack", "mid-round, testing", "billing@acef4043", "gateway@v1"},
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

@@ -63,9 +63,21 @@ func summarise(m protocol.Message, full bool) string {
 			}
 			return strings.Join(parts, " ")
 		}
-	case protocol.IntentAck, protocol.IntentNack:
+	case protocol.IntentAck:
 		if out := outstandingFromBody(m.Body["outstanding"]); len(out) > 0 {
 			return "waiting on " + strings.Join(out, ", ")
+		}
+	case protocol.IntentNack:
+		// Unlike the Ack above, a Nack carries "testing" (the version set the
+		// in-flight round is actually testing), not "outstanding" — see
+		// gate.go's onReady: open leaves gs.ready intact for a round's whole
+		// lifetime, only resolve clears it, so outstandingFor(gs) always
+		// returns an empty slice on this path. Rendering with describeVersions
+		// is deliberate: it is the exact same rendering pcops.Submit's own
+		// stderr line uses for this field, so the CLI and the log read
+		// identically for the same event.
+		if testing := versionsFromBody(m.Body["testing"]); len(testing) > 0 {
+			return "mid-round, testing " + describeVersions(testing)
 		}
 	}
 	// Everything else: whichever human-readable field is present.

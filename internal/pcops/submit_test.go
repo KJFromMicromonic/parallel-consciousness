@@ -397,6 +397,168 @@ func TestSubmitTreatsANackAsAcknowledgement(t *testing.T) {
 	}
 }
 
+// waitForLogged polls the durable log (the same way pcops.Watch reads it)
+// until match reports true for some record, or fails the test if ctx ends
+// first. Submit exposes no external hook for "the coordinator processed my
+// Nack" or "round 1 has resolved", so the log itself is the only place a test
+// can look for deterministic proof of either.
+func waitForLogged(t *testing.T, ctx context.Context, b *sqlite.Bus, match func(protocol.Message) bool) {
+	t.Helper()
+	for {
+		recs, err := b.History(ctx, 0)
+		if err != nil {
+			t.Fatalf("history: %v", err)
+		}
+		for _, r := range recs {
+			if match(r.Msg) {
+				return
+			}
+		}
+		select {
+		case <-time.After(20 * time.Millisecond):
+		case <-ctx.Done():
+			t.Fatal("context ended waiting for a log entry")
+		}
+	}
+}
+
+// TestSubmitRedeclaresAfterNackAndReturnsTheReDeclaredVerdict exercises the
+// Nack retry path end to end through Submit: nacked, declined, and
+// waitForRoundToResolve are otherwise exercised by no test in this package.
+//
+// Round 1 (billing@v1 + gateway@v1) is formed by publishing IntentReady
+// directly rather than through agent.New-backed senders named "billing" and
+// "gateway": Submit will separately create its OWN agent named "billing", and
+// pkg/bus/sqlite has no notion of a message "already claimed" by one
+// subscriber under a name — each Subscribe independently re-scans the log
+// from its own cursor, so two live subscriptions sharing a name would each
+// receive their own copy of anything addressed to it (this bus's Ack/Nack
+// replies are direct, not topic broadcasts). A raw Publish creates no
+// subscription and so cannot collide with Submit's.
+//
+// The runner is gated exactly like TestSubmitDeclinesAVerdictThatDidNotIncludeIt
+// so round 1 stays genuinely in flight until released, but waitForLogged is
+// what actually proves the ordering: Submit's billing@v2 readiness must be
+// nacked (proving it reached the coordinator while round 1 was still open)
+// before the runner is released, and round 1's own resolution must be
+// observed on the log before gateway re-declares — otherwise gateway's
+// re-declare could itself race an inflight round and be silently dropped
+// with nobody listening for its Nack.
+func TestSubmitRedeclaresAfterNackAndReturnsTheReDeclaredVerdict(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	db := filepath.Join(t.TempDir(), "bus.db")
+	cfg := pcops.Config{
+		DB:            db,
+		GateID:        "g",
+		Gate:          pcops.GateDef{Required: []string{"billing", "gateway"}, Runner: "runner"},
+		SubmitTimeout: 45 * time.Second,
+	}
+	cstop, err := pcops.StartCoordinator(ctx, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cstop()
+
+	b, err := sqlite.Open(ctx, db, sqlite.WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+
+	// The runner blocks every call until release is closed, then answers
+	// with exactly the versions it was asked to test: round 1 stalls in
+	// flight until we choose to let it go, and round 2 (formed by billing's
+	// own re-declare plus gateway's) resolves immediately afterward since
+	// release is by then already closed.
+	run, err := agent.New(ctx, b, "runner", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan map[string]string, 4)
+	release := make(chan struct{})
+	gate.ServeRunner(run, func(ctx context.Context, gateID string, versions map[string]string) gate.Verdict {
+		select {
+		case entered <- versions:
+		default:
+		}
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return gate.Verdict{GateID: gateID, Passed: true, Versions: versions}
+	})
+	go run.Run(ctx)
+
+	publishReady := func(who, version string) {
+		t.Helper()
+		msg := protocol.New(
+			protocol.Address{Agent: who}, protocol.Address{Topic: gate.Topic("g")},
+			protocol.IntentReady, map[string]any{"gate": "g", "version": version})
+		if err := b.Publish(ctx, msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	publishReady("billing", "v1")
+	publishReady("gateway", "v1")
+
+	select {
+	case vs := <-entered:
+		if vs["billing"] != "v1" || vs["gateway"] != "v1" {
+			t.Fatalf("round 1 entered with %+v, want billing=v1 gateway=v1", vs)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("round 1 never opened")
+	}
+
+	// Submit, as billing, at a new version while round 1 is genuinely in
+	// flight: this readiness must be dropped and nacked.
+	type result struct {
+		v   gate.Verdict
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		v, err := pcops.Submit(ctx, cfg, "g", "billing", "v2")
+		done <- result{v, err}
+	}()
+
+	// Proof that the Nack actually happened — i.e. that Submit's readiness
+	// reached the coordinator while round 1 was still open — rather than a
+	// race where round 1 resolves first and billing@v2 is recorded as
+	// ordinary new readiness instead.
+	waitForLogged(t, ctx, b, func(m protocol.Message) bool {
+		gateID, _ := m.Body["gate"].(string)
+		return m.Intent == protocol.IntentNack && m.To.Agent == "billing" && gateID == "g"
+	})
+
+	close(release) // let round 1 resolve
+
+	// Proof that round 1 has actually resolved (gs.ready re-armed, gs.inflight
+	// cleared) before gateway re-declares — otherwise gateway's own readiness
+	// could race the still-resolving round 1 and be nacked with nobody
+	// listening.
+	waitForLogged(t, ctx, b, func(m protocol.Message) bool {
+		gateID, _ := m.Body["gate"].(string)
+		passed, _ := m.Body["passed"].(bool)
+		return m.Intent == protocol.IntentInform && gateID == "g" && passed
+	})
+	publishReady("gateway", "v2")
+
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("Submit: %v", r.err)
+		}
+		if r.v.Versions["billing"] != "v2" {
+			t.Fatalf("Submit returned a verdict over %+v, want billing=v2", r.v.Versions)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Submit never returned after re-declaring past the Nack")
+	}
+}
+
 // The defect: pkg/gate drops a readiness that lands while a round is already
 // in flight, but Submit would still accept that round's verdict — one computed
 // without its version. The runner is gated so the ordering is deterministic:
