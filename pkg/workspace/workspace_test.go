@@ -177,11 +177,13 @@ func TestConcurrentAcquireYieldsExactlyOneWinner(t *testing.T) {
 	close(start)
 
 	var winners int
+	var winner *Lease
 	for i := 0; i < contenders; i++ {
 		r := <-results
 		switch {
 		case r.err == nil:
 			winners++
+			winner = r.lease
 		case errors.Is(r.err, ErrLeased):
 			// expected for every loser
 		default:
@@ -190,5 +192,25 @@ func TestConcurrentAcquireYieldsExactlyOneWinner(t *testing.T) {
 	}
 	if winners != 1 {
 		t.Fatalf("%d winners, want exactly 1", winners)
+	}
+
+	// FIX 7: exactly one winner is only half the guarantee under contention
+	// — a loser must not have left an orphan worktree behind either. Acquire
+	// only calls worktreeAdd after the exclusivity UPSERT has already
+	// determined it is the winner, so this also pins that ordering: nothing
+	// under m.root but the winner's own directory.
+	entries, err := os.ReadDir(m.root)
+	if err != nil {
+		t.Fatalf("read worktree root: %v", err)
+	}
+	if len(entries) != 1 {
+		names := make([]string, len(entries))
+		for i, e := range entries {
+			names[i] = e.Name()
+		}
+		t.Fatalf("worktree root has %d entries %v, want exactly 1 (no orphan worktree)", len(entries), names)
+	}
+	if got := entries[0].Name(); got != filepath.Base(winner.Path) {
+		t.Fatalf("worktree root's only entry is %q, want the winning lease's %q", got, filepath.Base(winner.Path))
 	}
 }
