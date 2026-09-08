@@ -212,9 +212,14 @@ func TestWatchRequiresConfig(t *testing.T) {
 	}
 }
 
-// A cancelled context blocking inside --follow is a clean Ctrl-C — main wires
-// ctx to SIGINT/SIGTERM — and cmdWatch must exit 0, not report it as a
-// failure. This is the CLI-boundary regression test for that mapping.
+// A cancelled context must not read as a failure at the CLI boundary: main
+// wires ctx to SIGINT/SIGTERM, so cmdWatch must map context.Canceled to exit
+// 0 rather than the generic error path, mirroring exitForDaemon's treatment
+// of the same case for up and run-gate. Passing an already-cancelled context
+// surfaces the cancellation through sqlite.Open, before Watch ever reaches
+// its follow loop — that loop's own cancellation handling is exercised by
+// TestWatchStopsCleanlyWhenCancelledMidFollow in internal/pcops/watch_test.go.
+// This test pins only the CLI's exit-code mapping.
 func TestCmdWatchExitsCleanlyOnCancelledContext(t *testing.T) {
 	t.Setenv("PC_DB", filepath.Join(t.TempDir(), "bus.db"))
 	path := writeScenario(t, sampleScenario)

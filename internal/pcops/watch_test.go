@@ -3,8 +3,10 @@ package pcops_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +16,35 @@ import (
 	"github.com/KJFromMicromonic/parallel-consciousness/pkg/gate"
 	"github.com/KJFromMicromonic/parallel-consciousness/pkg/protocol"
 )
+
+// notifyingWriter is a thread-safe io.Writer that closes notify on its first
+// write. A test running Watch's follow loop in a goroutine uses this to wait
+// for actual output — proof the loop is live and has made it past its first
+// Tail poll — rather than guessing at how long that takes with a fixed delay.
+type notifyingWriter struct {
+	mu     sync.Mutex
+	buf    bytes.Buffer
+	notify chan struct{}
+	once   sync.Once
+}
+
+func newNotifyingWriter() *notifyingWriter {
+	return &notifyingWriter{notify: make(chan struct{})}
+}
+
+func (w *notifyingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n, err := w.buf.Write(p)
+	w.once.Do(func() { close(w.notify) })
+	return n, err
+}
+
+func (w *notifyingWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
 
 func rec(from, toAgent, toTopic string, intent protocol.Intent, body map[string]any) sqlite.Record {
 	m := protocol.New(protocol.Address{Agent: from},
@@ -159,5 +190,55 @@ func TestWatchFiltersByGate(t *testing.T) {
 	}
 	if got := buf.String(); !strings.Contains(got, "KEEP") || strings.Contains(got, "DROP") {
 		t.Fatalf("gate filter wrong:\n%s", got)
+	}
+}
+
+// A clean Ctrl-C while --follow is blocked inside Tail must surface as
+// context.Canceled specifically — not merely as some non-nil error, which a
+// mid-tail database failure would also produce. This is what actually drives
+// Watch's follow loop and cancels while it is live and polling, unlike the
+// cmd/pc-level cancellation test, which cancels before Watch ever opens its
+// bus and so never reaches Tail at all.
+func TestWatchStopsCleanlyWhenCancelledMidFollow(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	db := filepath.Join(t.TempDir(), "bus.db")
+	b, err := sqlite.Open(ctx, db, sqlite.WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+
+	m := protocol.New(protocol.Address{Agent: "a"}, protocol.Address{Topic: gate.Topic("g")},
+		protocol.IntentInform, map[string]any{"gate": "g", "text": "hello"})
+	if err := b.Publish(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+
+	out := newNotifyingWriter()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- pcops.Watch(ctx, pcops.Config{DB: db}, "g", false, true, out)
+	}()
+
+	select {
+	case <-out.notify:
+		// The follow loop has replayed the published message and is now
+		// parked in Tail's poll, exactly the state this test needs to cancel
+		// mid-stream rather than before Watch even starts.
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for Watch to produce output before cancelling")
+	}
+
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Watch after mid-follow cancellation = %v, want an error satisfying errors.Is(err, context.Canceled)", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for Watch to return after cancellation")
 	}
 }
