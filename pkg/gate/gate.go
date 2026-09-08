@@ -396,11 +396,16 @@ func (c *Coordinator) resolve(ctx context.Context, gs *gateState, v Verdict, sta
 	gs.lastStalled = stalled
 	gs.mu.Unlock()
 
+	// versions makes the verdict self-describing: it says which participant was
+	// tested at which version. A participant needs that to tell whether this
+	// verdict covered its own submission — a gate id and a passed bool cannot.
+	// Without it, a readiness dropped mid-round would silently accept the
+	// in-flight round's verdict, one computed without its version at all.
 	_ = c.a.Send(ctx, protocol.New(
 		protocol.Address{Agent: c.a.Name},
 		protocol.Address{Topic: Topic(gateID)},
 		protocol.IntentInform,
-		map[string]any{"text": text, "gate": gateID, "passed": v.Passed},
+		map[string]any{"text": text, "gate": gateID, "passed": v.Passed, "versions": copyMap(v.Versions)},
 	))
 
 	if !v.Passed {

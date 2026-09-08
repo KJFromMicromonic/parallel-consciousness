@@ -909,3 +909,77 @@ func TestOnReadyDoesNotAckACachedResubmit(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 }
+
+// A verdict must say what it tested. Without this, a participant cannot tell
+// whether a broadcast verdict covered its own version — which is what lets a
+// dropped readiness silently accept someone else's round.
+func TestVerdictBroadcastCarriesTheVersionsItTested(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	b := bus.NewInMemory(64)
+	coord, err := agent.New(ctx, b, "coordinator", []string{gate.Topic("g")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := gate.NewCoordinator(coord)
+	c.Register(gate.Spec{ID: "g", Required: []string{"billing"}, Runner: "runner"})
+	go coord.Run(ctx)
+
+	run, err := agent.New(ctx, b, "runner", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate.ServeRunner(run, func(ctx context.Context, gateID string, versions map[string]string) gate.Verdict {
+		return gate.Verdict{GateID: gateID, Passed: true}
+	})
+	go run.Run(ctx)
+
+	// An observer on the gate topic sees the broadcast.
+	obs, err := agent.New(ctx, b, "observer", []string{gate.Topic("g")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(chan protocol.Message, 4)
+	obs.On(protocol.IntentInform, func(_ context.Context, _ *agent.Agent, m protocol.Message) *protocol.Message {
+		select {
+		case seen <- m:
+		default:
+		}
+		return nil
+	})
+	go obs.Run(ctx)
+
+	participant, err := agent.New(ctx, b, "billing", []string{gate.Topic("g")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go participant.Run(ctx)
+	if err := gate.Ready(ctx, participant, "g", "abc123"); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case m := <-seen:
+		vs, ok := m.Body["versions"]
+		if !ok {
+			t.Fatalf("broadcast has no versions: %+v", m.Body)
+		}
+		got := map[string]string{}
+		switch typed := vs.(type) {
+		case map[string]string:
+			got = typed
+		case map[string]any:
+			for k, raw := range typed {
+				if s, ok := raw.(string); ok {
+					got[k] = s
+				}
+			}
+		}
+		if got["billing"] != "abc123" {
+			t.Fatalf("versions = %+v, want billing=abc123", got)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("no verdict broadcast observed")
+	}
+}
