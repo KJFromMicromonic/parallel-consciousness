@@ -97,7 +97,21 @@ func clip(s string, full bool) string {
 // gateID filters to one gate when non-empty; a message belongs to a gate if
 // it rides that gate's topic or names it in its body.
 func Watch(ctx context.Context, cfg Config, gateID string, full, follow bool, out io.Writer) error {
-	b, err := sqlite.Open(ctx, cfg.DB, sqlite.WithPollInterval(250*time.Millisecond))
+	// Tail's output channel closes for three separate reasons: ctx ending, the
+	// bus closing, or a mid-stream History error inside its poll loop — and
+	// only the first two leave anything in ctx.Err(). The third reaches the
+	// caller only through this hook, so it is captured here and checked after
+	// the follow loop, ahead of ctx.Err(): otherwise a live database failure
+	// closes the channel exactly like a clean stop, and Watch would report
+	// success for a feed that silently died. Reading tailErr after the range
+	// over ch ends is race-free — Tail's goroutine writes it (if at all)
+	// strictly before closing the channel via its deferred close(out), and a
+	// channel close is a happens-before edge for every receive that observes it.
+	var tailErr error
+	b, err := sqlite.Open(ctx, cfg.DB,
+		sqlite.WithPollInterval(250*time.Millisecond),
+		sqlite.WithErrorHook(func(err error) { tailErr = err }),
+	)
 	if err != nil {
 		return fmt.Errorf("open bus: %w", err)
 	}
@@ -114,7 +128,7 @@ func Watch(ctx context.Context, cfg Config, gateID string, full, follow bool, ou
 	if !follow {
 		recs, err := b.History(ctx, 0)
 		if err != nil {
-			return err
+			return fmt.Errorf("history: %w", err)
 		}
 		for _, r := range recs {
 			if err := write(r); err != nil {
@@ -126,12 +140,15 @@ func Watch(ctx context.Context, cfg Config, gateID string, full, follow bool, ou
 
 	ch, err := b.Tail(ctx, 0)
 	if err != nil {
-		return err
+		return fmt.Errorf("tail: %w", err)
 	}
 	for r := range ch {
 		if err := write(r); err != nil {
 			return err
 		}
+	}
+	if tailErr != nil {
+		return fmt.Errorf("watch: %w", tailErr)
 	}
 	return ctx.Err()
 }

@@ -195,6 +195,38 @@ func TestBranchesFromConfigPreservesConfigOrder(t *testing.T) {
 	}
 }
 
+// watch needs the same gate definition as up and run-gate, for the same
+// reason: a feed without one cannot filter, and a bare database does not say
+// which gates exist.
+func TestWatchRequiresConfig(t *testing.T) {
+	_, err := resolveWatchConfig("")
+	if err == nil {
+		t.Fatal("resolveWatchConfig(\"\") = nil error, want one naming --config")
+	}
+	if !strings.Contains(err.Error(), "--config") {
+		t.Errorf("error %q does not name the missing --config flag", err.Error())
+	}
+
+	if got := cmdWatch(context.Background(), nil); got != 2 {
+		t.Errorf("cmdWatch with no --config = %d, want 2", got)
+	}
+}
+
+// A cancelled context blocking inside --follow is a clean Ctrl-C — main wires
+// ctx to SIGINT/SIGTERM — and cmdWatch must exit 0, not report it as a
+// failure. This is the CLI-boundary regression test for that mapping.
+func TestCmdWatchExitsCleanlyOnCancelledContext(t *testing.T) {
+	t.Setenv("PC_DB", filepath.Join(t.TempDir(), "bus.db"))
+	path := writeScenario(t, sampleScenario)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if got := cmdWatch(ctx, []string{"--config", path}); got != 0 {
+		t.Errorf("cmdWatch with an already-cancelled context = %d, want 0 (a clean stop, not a failure)", got)
+	}
+}
+
 // The usage string is the operator's map of what pc can do; advertising a
 // command that does not exist (or omitting one that does) was already flagged
 // once in review, so pin the full, accurate list down with a test.

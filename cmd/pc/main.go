@@ -265,11 +265,7 @@ func cmdWatch(ctx context.Context, args []string) int {
 	noFollow := fs.Bool("no-follow", false, "print recorded history and exit")
 	fs.Parse(args)
 
-	if *config == "" {
-		fmt.Fprintln(os.Stderr, "pc watch: --config is required")
-		return 2
-	}
-	cfg, err := pcops.LoadConfig(*config)
+	cfg, err := resolveWatchConfig(*config)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
@@ -278,12 +274,27 @@ func cmdWatch(ctx context.Context, args []string) int {
 	if id == "" {
 		id = cfg.GateID
 	}
+	// A signal-cancelled ctx blocking inside --follow is a clean Ctrl-C, not a
+	// failure: main wires ctx to SIGINT/SIGTERM, so context.Canceled here means
+	// the operator asked to stop, exactly like exitForDaemon treats it for the
+	// other long-running commands.
 	if err := pcops.Watch(ctx, cfg, id, *full, !*noFollow, os.Stdout); err != nil &&
 		!errors.Is(err, context.Canceled) {
 		fmt.Fprintf(os.Stderr, "pc watch: %v\n", err)
 		return 2
 	}
 	return 0
+}
+
+// resolveWatchConfig is watch's sibling of resolveUpConfig and
+// resolveRunGateConfig: a feed without a gate definition cannot filter, and a
+// coordinator's database alone does not say which gates exist, so --config is
+// required here for the same reason.
+func resolveWatchConfig(path string) (pcops.Config, error) {
+	if path == "" {
+		return pcops.Config{}, fmt.Errorf("pc watch: --config is required (no gate definition without one)")
+	}
+	return pcops.LoadConfig(path)
 }
 
 // exitForDaemon maps a daemon's terminal error to an exit code. Up and
