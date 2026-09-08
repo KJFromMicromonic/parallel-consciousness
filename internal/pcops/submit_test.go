@@ -355,6 +355,48 @@ func TestSubmitIgnoresAVerdictFromAPreviousRound(t *testing.T) {
 	}
 }
 
+// A Nack proves a coordinator exists just as well as an Ack does. If Submit
+// treated it as silence it would report ErrNotAcknowledged and undo F4.
+func TestSubmitTreatsANackAsAcknowledgement(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+
+	db := filepath.Join(t.TempDir(), "bus.db")
+	cfg := pcops.Config{
+		DB:            db,
+		GateID:        "g",
+		Gate:          pcops.GateDef{Required: []string{"billing"}, Runner: "runner"},
+		SubmitTimeout: 30 * time.Second,
+	}
+	cstop, err := pcops.StartCoordinator(ctx, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cstop()
+
+	b, err := sqlite.Open(ctx, db, sqlite.WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	run, err := agent.New(ctx, b, "runner", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate.ServeRunner(run, func(ctx context.Context, gateID string, versions map[string]string) gate.Verdict {
+		return gate.Verdict{GateID: gateID, Passed: true, Versions: versions}
+	})
+	go run.Run(ctx)
+
+	v, err := pcops.Submit(ctx, cfg, "g", "billing", "v1")
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	if !v.Passed {
+		t.Fatalf("verdict = %+v", v)
+	}
+}
+
 // The defect: pkg/gate drops a readiness that lands while a round is already
 // in flight, but Submit would still accept that round's verdict — one computed
 // without its version. The runner is gated so the ordering is deterministic:

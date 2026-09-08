@@ -287,6 +287,29 @@ func (c *Coordinator) onReady(ctx context.Context, _ *agent.Agent, m protocol.Me
 			"outstanding": outstanding,
 		})
 		reply = &ack
+	} else if required {
+		// The readiness was dropped because a round is already in flight.
+		// Saying so turns an indistinguishable silence into a signal: a
+		// blocked `pc submit` can otherwise not tell "the gate has not run
+		// yet" from "no coordinator is running" from "a required peer is
+		// never coming".
+		//
+		// This deliberately does NOT carry outstandingFor(gs). open leaves
+		// gs.ready intact for the whole round (only resolve clears it), so on
+		// this path outstandingFor always returns an empty slice — which reads
+		// as "waiting on nobody", the opposite of what is happening. What is
+		// actually useful is the version set the in-flight round is testing
+		// instead of this submitter's.
+		//
+		// IntentNack for the same reason as the IntentAck above: the courier
+		// registers no handler for it, so it reaches pcops.Submit's own
+		// subscription and never gets forwarded into a live agent session.
+		// Do not add a courier handler for it.
+		nack := m.Reply(protocol.Address{Agent: c.a.Name}, protocol.IntentNack, map[string]any{
+			"gate":    gateID,
+			"testing": copyMap(gs.ready),
+		})
+		reply = &nack
 	}
 	gs.mu.Unlock()
 	if full {

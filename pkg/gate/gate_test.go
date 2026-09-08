@@ -910,6 +910,82 @@ func TestOnReadyDoesNotAckACachedResubmit(t *testing.T) {
 	}
 }
 
+// A readiness that arrives while a round is in flight is dropped. Silence
+// there is indistinguishable from "no coordinator" and from "a peer is never
+// coming" — all three looked identical in a live run.
+func TestReadinessDroppedMidRoundIsNacked(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	b := bus.NewInMemory(64)
+	coord, err := agent.New(ctx, b, "coordinator", []string{gate.Topic("g")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := gate.NewCoordinator(coord)
+	c.SetRunnerTimeout(10 * time.Second) // hold the round in flight
+	c.Register(gate.Spec{ID: "g", Required: []string{"billing", "gateway"}, Runner: "runner"})
+	go coord.Run(ctx)
+
+	// No runner is registered, so once quorum forms the round stays in flight.
+	first, err := agent.New(ctx, b, "billing", []string{gate.Topic("g")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go first.Run(ctx)
+	second, err := agent.New(ctx, b, "gateway", []string{gate.Topic("g")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nacks := make(chan protocol.Message, 2)
+	second.On(protocol.IntentNack, func(_ context.Context, _ *agent.Agent, m protocol.Message) *protocol.Message {
+		select {
+		case nacks <- m:
+		default:
+		}
+		return nil
+	})
+	go second.Run(ctx)
+
+	if err := gate.Ready(ctx, first, "g", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.Ready(ctx, second, "g", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	// Quorum has formed and the round is in flight; a further readiness from
+	// gateway must now be nacked rather than silently dropped.
+	if err := gate.Ready(ctx, second, "g", "v2"); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case m := <-nacks:
+		if id, _ := m.Body["gate"].(string); id != "g" {
+			t.Fatalf("nack body = %+v, want gate g", m.Body)
+		}
+		// The nack must say what the in-flight round is testing; an empty
+		// or absent set would leave the submitter as blind as the silence
+		// this replaced.
+		testing := map[string]string{}
+		switch typed := m.Body["testing"].(type) {
+		case map[string]string:
+			testing = typed
+		case map[string]any:
+			for k, raw := range typed {
+				if s, ok := raw.(string); ok {
+					testing[k] = s
+				}
+			}
+		}
+		if testing["billing"] != "v1" || testing["gateway"] != "v1" {
+			t.Fatalf("nack testing = %+v, want billing=v1 gateway=v1", testing)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("readiness dropped mid-round produced no Nack")
+	}
+}
+
 // A verdict must say what it tested. Without this, a participant cannot tell
 // whether a broadcast verdict covered its own version — which is what lets a
 // dropped readiness silently accept someone else's round.
