@@ -90,6 +90,15 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 		if m.Timestamp.Before(readyAt) {
 			return nil // a previous round's verdict, replayed from the cursor
 		}
+		// A gate id and a passed bool do not identify a round. Accept a verdict
+		// only when it says it tested THIS agent at exactly the version submitted.
+		// pkg/gate drops a readiness that arrives while a round is already in
+		// flight, so without this guard an agent would accept the in-flight
+		// round's verdict — computed entirely without its version.
+		versions := versionsFromBody(m.Body["versions"])
+		if versions[agentName] != version {
+			return nil
+		}
 		// The broadcast carries one "text" line for both outcomes ("<gate>
 		// PASSED" / "<gate> FAILED: <detail>"); Detail is documented as
 		// empty on pass, so only surface it on failure.
@@ -98,7 +107,7 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 			detail, _ = m.Body["text"].(string)
 		}
 		select {
-		case verdicts <- gate.Verdict{GateID: gateID, Passed: passed, Detail: detail}:
+		case verdicts <- gate.Verdict{GateID: gateID, Passed: passed, Detail: detail, Versions: versions}:
 		default:
 		}
 		return nil

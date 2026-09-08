@@ -354,3 +354,109 @@ func TestSubmitIgnoresAVerdictFromAPreviousRound(t *testing.T) {
 		t.Fatalf("verdict.Detail = %q, want this round's failure detail", v.Detail)
 	}
 }
+
+// The defect: pkg/gate drops a readiness that lands while a round is already
+// in flight, but Submit would still accept that round's verdict — one computed
+// without its version. The runner is gated so the ordering is deterministic:
+// the stale verdict is the ONLY verdict on the log at the moment Submit could
+// wrongly accept it, and the genuine one cannot arrive until we release it.
+func TestSubmitDeclinesAVerdictThatDidNotIncludeIt(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	db := filepath.Join(t.TempDir(), "bus.db")
+	cfg := pcops.Config{
+		DB:            db,
+		GateID:        "g",
+		Gate:          pcops.GateDef{Required: []string{"billing"}, Runner: "runner"},
+		SubmitTimeout: 45 * time.Second,
+	}
+	cstop, err := pcops.StartCoordinator(ctx, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cstop()
+
+	b, err := sqlite.Open(ctx, db, sqlite.WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+
+	run, err := agent.New(ctx, b, "runner", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Entering the runner proves three things at once: readiness was declared,
+	// the round is in flight, and it is in flight AT MY-VERSION. It is also
+	// strictly after Submit set readyAt, so anything published from here on
+	// clears the timestamp fence and reaches the version guard under test.
+	entered := make(chan map[string]string, 1)
+	release := make(chan struct{})
+	gate.ServeRunner(run, func(ctx context.Context, gateID string, versions map[string]string) gate.Verdict {
+		select {
+		case entered <- versions:
+		default:
+		}
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return gate.Verdict{GateID: gateID, Passed: true, Versions: versions}
+	})
+	go run.Run(ctx)
+
+	type result struct {
+		v   gate.Verdict
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		v, err := pcops.Submit(ctx, cfg, "g", "billing", "MY-VERSION")
+		done <- result{v, err}
+	}()
+
+	select {
+	case vs := <-entered:
+		if vs["billing"] != "MY-VERSION" {
+			t.Fatalf("runner entered with versions %+v, want billing=MY-VERSION", vs)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("runner was never invoked, so the round never started")
+	}
+
+	// A verdict for a DIFFERENT version of billing, published exactly as the
+	// coordinator publishes one.
+	stale := protocol.New(protocol.Address{Agent: "coordinator"},
+		protocol.Address{Topic: gate.Topic("g")}, protocol.IntentInform,
+		map[string]any{"gate": "g", "passed": true, "text": "g PASSED",
+			"versions": map[string]any{"billing": "SOMEONE-ELSES-VERSION"}})
+	if err := b.Publish(ctx, stale); err != nil {
+		t.Fatal(err)
+	}
+
+	// THE ASSERTION THAT CATCHES THE DEFECT. The stale verdict is the only
+	// verdict available; a Submit without the version guard accepts it and
+	// returns here. With the guard it must keep waiting.
+	select {
+	case r := <-done:
+		t.Fatalf("Submit returned %+v (err %v) on a verdict that tested %q, not MY-VERSION",
+			r.v, r.err, "SOMEONE-ELSES-VERSION")
+	case <-time.After(3 * time.Second):
+		// Still waiting, correctly.
+	}
+
+	close(release) // let the round that actually included billing finish
+
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("Submit: %v", r.err)
+		}
+		if r.v.Versions["billing"] != "MY-VERSION" {
+			t.Fatalf("Submit returned a verdict over %+v, want billing=MY-VERSION", r.v.Versions)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Submit never returned after the genuine verdict was broadcast")
+	}
+}
