@@ -75,6 +75,21 @@ func TestFormatRecord(t *testing.T) {
 			want: []string{"inform", "currency FAILED: boom"},
 		},
 		{
+			// FIX 5: gate.go's resolve stamps the verdict broadcast's body
+			// with the version set it tested; nothing connected that to the
+			// viewer until now, even though the spec justified building
+			// Watch first specifically to make the versions change easy to
+			// verify. Rendered with describeVersions, same as a Nack's
+			// "testing" set below, so an inform and the round that produced
+			// it read identically.
+			name: "inform also renders the versions the verdict tested",
+			in: rec("coordinator", "", "gate.currency", protocol.IntentInform, map[string]any{
+				"gate": "currency", "passed": true, "text": "currency PASSED",
+				"versions": map[string]any{"billing": "acef4043778b966dc1cae9819e282d65f6b95e22"},
+			}),
+			want: []string{"inform", "currency PASSED", "billing@acef4043"},
+		},
+		{
 			name: "block shows the routed detail",
 			in:   rec("coordinator", "billing", "", protocol.IntentBlock, map[string]any{"gate": "currency", "text": "currency gate failing: boom"}),
 			want: []string{"billing", "block", "currency gate failing"},
@@ -168,6 +183,14 @@ func TestWatchRendersACompletedRound(t *testing.T) {
 		t.Fatalf("Watch: %v", err)
 	}
 	got := buf.String()
+	// FIX 8: these must appear IN ORDER — a Watch that emitted records in
+	// reverse seq order would still pass a set of independent
+	// strings.Contains checks over the whole buffer, which is what this test
+	// used to do. Searching each substring starting only from where the
+	// previous one was found pins the sequence a completed round actually
+	// produces: readiness, the runner's request, its disagreement, the
+	// failing verdict, and the routed block.
+	pos := 0
 	for _, want := range []string{
 		"billing", "ready", "v=v1",
 		"runner", "request",
@@ -175,9 +198,11 @@ func TestWatchRendersACompletedRound(t *testing.T) {
 		"inform", "g FAILED",
 		"block",
 	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("watch output missing %q\n--- got ---\n%s", want, got)
+		i := strings.Index(got[pos:], want)
+		if i == -1 {
+			t.Fatalf("watch output missing %q at or after position %d, in order\n--- got ---\n%s", want, pos, got)
 		}
+		pos += i + len(want)
 	}
 }
 

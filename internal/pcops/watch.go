@@ -20,9 +20,14 @@ const maxSummary = 120
 
 // abbrevVersion shortens a git SHA to the conventional short form. Versions
 // are opaque strings by contract, so a shorter one is returned unchanged.
+//
+// Rune-aware, not byte-aware: an opaque version string is not guaranteed
+// ASCII, and slicing bytes can split a multi-byte UTF-8 sequence and emit a
+// replacement character in the truncated result.
 func abbrevVersion(v string) string {
-	if len(v) > 8 {
-		return v[:8]
+	r := []rune(v)
+	if len(r) > 8 {
+		return string(r[:8])
 	}
 	return v
 }
@@ -79,6 +84,25 @@ func summarise(m protocol.Message, full bool) string {
 		if testing := versionsFromBody(m.Body["testing"]); len(testing) > 0 {
 			return "mid-round, testing " + describeVersions(testing)
 		}
+	case protocol.IntentInform:
+		// The verdict broadcast: gate.go's resolve stamps "versions" with the
+		// set the round actually tested. Tasks 1-3 built this viewer and Task
+		// 4 added Versions to the wire shape, but nothing connected the two —
+		// the spec justified building Watch FIRST on the grounds that the
+		// verdict-versions change would be far easier to verify once you
+		// could see what a verdict carries, so leaving it unrendered defeated
+		// that. describeVersions is the exact same rendering pcops.Submit's
+		// own stderr uses for a Nack's "testing" set, so an inform and the
+		// round that produced it read identically.
+		if vs := versionsFromBody(m.Body["versions"]); len(vs) > 0 {
+			text, _ := m.Body["text"].(string)
+			summary := clip(text, full)
+			tail := "(" + describeVersions(vs) + ")"
+			if summary == "" {
+				return tail
+			}
+			return summary + " " + tail
+		}
 	}
 	// Everything else: whichever human-readable field is present.
 	for _, k := range []string{"text", "detail"} {
@@ -89,12 +113,20 @@ func summarise(m protocol.Message, full bool) string {
 	return ""
 }
 
+// clip is rune-aware, not byte-aware, for the same reason as abbrevVersion:
+// it is applied to arbitrary runner detail (real Go test output routinely
+// contains non-ASCII), and slicing bytes at maxSummary can split a multi-byte
+// sequence mid-character.
 func clip(s string, full bool) string {
 	s = strings.ReplaceAll(strings.TrimSpace(s), "\n", " ")
-	if full || len(s) <= maxSummary {
+	if full {
 		return s
 	}
-	return s[:maxSummary] + "…"
+	r := []rune(s)
+	if len(r) <= maxSummary {
+		return s
+	}
+	return string(r[:maxSummary]) + "…"
 }
 
 // Watch renders the gate's activity feed to out: everything already recorded,
