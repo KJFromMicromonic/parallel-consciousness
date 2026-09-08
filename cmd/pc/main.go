@@ -6,6 +6,12 @@
 //	0  the gate passed
 //	1  the gate failed or stalled — the spanning test ran and did not pass
 //	2  no verdict — config, identity, connection error, or timeout
+//
+// pcops.Run's own sentinel errors (ErrSessionDied, ErrLeaseLost) have no exit
+// code here at all: nothing in this package dispatches Run, so they never
+// reach a CLI boundary to map. Documented so a reader comparing the sentinel
+// list above against Run's doesn't go looking for a mapping that does not
+// exist.
 package main
 
 import (
@@ -260,7 +266,8 @@ func branchesFromConfig(cfg pcops.Config) ([]string, error) {
 func cmdWatch(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("watch", flag.ExitOnError)
 	config := fs.String("config", "", "scenario file (required)")
-	gateID := fs.String("gate", "", "only show this gate (default: everything)")
+	gateID := fs.String("gate", "", "which gate to show (default: the scenario's gate.id; use --all to see everything)")
+	all := fs.Bool("all", false, "show every gate and all peer traffic, not just the scenario's gate")
 	full := fs.Bool("full", false, "do not truncate long details")
 	noFollow := fs.Bool("no-follow", false, "print recorded history and exit")
 	fs.Parse(args)
@@ -270,9 +277,16 @@ func cmdWatch(ctx context.Context, args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
+	// --gate "" is deliberately not magic: it re-defaults to cfg.GateID just
+	// like omitting the flag, so the only way to reach the unfiltered path
+	// (matchesGate short-circuiting on an empty gate id) is the explicit
+	// --all flag. An empty string is not discoverable the way a flag is.
 	id := *gateID
 	if id == "" {
 		id = cfg.GateID
+	}
+	if *all {
+		id = ""
 	}
 	// A signal-cancelled ctx blocking inside --follow is a clean Ctrl-C, not a
 	// failure: main wires ctx to SIGINT/SIGTERM, so context.Canceled here means

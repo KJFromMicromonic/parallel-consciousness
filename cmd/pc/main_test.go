@@ -1,16 +1,21 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/KJFromMicromonic/parallel-consciousness/internal/pcops"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/bus/sqlite"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/protocol"
 )
 
 // pcops.Run injects PC_SUBMIT_TIMEOUT into every session it spawns. Ignoring it
@@ -229,6 +234,121 @@ func TestCmdWatchExitsCleanlyOnCancelledContext(t *testing.T) {
 
 	if got := cmdWatch(ctx, []string{"--config", path}); got != 0 {
 		t.Errorf("cmdWatch with an already-cancelled context = %d, want 0 (a clean stop, not a failure)", got)
+	}
+}
+
+// notifyingWriter is a thread-safe io.Writer that closes notify on its first
+// write, used below to detect that cmdWatch's follow loop has actually
+// produced output before the test cancels it — rather than guessing at how
+// long that takes with a fixed delay.
+type notifyingWriter struct {
+	mu     sync.Mutex
+	buf    bytes.Buffer
+	notify chan struct{}
+	once   sync.Once
+}
+
+func newNotifyingWriter() *notifyingWriter {
+	return &notifyingWriter{notify: make(chan struct{})}
+}
+
+func (w *notifyingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n, err := w.buf.Write(p)
+	w.once.Do(func() { close(w.notify) })
+	return n, err
+}
+
+func (w *notifyingWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
+// FIX 1's CLI half: the DEFAULT invocation — no --gate, no --all — is the one
+// an operator actually types (`pc watch --config scenario.yaml`), and it was
+// exactly the invocation that silently dropped every peer pc send message,
+// because cmdWatch used to default --gate to cfg.GateID with no way back to
+// the unfiltered path. A direct, gate-less peer message must render under
+// this default, unaided by any flag.
+func TestCmdWatchDefaultInvocationRendersPeerTraffic(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "bus.db")
+	scenario := fmt.Sprintf(`
+db: %s
+gate:
+  id: checkout
+  required: [billing, gateway]
+  runner: integrator
+  run: go test ./...
+agents:
+  - name: billing
+    branch: agent/billing
+  - name: gateway
+    branch: agent/gateway
+runner:
+  name: integrator
+  branch: agent/integration
+`, dbPath)
+	path := writeScenario(t, scenario)
+
+	ctx := context.Background()
+	b, err := sqlite.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := protocol.New(protocol.Address{Agent: "billing"}, protocol.Address{Agent: "gateway"},
+		protocol.IntentInform, map[string]any{"text": "PEER MESSAGE FROM A SHELL"})
+	if err := b.Publish(ctx, peer); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	out := newNotifyingWriter()
+	orig := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	copyDone := make(chan struct{})
+	go func() {
+		io.Copy(out, r)
+		close(copyDone)
+	}()
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	exitCode := make(chan int, 1)
+	go func() {
+		// No --gate, no --all: the default invocation under test.
+		exitCode <- cmdWatch(runCtx, []string{"--config", path})
+	}()
+
+	select {
+	case <-out.notify:
+		// cmdWatch has rendered its first line; safe to stop it now.
+	case <-time.After(10 * time.Second):
+		cancel()
+		t.Fatal("timed out waiting for cmdWatch to produce output before cancelling")
+	}
+	cancel()
+
+	select {
+	case <-exitCode:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for cmdWatch to return after cancellation")
+	}
+
+	os.Stdout = orig
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	<-copyDone
+
+	if got := out.String(); !strings.Contains(got, "PEER MESSAGE FROM A SHELL") {
+		t.Errorf("pc watch's default invocation did not render peer traffic:\n%s", got)
 	}
 }
 

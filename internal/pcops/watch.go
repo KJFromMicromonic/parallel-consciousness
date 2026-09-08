@@ -172,8 +172,19 @@ func matchesGate(r sqlite.Record, gateID string) bool {
 	if r.Msg.To.Topic == gate.Topic(gateID) {
 		return true
 	}
-	id, _ := r.Msg.Body["gate"].(string)
-	return id == gateID
+	if id, ok := r.Msg.Body["gate"].(string); ok {
+		return id == gateID
+	}
+	// No "gate" key in the body at all: pcops.Send's DIRECT peer traffic
+	// (pc send) carries no gate field and rides no topic, so there is
+	// nothing here to compare against gateID. Dropping it unconditionally —
+	// the shipped behaviour — re-creates precisely the blindness
+	// pkg/bus/sqlite.History exists to avoid: peer agent-to-agent messages
+	// are exactly what Subscribe's recipient filter hides and what this
+	// command exists to surface. Admit it only when it is actually a direct
+	// agent-to-agent message (not an untagged topic broadcast for some other
+	// gate, which must still be dropped).
+	return r.Msg.To.Topic == "" && r.Msg.To.Agent != ""
 }
 
 // versionsFromBody decodes a participant→version map that has crossed the

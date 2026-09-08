@@ -209,6 +209,41 @@ func TestWatchFiltersByGate(t *testing.T) {
 	}
 }
 
+// A peer pcops.Send message is DIRECT (no topic) and its body is only
+// {"text": ...} — no "gate" key at all, unlike every routed gate message,
+// which always carries one. FIX 1: matchesGate must admit that shape when
+// watching a specific gate (this is the live-fire "peer pc send" traffic
+// History exists to surface), while a same-shaped direct message that DOES
+// carry a foreign gate id in its body must still be dropped, exactly like
+// TestWatchFiltersByGate's topic-message case above.
+func TestWatchAdmitsGatelessPeerTrafficButStillFiltersTaggedForeignTraffic(t *testing.T) {
+	ctx := context.Background()
+	db := filepath.Join(t.TempDir(), "bus.db")
+	b, err := sqlite.Open(ctx, db, sqlite.WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+
+	peer := protocol.New(protocol.Address{Agent: "billing"}, protocol.Address{Agent: "gateway"},
+		protocol.IntentInform, map[string]any{"text": "PEER-KEEP"})
+	foreign := protocol.New(protocol.Address{Agent: "billing"}, protocol.Address{Agent: "gateway"},
+		protocol.IntentInform, map[string]any{"gate": "other", "text": "PEER-DROP"})
+	for _, m := range []protocol.Message{peer, foreign} {
+		if err := b.Publish(ctx, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := pcops.Watch(ctx, pcops.Config{DB: db}, "mine", false, false, &buf); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.String(); !strings.Contains(got, "PEER-KEEP") || strings.Contains(got, "PEER-DROP") {
+		t.Fatalf("peer traffic filter wrong:\n%s", got)
+	}
+}
+
 // A clean Ctrl-C while --follow is blocked inside Tail must surface as
 // context.Canceled specifically — not merely as some non-nil error, which a
 // mid-tail database failure would also produce. This is what actually drives
