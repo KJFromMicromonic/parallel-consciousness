@@ -78,9 +78,15 @@ func (b *Bus) Tail(ctx context.Context, fromSeq int64) (<-chan Record, error) {
 		for {
 			recs, err := b.History(ctx, cursor)
 			if err != nil {
-				if ctx.Err() == nil {
-					b.onErr(fmt.Errorf("tail: %w", err))
+				if ctx.Err() != nil {
+					return
 				}
+				select {
+				case <-b.closed:
+					return
+				default:
+				}
+				b.onErr(fmt.Errorf("tail: %w", err))
 				return
 			}
 			for _, r := range recs {

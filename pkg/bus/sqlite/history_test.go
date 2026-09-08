@@ -3,6 +3,7 @@ package sqlite_test
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -118,5 +119,59 @@ func recvRecord(t *testing.T, ch <-chan sqlite.Record) sqlite.Record {
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for a record")
 		return sqlite.Record{}
+	}
+}
+
+// TestTailClosedBusDoesNotReport verifies that when Bus.Close() is called
+// while Tail is running with an independent context, no error is reported.
+// Bus.Close() closes b.closed before closing the underlying database, so
+// the in-flight History query may fail. This must not trigger onErr, because
+// the failure is from an intentional shutdown, not a genuine error.
+func TestTailClosedBusDoesNotReport(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Capture errors via the error hook
+	var mu sync.Mutex
+	var errs []error
+	b, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "bus.db"),
+		sqlite.WithPollInterval(5*time.Millisecond),
+		sqlite.WithErrorHook(func(err error) {
+			mu.Lock()
+			defer mu.Unlock()
+			errs = append(errs, err)
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Start Tail with a context we do NOT cancel
+	tailCtx, tailCancel := context.WithCancel(context.Background())
+	defer tailCancel()
+
+	ch, err := b.Tail(tailCtx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Close the bus while Tail is running
+	b.Close()
+
+	// Tail channel should close without error
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatal("channel should be closed after Close()")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("tail channel did not close after Close()")
+	}
+
+	// Check that no errors were reported through onErr
+	mu.Lock()
+	defer mu.Unlock()
+	if len(errs) > 0 {
+		t.Fatalf("expected no errors from onErr, got %d: %v", len(errs), errs)
 	}
 }
