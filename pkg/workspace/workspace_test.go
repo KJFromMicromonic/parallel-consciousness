@@ -151,3 +151,44 @@ func TestReclaimFencesTheOriginalHolder(t *testing.T) {
 		t.Fatalf("new holder's Heartbeat = %v, want nil", err)
 	}
 }
+
+// Exclusivity is decided by a single conditional UPSERT rather than a
+// read-then-write in Go, which is what makes it safe under contention. That
+// has only ever been verified by reading the SQL; this exercises it.
+func TestConcurrentAcquireYieldsExactlyOneWinner(t *testing.T) {
+	ctx := context.Background()
+	repo := newRepo(t)
+	m := newManager(t, repo)
+
+	const contenders = 8
+	type result struct {
+		lease *Lease
+		err   error
+	}
+	results := make(chan result, contenders)
+	start := make(chan struct{})
+	for i := 0; i < contenders; i++ {
+		go func() {
+			<-start // release them together
+			l, err := m.Acquire(ctx, "billing", "agent/billing")
+			results <- result{l, err}
+		}()
+	}
+	close(start)
+
+	var winners int
+	for i := 0; i < contenders; i++ {
+		r := <-results
+		switch {
+		case r.err == nil:
+			winners++
+		case errors.Is(r.err, ErrLeased):
+			// expected for every loser
+		default:
+			t.Fatalf("unexpected error: %v", r.err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("%d winners, want exactly 1", winners)
+	}
+}
