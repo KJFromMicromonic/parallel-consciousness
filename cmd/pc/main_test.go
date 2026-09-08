@@ -198,8 +198,8 @@ func TestBranchesFromConfigPreservesConfigOrder(t *testing.T) {
 // The usage string is the operator's map of what pc can do; advertising a
 // command that does not exist (or omitting one that does) was already flagged
 // once in review, so pin the full, accurate list down with a test.
-func TestUsageListsAllFourCommands(t *testing.T) {
-	for _, cmd := range []string{"submit", "send", "up", "run-gate"} {
+func TestUsageListsAllFiveCommands(t *testing.T) {
+	for _, cmd := range []string{"submit", "send", "up", "run-gate", "watch"} {
 		if !strings.Contains(usage, cmd) {
 			t.Errorf("usage %q does not mention %q", usage, cmd)
 		}

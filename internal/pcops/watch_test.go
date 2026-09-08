@@ -1,12 +1,17 @@
 package pcops_test
 
 import (
+	"bytes"
+	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/KJFromMicromonic/parallel-consciousness/internal/pcops"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/agent"
 	"github.com/KJFromMicromonic/parallel-consciousness/pkg/bus/sqlite"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/gate"
 	"github.com/KJFromMicromonic/parallel-consciousness/pkg/protocol"
 )
 
@@ -70,5 +75,89 @@ func TestFormatRecordTruncatesUnlessFull(t *testing.T) {
 	}
 	if full := pcops.FormatRecord(r, true); !strings.Contains(full, long) {
 		t.Error("--full did not include the whole detail")
+	}
+}
+
+// Watch must render a real round: readiness, the runner request, the verdict
+// and the routed blocks — including the direct messages Subscribe would hide.
+func TestWatchRendersACompletedRound(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	db := filepath.Join(t.TempDir(), "bus.db")
+	cfg := pcops.Config{
+		DB:            db,
+		GateID:        "g",
+		Gate:          pcops.GateDef{Required: []string{"billing"}, Runner: "runner"},
+		SubmitTimeout: 20 * time.Second,
+	}
+
+	cstop, err := pcops.StartCoordinator(ctx, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cstop()
+
+	b, err := sqlite.Open(ctx, db, sqlite.WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	run, err := agent.New(ctx, b, "runner", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate.ServeRunner(run, func(ctx context.Context, gateID string, versions map[string]string) gate.Verdict {
+		return gate.Verdict{GateID: gateID, Passed: false, Detail: "spanning test failed"}
+	})
+	go run.Run(ctx)
+
+	if _, err := pcops.Submit(ctx, cfg, "g", "billing", "v1"); err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := pcops.Watch(ctx, cfg, "g", false, false, &buf); err != nil {
+		t.Fatalf("Watch: %v", err)
+	}
+	got := buf.String()
+	for _, want := range []string{
+		"billing", "ready", "v=v1",
+		"runner", "request",
+		"disagree",
+		"inform", "g FAILED",
+		"block",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("watch output missing %q\n--- got ---\n%s", want, got)
+		}
+	}
+}
+
+func TestWatchFiltersByGate(t *testing.T) {
+	ctx := context.Background()
+	db := filepath.Join(t.TempDir(), "bus.db")
+	b, err := sqlite.Open(ctx, db, sqlite.WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+
+	mine := protocol.New(protocol.Address{Agent: "a"}, protocol.Address{Topic: gate.Topic("mine")},
+		protocol.IntentInform, map[string]any{"gate": "mine", "text": "KEEP"})
+	other := protocol.New(protocol.Address{Agent: "a"}, protocol.Address{Topic: gate.Topic("other")},
+		protocol.IntentInform, map[string]any{"gate": "other", "text": "DROP"})
+	for _, m := range []protocol.Message{mine, other} {
+		if err := b.Publish(ctx, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := pcops.Watch(ctx, pcops.Config{DB: db}, "mine", false, false, &buf); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.String(); !strings.Contains(got, "KEEP") || strings.Contains(got, "DROP") {
+		t.Fatalf("gate filter wrong:\n%s", got)
 	}
 }

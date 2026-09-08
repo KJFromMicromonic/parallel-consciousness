@@ -1,11 +1,15 @@
 package pcops
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/KJFromMicromonic/parallel-consciousness/pkg/bus/sqlite"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/gate"
 	"github.com/KJFromMicromonic/parallel-consciousness/pkg/protocol"
 )
 
@@ -79,6 +83,68 @@ func clip(s string, full bool) string {
 		return s
 	}
 	return s[:maxSummary] + "…"
+}
+
+// Watch renders the gate's activity feed to out: everything already recorded,
+// then — when follow is set — everything that arrives afterwards.
+//
+// It reads the durable log directly rather than subscribing, for two reasons.
+// A new subscriber starts at the log's HEAD, so it would see no history at
+// all; and Subscribe filters to messages addressed to the subscriber, so an
+// observer would miss the routed failure blocks and agent-to-agent traffic
+// that are the most useful things to watch.
+//
+// gateID filters to one gate when non-empty; a message belongs to a gate if
+// it rides that gate's topic or names it in its body.
+func Watch(ctx context.Context, cfg Config, gateID string, full, follow bool, out io.Writer) error {
+	b, err := sqlite.Open(ctx, cfg.DB, sqlite.WithPollInterval(250*time.Millisecond))
+	if err != nil {
+		return fmt.Errorf("open bus: %w", err)
+	}
+	defer b.Close()
+
+	write := func(r sqlite.Record) error {
+		if !matchesGate(r, gateID) {
+			return nil
+		}
+		_, err := fmt.Fprintln(out, FormatRecord(r, full))
+		return err
+	}
+
+	if !follow {
+		recs, err := b.History(ctx, 0)
+		if err != nil {
+			return err
+		}
+		for _, r := range recs {
+			if err := write(r); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	ch, err := b.Tail(ctx, 0)
+	if err != nil {
+		return err
+	}
+	for r := range ch {
+		if err := write(r); err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
+}
+
+func matchesGate(r sqlite.Record, gateID string) bool {
+	if gateID == "" {
+		return true
+	}
+	if r.Msg.To.Topic == gate.Topic(gateID) {
+		return true
+	}
+	id, _ := r.Msg.Body["gate"].(string)
+	return id == gateID
 }
 
 // versionsFromBody decodes a participant→version map that has crossed the

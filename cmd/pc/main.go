@@ -27,7 +27,7 @@ import (
 // usage lists every subcommand main actually dispatches. An earlier review
 // flagged advertising a command that did not exist; keep this list exact in
 // both directions as commands are added.
-const usage = "usage: pc <submit|send|up|run-gate> [flags]"
+const usage = "usage: pc <submit|send|up|run-gate|watch> [flags]"
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -52,6 +52,8 @@ func run(ctx context.Context, args []string) int {
 		return cmdUp(ctx, args[1:])
 	case "run-gate":
 		return cmdRunGate(ctx, args[1:])
+	case "watch":
+		return cmdWatch(ctx, args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", args[0])
 		return 2
@@ -250,6 +252,38 @@ func branchesFromConfig(cfg pcops.Config) ([]string, error) {
 		branches = append(branches, a.Branch)
 	}
 	return branches, nil
+}
+
+// cmdWatch streams the gate's activity feed. --config is required for the
+// same reason as up and run-gate: a feed without a gate definition cannot
+// filter, and a coordinator's database alone does not say which gates exist.
+func cmdWatch(ctx context.Context, args []string) int {
+	fs := flag.NewFlagSet("watch", flag.ExitOnError)
+	config := fs.String("config", "", "scenario file (required)")
+	gateID := fs.String("gate", "", "only show this gate (default: everything)")
+	full := fs.Bool("full", false, "do not truncate long details")
+	noFollow := fs.Bool("no-follow", false, "print recorded history and exit")
+	fs.Parse(args)
+
+	if *config == "" {
+		fmt.Fprintln(os.Stderr, "pc watch: --config is required")
+		return 2
+	}
+	cfg, err := pcops.LoadConfig(*config)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	id := *gateID
+	if id == "" {
+		id = cfg.GateID
+	}
+	if err := pcops.Watch(ctx, cfg, id, *full, !*noFollow, os.Stdout); err != nil &&
+		!errors.Is(err, context.Canceled) {
+		fmt.Fprintf(os.Stderr, "pc watch: %v\n", err)
+		return 2
+	}
+	return 0
 }
 
 // exitForDaemon maps a daemon's terminal error to an exit code. Up and
