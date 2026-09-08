@@ -355,9 +355,17 @@ func TestSubmitIgnoresAVerdictFromAPreviousRound(t *testing.T) {
 	}
 }
 
-// A Nack proves a coordinator exists just as well as an Ack does. If Submit
-// treated it as silence it would report ErrNotAcknowledged and undo F4.
-func TestSubmitTreatsANackAsAcknowledgement(t *testing.T) {
+// A single required participant's readiness completes quorum on its first
+// Ready, so this exercises the acknowledged-then-verdict path end to end
+// through the retry loop: one attempt, an Ack, then the verdict.
+//
+// Named for what it does, deliberately. It was called
+// TestSubmitTreatsANackAsAcknowledgement, but with Required:["billing"] the
+// coordinator records the readiness and ACKS it — no Nack is ever produced,
+// so the name promised coverage the body never provided. The Nack path is
+// covered by TestSubmitRedeclaresAfterNackAndReturnsTheReDeclaredVerdict,
+// which asserts a real IntentNack reached the log before proceeding.
+func TestSubmitCompletesQuorumOnItsFirstAttempt(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
 
