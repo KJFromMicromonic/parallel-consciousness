@@ -123,24 +123,12 @@ const (
 )
 
 // queuedWork is one turn's worth of scripted actions, tagged with which queue
-// (if any) it came from, and — when it does come from Steer or Follow — the
-// exact Queue snapshot to report as that message's accept receipt.
-//
-// The receipt travels inside this same struct, over the same s.work channel
-// as the actions it accepts, rather than over a second channel. That is what
-// gives receipt-before-drain ordering for free: Go only guarantees FIFO
-// within one channel, not across two, so an earlier version that sent the
-// receipt over its own channel had that ordering only incidentally — it held
-// because loop() happened to already be parked in select when both sends
-// landed. Nothing enforced it against two back-to-back Steer/Follow calls
-// with no intervening idle, or scheduling pressure on a loaded box, either
-// of which could have delivered the drained {0,0} before the accepted
-// {Steering:1}. Folding the receipt in here removes that whole race surface
-// instead of papering over it.
+// (if any) it came from. The accept receipt for a Steer or Follow message is
+// NOT carried in here — see queue()'s doc comment for why it is emitted
+// directly by the caller instead of by loop() processing this struct.
 type queuedWork struct {
 	actions []Action
 	kind    workKind
-	accept  *runtime.Queue
 }
 
 type session struct {
@@ -179,6 +167,22 @@ type session struct {
 	endReason runtime.ExitReason
 	pending   runtime.Queue
 
+	// evMu serializes emit() against closeEvents(), the one place s.events is
+	// closed. emit() is no longer called only from loop(): queue() (called
+	// from whatever arbitrary goroutine invokes Steer or Follow) now emits
+	// the accept receipt itself, synchronously, rather than leaving that to
+	// loop() — see queue()'s doc comment for why. That makes s.events a
+	// channel with concurrent senders, and Go panics on a send to an already
+	// closed channel regardless of which select branch would otherwise have
+	// been chosen. evMu plus evClosed close that race: closeEvents holds the
+	// lock across setting evClosed and closing the channel, so any emit()
+	// already past its own closed-check either finishes its send under the
+	// lock before the close can proceed, or (checked after acquiring the
+	// lock) sees evClosed and safely no-ops instead of touching a channel
+	// that might already be gone.
+	evMu     sync.Mutex
+	evClosed bool
+
 	// transcript is the raw-frame record for Spec.TranscriptDir. Only loop()
 	// (a single goroutine) ever writes through it, so no lock is needed.
 	transcript *os.File
@@ -187,12 +191,12 @@ type session struct {
 }
 
 func (s *session) loop() {
-	// LIFO: closeTranscript runs first, then close(events), then
+	// LIFO: closeTranscript runs first, then closeEvents, then
 	// close(stopped) last — so a caller unblocked by stopped sees a fully
 	// wound-down session: transcript flushed and closed, events channel
 	// already closed too.
 	defer close(s.stopped)
-	defer close(s.events)
+	defer s.closeEvents()
 	defer s.closeTranscript()
 	s.emit(runtime.Event{Kind: runtime.KindStarted})
 	for {
@@ -202,9 +206,6 @@ func (s *session) loop() {
 			return
 		case qw := <-s.work:
 			s.emit(runtime.Event{Kind: runtime.KindTurnBegan})
-			if qw.accept != nil {
-				s.emit(runtime.Event{Kind: runtime.KindQueueChanged, Pending: qw.accept})
-			}
 		actions:
 			for _, a := range qw.actions {
 				select {
@@ -236,6 +237,16 @@ func (s *session) closeTranscript() {
 	if s.transcript != nil {
 		s.transcript.Close()
 	}
+}
+
+// closeEvents is the one place s.events is closed. See evMu's doc comment on
+// session for why closing it plainly (as loop() used to, when it was the
+// channel's only writer) would race a concurrent emit() from queue().
+func (s *session) closeEvents() {
+	s.evMu.Lock()
+	defer s.evMu.Unlock()
+	s.evClosed = true
+	close(s.events)
 }
 
 func (s *session) run(a Action) {
@@ -291,6 +302,11 @@ func (s *session) trace(kind, detail string, ok bool) {
 func (s *session) emit(ev runtime.Event) {
 	ev.At = time.Now()
 	ev.Agent = s.spec.Agent
+	s.evMu.Lock()
+	defer s.evMu.Unlock()
+	if s.evClosed {
+		return
+	}
 	select {
 	case s.events <- ev:
 	case <-s.done:
@@ -339,11 +355,28 @@ func pick(own, fallback func(string) []Action) func(string) []Action {
 
 // queue accepts a steer or follow message: it checks ctx first (an
 // already-cancelled ctx must return promptly regardless of whether a hook is
-// even set), then — mirroring the day-0 spike's queue_update, which fired
-// immediately on injection — bundles the accept receipt into the same
-// queuedWork value as the scripted actions, so loop() emits the receipt
-// before running them (see queuedWork's doc comment for why that ordering
-// needs to be structural rather than incidental).
+// even set), then emits the accept receipt itself — synchronously, on this
+// call's own goroutine — before ever handing the scripted actions to loop()
+// via s.work.
+//
+// That ordering is deliberate and structural, not incidental. The day-0
+// spike (Q3) measured a real adapter's queue_update firing immediately on
+// injection, regardless of what tool call was in flight at the time; loop()
+// only reaches the top of its select — and so only notices a newly queued
+// item at all — between turns, so an earlier version that instead bundled
+// the receipt into the queuedWork value and let loop() emit it on dequeue
+// silently reintroduced exactly the coupling Steer/Follow's contract
+// forbids: with a prior turn's action still running, that receipt would not
+// appear until that action finished, indistinguishable from Steer having
+// waited to be accepted rather than merely waited to be applied.
+//
+// Emitting here, before the s.work send, also gives receipt-before-drain
+// ordering for free without depending on scheduling: this goroutine's send
+// to s.events happens fully before its subsequent send to s.work, which in
+// turn happens before loop() can receive that item and eventually emit its
+// drain — so the receipt is guaranteed to reach s.events before that
+// message's own drain event, and before the completion of whatever turn was
+// already in flight.
 func (s *session) queue(ctx context.Context, hook func(string) []Action, text string, kind workKind) error {
 	select {
 	case <-ctx.Done():
@@ -355,14 +388,18 @@ func (s *session) queue(ctx context.Context, hook func(string) []Action, text st
 	}
 	actions := hook(text)
 	q := s.enqueue(kind)
+	s.emit(runtime.Event{Kind: runtime.KindQueueChanged, Pending: &q})
 	select {
-	case s.work <- queuedWork{actions: actions, kind: kind, accept: &q}:
+	case s.work <- queuedWork{actions: actions, kind: kind}:
 		return nil
 	case <-s.done:
-		// The counter was already incremented above, but nothing will ever
-		// dequeue and drain it now — the session is ending. That is harmless
-		// (no further receipt will ever be observed), but the caller must
-		// NOT be told "accepted": this message will never run.
+		// The counter was already incremented, and the receipt above already
+		// emitted, but nothing will ever dequeue and drain this message now —
+		// the session is ending. That stale receipt is harmless the same way
+		// the leaked counter increment is: no further receipt will ever be
+		// observed either way, and the caller must NOT be told "accepted" by
+		// this method's return value, which is what a caller actually acts
+		// on: this message will never run.
 		return fmt.Errorf("fake: queue message: %w", ErrSessionEnding)
 	case <-ctx.Done():
 		return fmt.Errorf("fake: queue message: %w", ctx.Err())

@@ -589,3 +589,11 @@ are held to it.
   failures requiring adapter updates.
 - The scenario file is hand-authored; nothing generates or validates loop shape
   yet.
+- A gate cannot be deliberately re-run on an unchanged version: a participant
+  that re-submits at the exact version a completed round already tested gets
+  that recorded verdict back immediately instead of a fresh run (see F2 in
+  `2026-09-02-live-fire-findings.md`). This is the right default — it turns a
+  redundant resubmit that could otherwise hang for the full submit timeout
+  into an instant answer — but it means retrying a flaky spanning test on an
+  unchanged commit is not currently possible. A forced re-run would need an
+  explicit opt-in, which is not implemented.

@@ -90,6 +90,49 @@ type gateState struct {
 	ready    map[string]string // participant -> version
 	inflight bool              // a run is awaiting the runner's verdict
 	gen      int               // bumped on each resolution; invalidates stale timers
+
+	// lastVerdict and lastStalled remember the most recently resolved round:
+	// who was tested at which version (Verdict.Versions), whether it passed,
+	// and whether that resolution came from a stalled runner. onReady
+	// consults this before recording a new readiness signal: a participant
+	// re-submitting at the identical version a completed round already
+	// covered is asking "is my version good?", and the honest, immediate
+	// answer is the recorded verdict — not silence until submit_timeout,
+	// which a quorum that can never re-form would otherwise guarantee.
+	//
+	// The remembered round is replayed through resolve (see onReady), the
+	// same path a freshly-computed verdict takes — not delivered by some
+	// separate, bespoke message. An earlier version of this mechanism sent a
+	// direct IntentInform straight to the resubmitting sender instead. That
+	// looked correct in isolation, but internal/pcops's courier forwards any
+	// non-block intent addressed to an agent into that agent's live session
+	// (the same path that carries peer `pc send` traffic) — so the "answer"
+	// was also delivered to the courier, which nudged the session, which
+	// resubmitted, which produced another cached answer, forwarded again,
+	// forever. Because that direct send bypassed resolve, the round-cap
+	// counter (driven by OnVerdict) never advanced either, so nothing bounded
+	// it: an unbounded busy loop, worse than the multi-minute hang it was
+	// meant to fix. Routing through resolve keeps every existing consumer of
+	// a round's outcome — the topic broadcast, the failure blocks, and the
+	// OnVerdict hook that round-caps a stuck participant — exactly as they
+	// are for a fresh round, so a repeat offender is still bounded.
+	//
+	// A second design mistake, also caught in a live run: the guard that
+	// decides whether the cache still applies must not compare only the
+	// asking participant's own version. An earlier version did exactly
+	// that, and one participant's fresh, passing resubmit was ignored
+	// because the OTHER, unchanged participant's resubmit was answered from
+	// a now-stale FAILED verdict — the cache never noticed the first
+	// participant had moved on, because nothing prompted it to look. See
+	// onReady for the sticky-invalidation fix and the exact sequence that
+	// exposed it.
+	//
+	// Known limitation: this means a gate cannot be deliberately re-run on an
+	// unchanged version — e.g. to retry a flaky spanning test — since the
+	// recorded verdict wins instead. That is the right default; a forced
+	// re-run would need an explicit opt-in, which is not implemented here.
+	lastVerdict *Verdict
+	lastStalled bool
 }
 
 // NewCoordinator wires gate handlers onto an agent.
@@ -153,15 +196,120 @@ func (c *Coordinator) onReady(ctx context.Context, _ *agent.Agent, m protocol.Me
 	}
 	gs.mu.Lock()
 	required := contains(gs.spec.Required, m.From.Agent)
-	if required && !gs.inflight {
+	// Not in flight, a verdict is remembered, and this required participant
+	// is exactly where the remembered round left it: resolve a synthetic
+	// round from the remembered verdict instead of recording new readiness.
+	// Exact string equality on purpose — any change since (even an
+	// uncommitted one that changed the version string) means this is a new
+	// state that has never been tested.
+	//
+	// A remembered verdict is only a valid answer to ANY participant when
+	// nothing relevant has changed since the round that produced it — not
+	// merely when the asking participant's own version is unchanged. A live
+	// run exposed the earlier, submitter-only comparison: participant A
+	// fixed its half and resubmitted a new version, then participant B
+	// resubmitted its own unchanged version and was wrongly answered with
+	// the pre-fix FAILED verdict from cache, because the guard never
+	// noticed A had already moved on. Since the cached path skips recording
+	// readiness, A's new version was then simply never picked up — the gate
+	// stayed stuck on a stale verdict until the participants worked around
+	// it out of band. See gateState's doc comment for the full account.
+	//
+	// The fix is sticky invalidation: the moment ANY required participant's
+	// version diverges from what the remembered round tested for it, the
+	// remembered verdict is discarded outright (not just skipped for that
+	// one sender), and stays discarded until the next genuine resolve
+	// stores a fresh one. That is simpler than comparing whole version sets
+	// on every submit, and it is what makes B's very next, unchanged
+	// resubmit fall through to ordinary readiness recording instead of a
+	// second stale answer.
+	if !gs.inflight && gs.lastVerdict != nil && required {
+		if tested, ok := gs.lastVerdict.Versions[m.From.Agent]; ok && tested == version {
+			cached := *gs.lastVerdict
+			stalled := gs.lastStalled
+			// Mirror what open does to gs.inflight before handing off to
+			// resolve: resolve requires it (its guard would otherwise
+			// silently no-op this synthetic round) and it also blocks any
+			// readiness recorded concurrently from folding into it.
+			gs.inflight = true
+			gs.mu.Unlock()
+			c.resolve(ctx, gs, cached, stalled, true)
+			// No IntentAck on this path, deliberately: the cache answers via
+			// resolve's own IntentInform broadcast without ever recording
+			// readiness, so there is nothing here for an ack to confirm. F4
+			// (see below) only concerns itself with recorded readiness;
+			// pcops.Submit treats a verdict's arrival as satisfying its ack
+			// wait too, precisely so a redundant identical resubmit answered
+			// from cache is never mistaken for an unacknowledged gate.
+			return nil
+		}
+		gs.lastVerdict = nil
+	}
+
+	// recorded is whether THIS call adds m.From.Agent to the round's
+	// readiness set — the same condition that used to gate the assignment
+	// below, now also gating the F4 acknowledgement so the two can never
+	// drift apart.
+	recorded := required && !gs.inflight
+	if recorded {
 		gs.ready[m.From.Agent] = version // dedup by participant; last write wins
 	}
-	full := required && !gs.inflight && len(gs.ready) == len(gs.spec.Required)
+	full := recorded && len(gs.ready) == len(gs.spec.Required)
+
+	var reply *protocol.Message
+	if recorded {
+		// F4: acknowledge every recorded readiness with who the gate is
+		// still waiting on. Without this, a blocked `pc submit` cannot tell
+		// "the gate hasn't run yet" from "no coordinator is running at all"
+		// from "a required peer is never coming" — all three looked
+		// identical (total silence) in a live run against real coding
+		// agents; see docs/superpowers/specs/2026-09-02-live-fire-findings.md,
+		// findings F4 and "F4 reinforced". outstandingFor reads gs.ready,
+		// which by construction already includes m.From.Agent, so a
+		// quorum-completing submit correctly gets back an empty list.
+		//
+		// IntentAck, not e.g. IntentInform or a direct reply, is the
+		// deliberate choice: internal/pcops's courier only registers
+		// handlers for IntentBlock and the six sendable intents (inform,
+		// request, propose, agree, disagree, done) — nothing forwards
+		// IntentAck into a live coding-agent session, so this reaches only
+		// pcops.Submit's own bus subscription. That matters because an
+		// earlier design in this project answered a cached verdict with a
+		// direct send instead of routing through resolve; the courier
+		// forwarded THAT straight into the agent's session, the agent
+		// reacted by resubmitting, and that produced an unbounded feedback
+		// loop (2,589 goroutines in 8 seconds — see gateState's doc comment
+		// above). Do not add a courier handler for IntentAck: that would
+		// reopen exactly that loop for this acknowledgement.
+		outstanding := outstandingFor(gs)
+		ack := m.Reply(protocol.Address{Agent: c.a.Name}, protocol.IntentAck, map[string]any{
+			"gate":        gateID,
+			"outstanding": outstanding,
+		})
+		reply = &ack
+	}
 	gs.mu.Unlock()
 	if full {
 		c.open(ctx, gs)
 	}
-	return nil // ready is terminal
+	// Returning reply (rather than nil, and rather than sending it here
+	// ourselves) lets the caller's normal dispatch mechanism publish it —
+	// ready itself stays terminal from the sender's point of view; this is
+	// just the coordinator choosing to speak up when it used to stay silent.
+	return reply
+}
+
+// outstandingFor lists the required participants that have not yet declared
+// readiness for gs's current round, in Spec.Required order. Callers must hold
+// gs.mu.
+func outstandingFor(gs *gateState) []string {
+	outstanding := make([]string, 0, len(gs.spec.Required))
+	for _, p := range gs.spec.Required {
+		if _, ok := gs.ready[p]; !ok {
+			outstanding = append(outstanding, p)
+		}
+	}
+	return outstanding
 }
 
 func (c *Coordinator) open(ctx context.Context, gs *gateState) {
@@ -190,7 +338,7 @@ func (c *Coordinator) open(ctx context.Context, gs *gateState) {
 		if stale {
 			return // this run already resolved; ignore
 		}
-		c.resolve(ctx, gs, Verdict{GateID: gateID, Passed: false, Detail: "runner unresponsive"}, true)
+		c.resolve(ctx, gs, Verdict{GateID: gateID, Passed: false, Detail: "runner unresponsive"}, true, false)
 	})
 }
 
@@ -201,11 +349,17 @@ func (c *Coordinator) onVerdictMsg(ctx context.Context, _ *agent.Agent, m protoc
 		return nil
 	}
 	detail, _ := m.Body["detail"].(string)
-	c.resolve(ctx, gs, Verdict{GateID: gateID, Passed: m.Intent == protocol.IntentDone, Detail: detail}, false)
+	c.resolve(ctx, gs, Verdict{GateID: gateID, Passed: m.Intent == protocol.IntentDone, Detail: detail}, false, false)
 	return nil
 }
 
-func (c *Coordinator) resolve(ctx context.Context, gs *gateState, v Verdict, stalled bool) {
+// resolve settles an in-flight round — real or, when fromCache is true,
+// synthetic — and is the single place that broadcasts a verdict, routes
+// failure blocks, remembers the round, and fires OnVerdict. Routing the
+// cached-answer path through here (see onReady) rather than around it is
+// what keeps a repeated identical resubmit visible to everything that
+// already watches a round's outcome, the round cap included.
+func (c *Coordinator) resolve(ctx context.Context, gs *gateState, v Verdict, stalled, fromCache bool) {
 	gs.mu.Lock()
 	if !gs.inflight {
 		gs.mu.Unlock()
@@ -219,7 +373,6 @@ func (c *Coordinator) resolve(ctx context.Context, gs *gateState, v Verdict, sta
 	gs.ready = make(map[string]string) // re-arm for the next round
 	owners := append([]string(nil), gs.spec.Required...)
 	gateID := gs.spec.ID
-	gs.mu.Unlock()
 
 	var text string
 	switch {
@@ -230,6 +383,19 @@ func (c *Coordinator) resolve(ctx context.Context, gs *gateState, v Verdict, sta
 	default:
 		text = fmt.Sprintf("%s FAILED: %s", gateID, v.Detail)
 	}
+	if fromCache {
+		// Visible marker: an operator reading the log, or an agent reading
+		// its own submit output, can tell this was answered from a
+		// completed round rather than a freshly run spanning test.
+		text += " (already tested at this version)"
+	}
+	// Remember this round so a participant that re-submits at the same
+	// version gets it back immediately instead of hanging. See onReady.
+	remembered := v
+	gs.lastVerdict = &remembered
+	gs.lastStalled = stalled
+	gs.mu.Unlock()
+
 	_ = c.a.Send(ctx, protocol.New(
 		protocol.Address{Agent: c.a.Name},
 		protocol.Address{Topic: Topic(gateID)},

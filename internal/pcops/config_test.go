@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/KJFromMicromonic/parallel-consciousness/internal/pcops"
+	"gopkg.in/yaml.v3"
 )
 
 const sample = `
@@ -108,6 +109,34 @@ func TestPCDBOverridesConfig(t *testing.T) {
 	}
 	if cfg.DB != "/tmp/override.db" {
 		t.Errorf("DB = %q, want the PC_DB override", cfg.DB)
+	}
+}
+
+// TestGateDefYAMLTagsAreLoadBearing unmarshals straight into a GateDef,
+// bypassing LoadConfig entirely. rawConfig.Gate embeds GateDef inline so that
+// GateDef's own yaml tags are what populate it — a field added to GateDef
+// without also being wired into a hand-copied intermediate struct would
+// otherwise be silently dropped. TestLoadConfig alone cannot distinguish that
+// failure mode from GateDef's tags genuinely working, because it goes through
+// LoadConfig's own field-by-field assembly either way.
+func TestGateDefYAMLTagsAreLoadBearing(t *testing.T) {
+	var g pcops.GateDef
+	body := `
+required: [billing, gateway]
+runner: integrator
+run: go test ./integration/...
+`
+	if err := yaml.Unmarshal([]byte(body), &g); err != nil {
+		t.Fatal(err)
+	}
+	if len(g.Required) != 2 || g.Required[0] != "billing" || g.Required[1] != "gateway" {
+		t.Errorf("Required = %v", g.Required)
+	}
+	if g.Runner != "integrator" {
+		t.Errorf("Runner = %q", g.Runner)
+	}
+	if g.Run != "go test ./integration/..." {
+		t.Errorf("Run = %q", g.Run)
 	}
 }
 
