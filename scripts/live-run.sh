@@ -208,10 +208,10 @@ if [ "$have_pi" -eq 1 ]; then billing_harness=pi; else billing_harness=claude; f
 if [ "$have_claude" -eq 1 ]; then gateway_harness=claude; else gateway_harness=pi; fi
 
 launch billing "$billing_harness" \
-  "Render the invoice currency correctly. You own billing/ only. Submit with: pc submit --gate currency --agent billing"
+  "Render the invoice currency correctly. You own billing/ only. Submit with: pc submit --gate currency --as billing"
 AGENT_PIDS=("$LAST_PID")
 launch gateway "$gateway_harness" \
-  "Stamp the agreed currency on invoices you build. You own gateway/ only. Submit with: pc submit --gate currency --agent gateway"
+  "Stamp the agreed currency on invoices you build. You own gateway/ only. Submit with: pc submit --gate currency --as gateway"
 AGENT_PIDS+=("$LAST_PID")
 
 # --------------------------------------------------------------------- report
