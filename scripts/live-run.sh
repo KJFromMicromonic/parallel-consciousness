@@ -42,6 +42,19 @@ LOG_DIR="$RUN_DIR/logs"
 WORK_DIR="$RUN_DIR/worktrees"
 FIXTURE="$ROOT/fixtures/two-service"
 
+# The agreed currency is chosen per run and is the SPLIT SECRET: it goes into
+# the gate command (so the gate can check it) and into billing's task text (so
+# billing knows it), and nowhere else. gateway cannot read it from the
+# repository, its own worktree, or any gate output — the gate reports only what
+# it found. Asking billing over `pc send` is the only route, which is what
+# makes a converging run evidence that peer messaging works.
+#
+# Randomised so a model cannot pattern-match a plausible default. USD and EUR
+# are excluded (EUR is the seeded-wrong value and USD is the obvious guess for
+# an invoicing demo), as is XTS, which the spanning test uses as its probe.
+CURRENCIES=(SGD NOK PLN ZAR MXN THB CZK ILS)
+AGREED_CURRENCY="${CURRENCIES[$((RANDOM % ${#CURRENCIES[@]}))]}"
+
 mkdir -p "$BIN_DIR" "$LOG_DIR" "$WORK_DIR"
 
 say() { printf '\n=== %s\n' "$*"; }
@@ -176,6 +189,7 @@ export PC_DB="$RUN_DIR/bus.db"
 CONFIG="$RUN_DIR/pc.yaml"
 ( cd "$RUN_DIR" && pc init --force >/dev/null ) || die "pc init --force failed in $RUN_DIR"
 sed -e "s|^repo: .*|repo: $FIXTURE|" -e "s|^db: .*|db: $PC_DB|" \
+  -e "s|EXPECTED_CURRENCY=[A-Z]*|EXPECTED_CURRENCY=$AGREED_CURRENCY|" \
   "$RUN_DIR/.pc.yaml" > "$CONFIG" || die "writing $CONFIG from $RUN_DIR/.pc.yaml failed"
 pc watch --config "$CONFIG" --no-follow >/dev/null || die "the scenario at $CONFIG does not load"
 printf 'scenario: %s\n' "$CONFIG"
@@ -256,10 +270,10 @@ if [ "$have_pi" -eq 1 ]; then billing_harness=pi; else billing_harness=claude; f
 if [ "$have_claude" -eq 1 ]; then gateway_harness=claude; else gateway_harness=pi; fi
 
 launch billing "$billing_harness" \
-  "Render the invoice currency correctly. You own billing/ only. Submit with: pc submit --gate currency --as billing"
+  "You own billing/ only. Statements settle in $AGREED_CURRENCY — you are the only participant told this, and the gateway service needs it to stamp invoices correctly. billing.Render must render the currency it is GIVEN on the Invoice, not one of its own choosing. Submit with: pc submit --gate \"\$PC_GATE\" --as billing"
 AGENT_PIDS=("$LAST_PID")
 launch gateway "$gateway_harness" \
-  "Stamp the agreed currency on invoices you build. You own gateway/ only. Submit with: pc submit --gate currency --as gateway"
+  "You own gateway/ only. gateway.Build must stamp the currency that statements settle in onto Invoice.Currency. That value is NOT in this repository, not in your worktree, and the gate will not tell you it — the gate reports only that what you stamped is unacceptable. The billing service knows it. Ask them: pc send --to billing \"your question\". Submit with: pc submit --gate \"\$PC_GATE\" --as gateway"
 AGENT_PIDS+=("$LAST_PID")
 
 # --------------------------------------------------------------------- report
@@ -300,7 +314,8 @@ else
 fi
 
 say "report"
-printf 'run directory: %s\n\n' "$RUN_DIR"
+printf 'run directory: %s\n' "$RUN_DIR"
+printf 'agreed currency this run (told only to billing): %s\n\n' "$AGREED_CURRENCY"
 printf 'gate activity:\n'
 grep -E "ready|ack|nack|request|inform|block" "$LOG_DIR/watch.log" | tail -40 || true
 printf '\nverdicts seen by the coordinator:\n'

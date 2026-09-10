@@ -36,6 +36,18 @@ import (
 // `gateway` still stamping EUR, and the coordination the fixture exists to
 // force never had to happen. A gate one participant can satisfy by defecting
 // is worse than no gate, because it reports success.
+//
+// Finally — and this is what makes the fixture a test of COMMUNICATION rather
+// than of plumbing — the gate never discloses the value it wants. It reports
+// only what it found. The agreed currency is given to `billing` alone, in its
+// task; `gateway` cannot obtain it from this repository, from its own worktree,
+// or from any gate output. The only route is to ask its peer.
+//
+// Before this, both live runs had `gateway` read the wanted value straight out
+// of the failure detail and then send `billing` a message it did not need. Peer
+// messaging looked exercised and was in fact decorative. Now it is the only
+// path to a passing gate, so a run that converges is evidence the channel
+// works — and one that stalls is evidence it does not.
 func TestGatewayStampsTheAgreedCurrency(t *testing.T) {
 	want := os.Getenv("EXPECTED_CURRENCY")
 	if want == "" {
@@ -60,7 +72,12 @@ func TestGatewayStampsTheAgreedCurrency(t *testing.T) {
 	// influence the outcome.
 	inv := gateway.Build("acme", 125_00)
 	if inv.Currency != want {
-		t.Fatalf("gateway stamped the wrong currency: Build set Currency=%q, want %q", inv.Currency, want)
+		// Deliberately does NOT name the wanted value. The gate knows it — the
+		// integration environment supplies it — and reports only that what it
+		// found is unacceptable. See the split-secret note above: billing is
+		// the service that knows which currency statements settle in, and
+		// asking it is the only way to find out.
+		t.Fatalf("gateway stamped a currency the statement contract does not accept: Build set Currency=%q. The required value is not in this repository and the gate will not disclose it — the billing service is the one that knows.", inv.Currency)
 	}
 
 	// Both halves together, end to end. Redundant when the two above pass,
@@ -68,6 +85,8 @@ func TestGatewayStampsTheAgreedCurrency(t *testing.T) {
 	// cannot be satisfied without them.
 	line := billing.Render(inv)
 	if !strings.HasSuffix(line, " "+want) {
-		t.Fatalf("the composed invoice line is wrong: rendered %q, want a line ending in %q", line, want)
+		// Safe to show the line here: this is reachable only once the check
+		// above has passed, so gateway already holds the value.
+		t.Fatalf("the composed invoice line does not end with the invoice's own currency: rendered %q", line)
 	}
 }

@@ -82,8 +82,20 @@ func TestFixtureBaselineFailsUnderTheGateCommand(t *testing.T) {
 	if !strings.Contains(string(out), "EUR") {
 		t.Errorf("baseline failed, but the failure detail does not mention the wrong value it found; an agent learns the right value from this text:\n%s", out)
 	}
-	if !strings.Contains(string(out), "USD") {
-		t.Errorf("baseline failed, but the failure detail does not name the wanted value; that text is the ONLY channel through which an agent can learn a value absent from its worktree:\n%s", out)
+	// The INVERSE of what this test used to assert, and the inversion is the
+	// point. It once required the failure detail to name the wanted value,
+	// because the gate was the only channel through which an agent could learn
+	// something absent from its worktree. That made peer messaging decorative:
+	// two live runs had gateway read the value out of this text and then send
+	// billing a message it did not need.
+	//
+	// The gate is now non-disclosing. The agreed currency is given to billing
+	// alone, so the only route to it is asking a peer — which is the capability
+	// this project exists to provide, and which nothing was previously testing.
+	// If the value ever leaks back into the gate's output, the fixture silently
+	// stops testing communication and starts testing plumbing again.
+	if strings.Contains(string(out), "USD") {
+		t.Errorf("the gate DISCLOSED the value it wants; gateway could then learn it without asking billing, and the fixture would no longer test peer communication at all:\n%s", out)
 	}
 }
 
