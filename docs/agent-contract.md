@@ -43,4 +43,14 @@ choice of representation, whether they have already handled a case.
 - Do not edit the spanning test to make it pass.
 - Do not weaken assertions. A gate that passes for the wrong reason is worse
   than one that fails.
+- **Do not hardcode a value the gate is checking for.** If the gate expects a
+  particular value, your code must obtain it the way production would — from
+  the data it is handed, or from configuration — never by embedding the literal
+  the test looks for. Making the assertion true is not the job; making the
+  behaviour correct is.
+- **Do not route around the types you share with the other service.** If a
+  field exists for the other agent to populate, read that field. Substituting
+  your own value for it turns a real disagreement into a silent pass.
 - Re-submit after each fix. The gate re-runs on every submission.
+- **When `pc submit` exits 0, you are done.** Stop. Re-submitting an unchanged
+  version cannot change the verdict.
