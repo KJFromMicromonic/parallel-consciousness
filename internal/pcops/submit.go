@@ -48,7 +48,7 @@ const AckTimeout = 10 * time.Second
 // agent name. Any tool that can run a shell command can participate.
 func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) (gate.Verdict, error) {
 	// The headline correctness guard this branch exists to deliver is
-	// versions[agentName] != version below. versionsFromBody returns "" for
+	// versions[agentName] != version below. protocol.Versions returns "" for
 	// a participant absent from a verdict's Versions map, so an empty
 	// version here would compare "" against "" and PASS that guard for a
 	// verdict that never tested this agent at all. `pc submit` cannot reach
@@ -128,7 +128,7 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 		// pkg/gate drops a readiness that arrives while a round is already in
 		// flight, so without this guard an agent would accept the in-flight
 		// round's verdict — computed entirely without its version.
-		versions := versionsFromBody(m.Body["versions"])
+		versions := protocol.Versions(m.Body["versions"])
 		if versions[agentName] != version {
 			// This verdict resolved the in-flight round that displaced our own
 			// readiness (see the Nack handler below) — it is proof that round
@@ -180,7 +180,7 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 			return nil // a previous round's ack, replayed from the cursor
 		}
 		select {
-		case acked <- outstandingFromBody(m.Body["outstanding"]):
+		case acked <- protocol.Strings(m.Body["outstanding"]):
 		default:
 		}
 		return nil
@@ -209,7 +209,7 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 			return nil // a previous round's nack, replayed from the cursor
 		}
 		select {
-		case nacked <- versionsFromBody(m.Body["testing"]):
+		case nacked <- protocol.Versions(m.Body["testing"]):
 		default:
 		}
 		return nil
@@ -375,26 +375,4 @@ func describeVersions(vs map[string]string) string {
 	}
 	sort.Strings(parts)
 	return strings.Join(parts, ", ")
-}
-
-// outstandingFromBody coerces a wire "outstanding" value into []string,
-// accepting both the in-memory []string (pkg/gate builds it that way
-// directly, and the in-memory bus passes values through unchanged) and a
-// JSON []any (what pkg/bus/sqlite delivers after a round trip through the
-// database). Mirrors gate.go's versionsFromBody for the same reason.
-func outstandingFromBody(v any) []string {
-	switch vv := v.(type) {
-	case []string:
-		return vv
-	case []any:
-		out := make([]string, 0, len(vv))
-		for _, e := range vv {
-			if s, ok := e.(string); ok {
-				out = append(out, s)
-			}
-		}
-		return out
-	default:
-		return nil
-	}
 }

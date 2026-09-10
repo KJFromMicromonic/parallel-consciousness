@@ -56,7 +56,7 @@ func summarise(m protocol.Message, full bool) string {
 			return "v=" + abbrevVersion(v)
 		}
 	case protocol.IntentRequest:
-		if vs := versionsFromBody(m.Body["versions"]); len(vs) > 0 {
+		if vs := protocol.Versions(m.Body["versions"]); len(vs) > 0 {
 			names := make([]string, 0, len(vs))
 			for n := range vs {
 				names = append(names, n)
@@ -69,7 +69,7 @@ func summarise(m protocol.Message, full bool) string {
 			return strings.Join(parts, " ")
 		}
 	case protocol.IntentAck:
-		if out := outstandingFromBody(m.Body["outstanding"]); len(out) > 0 {
+		if out := protocol.Strings(m.Body["outstanding"]); len(out) > 0 {
 			return "waiting on " + strings.Join(out, ", ")
 		}
 	case protocol.IntentNack:
@@ -81,7 +81,7 @@ func summarise(m protocol.Message, full bool) string {
 		// is deliberate: it is the exact same rendering pcops.Submit's own
 		// stderr line uses for this field, so the CLI and the log read
 		// identically for the same event.
-		if testing := versionsFromBody(m.Body["testing"]); len(testing) > 0 {
+		if testing := protocol.Versions(m.Body["testing"]); len(testing) > 0 {
 			return "mid-round, testing " + describeVersions(testing)
 		}
 	case protocol.IntentInform:
@@ -94,7 +94,7 @@ func summarise(m protocol.Message, full bool) string {
 		// that. describeVersions is the exact same rendering pcops.Submit's
 		// own stderr uses for a Nack's "testing" set, so an inform and the
 		// round that produced it read identically.
-		if vs := versionsFromBody(m.Body["versions"]); len(vs) > 0 {
+		if vs := protocol.Versions(m.Body["versions"]); len(vs) > 0 {
 			text, _ := m.Body["text"].(string)
 			summary := clip(text, full)
 			tail := "(" + describeVersions(vs) + ")"
@@ -217,25 +217,4 @@ func matchesGate(r sqlite.Record, gateID string) bool {
 	// agent-to-agent message (not an untagged topic broadcast for some other
 	// gate, which must still be dropped).
 	return r.Msg.To.Topic == "" && r.Msg.To.Agent != ""
-}
-
-// versionsFromBody decodes a participant→version map that has crossed the
-// bus. Over pkg/bus/sqlite a body is JSON, so a map[string]string is
-// delivered as map[string]any; pkg/gate carries its own copy of this for
-// the same reason. Anything that is not a string is skipped rather than
-// guessed at.
-func versionsFromBody(v any) map[string]string {
-	switch m := v.(type) {
-	case map[string]string:
-		return m
-	case map[string]any:
-		out := make(map[string]string, len(m))
-		for k, raw := range m {
-			if s, ok := raw.(string); ok {
-				out[k] = s
-			}
-		}
-		return out
-	}
-	return nil
 }
