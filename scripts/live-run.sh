@@ -127,12 +127,25 @@ if [ -n "$(git -C "$FIXTURE" status --porcelain)" ]; then
   git -C "$FIXTURE" -c user.email=live-run@local -c user.name=live-run commit -qm "fixture baseline (auto, live-run)"
 fi
 
+# Prune first, and this is load-bearing rather than tidiness: a previous run's
+# worktrees live under its own timestamped $RUN_DIR, so once that directory is
+# deleted (or the user clears .pc/) git still holds registrations pointing at
+# paths that no longer exist. It marks them "prunable" but keeps treating the
+# agent branches as checked out by them — so `branch -D` below fails behind its
+# `|| true`, and `worktree add -b` then dies with "a branch named
+# 'agent/billing' already exists". Without this line the script works exactly
+# once per fixture repo, which for a tool whose whole purpose is a reproducible
+# run is the wrong number.
+git -C "$FIXTURE" worktree prune
+
 for spec in "billing:agent/billing" "gateway:agent/gateway" "integrator:agent/integration"; do
   name="${spec%%:*}"; branch="${spec##*:}"
   path="$WORK_DIR/$name"
   git -C "$FIXTURE" worktree remove --force "$path" 2>/dev/null || true
+  git -C "$FIXTURE" worktree prune
   git -C "$FIXTURE" branch -D "$branch" 2>/dev/null || true
-  git -C "$FIXTURE" worktree add -q -b "$branch" "$path" HEAD
+  git -C "$FIXTURE" worktree add -q -b "$branch" "$path" HEAD \
+    || die "could not create worktree $path on $branch — check \`git -C $FIXTURE worktree list\`"
   printf '%-11s %s (%s)\n' "$name" "$path" "$branch"
 done
 
