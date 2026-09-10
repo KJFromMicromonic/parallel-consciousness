@@ -909,3 +909,157 @@ func TestOnReadyDoesNotAckACachedResubmit(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 }
+
+// A readiness that arrives while a round is in flight is dropped. Silence
+// there is indistinguishable from "no coordinator" and from "a peer is never
+// coming" — all three looked identical in a live run.
+func TestReadinessDroppedMidRoundIsNacked(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	b := bus.NewInMemory(64)
+	coord, err := agent.New(ctx, b, "coordinator", []string{gate.Topic("g")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := gate.NewCoordinator(coord)
+	c.SetRunnerTimeout(10 * time.Second) // hold the round in flight
+	c.Register(gate.Spec{ID: "g", Required: []string{"billing", "gateway"}, Runner: "runner"})
+	go coord.Run(ctx)
+
+	// No runner is registered, so once quorum forms the round stays in flight.
+	first, err := agent.New(ctx, b, "billing", []string{gate.Topic("g")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go first.Run(ctx)
+	second, err := agent.New(ctx, b, "gateway", []string{gate.Topic("g")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nacks := make(chan protocol.Message, 2)
+	second.On(protocol.IntentNack, func(_ context.Context, _ *agent.Agent, m protocol.Message) *protocol.Message {
+		select {
+		case nacks <- m:
+		default:
+		}
+		return nil
+	})
+	go second.Run(ctx)
+
+	if err := gate.Ready(ctx, first, "g", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.Ready(ctx, second, "g", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	// Quorum has formed and the round is in flight; a further readiness from
+	// gateway must now be nacked rather than silently dropped.
+	if err := gate.Ready(ctx, second, "g", "v2"); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case m := <-nacks:
+		if id, _ := m.Body["gate"].(string); id != "g" {
+			t.Fatalf("nack body = %+v, want gate g", m.Body)
+		}
+		// The nack must say what the in-flight round is testing; an empty
+		// or absent set would leave the submitter as blind as the silence
+		// this replaced.
+		testing := map[string]string{}
+		switch typed := m.Body["testing"].(type) {
+		case map[string]string:
+			testing = typed
+		case map[string]any:
+			for k, raw := range typed {
+				if s, ok := raw.(string); ok {
+					testing[k] = s
+				}
+			}
+		}
+		if testing["billing"] != "v1" || testing["gateway"] != "v1" {
+			t.Fatalf("nack testing = %+v, want billing=v1 gateway=v1", testing)
+		}
+	case <-time.After(3 * time.Second):
+		// Not the full 10s SetRunnerTimeout: the nack arrives in milliseconds
+		// on the in-memory bus, and waiting the round's whole lifetime here
+		// would let a genuine regression race the stall's own resolution
+		// instead of failing promptly.
+		t.Fatal("readiness dropped mid-round produced no Nack")
+	}
+}
+
+// A verdict must say what it tested. Without this, a participant cannot tell
+// whether a broadcast verdict covered its own version — which is what lets a
+// dropped readiness silently accept someone else's round.
+func TestVerdictBroadcastCarriesTheVersionsItTested(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	b := bus.NewInMemory(64)
+	coord, err := agent.New(ctx, b, "coordinator", []string{gate.Topic("g")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := gate.NewCoordinator(coord)
+	c.Register(gate.Spec{ID: "g", Required: []string{"billing"}, Runner: "runner"})
+	go coord.Run(ctx)
+
+	run, err := agent.New(ctx, b, "runner", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate.ServeRunner(run, func(ctx context.Context, gateID string, versions map[string]string) gate.Verdict {
+		return gate.Verdict{GateID: gateID, Passed: true}
+	})
+	go run.Run(ctx)
+
+	// An observer on the gate topic sees the broadcast.
+	obs, err := agent.New(ctx, b, "observer", []string{gate.Topic("g")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(chan protocol.Message, 4)
+	obs.On(protocol.IntentInform, func(_ context.Context, _ *agent.Agent, m protocol.Message) *protocol.Message {
+		select {
+		case seen <- m:
+		default:
+		}
+		return nil
+	})
+	go obs.Run(ctx)
+
+	participant, err := agent.New(ctx, b, "billing", []string{gate.Topic("g")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go participant.Run(ctx)
+	if err := gate.Ready(ctx, participant, "g", "abc123"); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case m := <-seen:
+		vs, ok := m.Body["versions"]
+		if !ok {
+			t.Fatalf("broadcast has no versions: %+v", m.Body)
+		}
+		got := map[string]string{}
+		switch typed := vs.(type) {
+		case map[string]string:
+			got = typed
+		case map[string]any:
+			for k, raw := range typed {
+				if s, ok := raw.(string); ok {
+					got[k] = s
+				}
+			}
+		}
+		if got["billing"] != "abc123" {
+			t.Fatalf("versions = %+v, want billing=abc123", got)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("no verdict broadcast observed")
+	}
+}

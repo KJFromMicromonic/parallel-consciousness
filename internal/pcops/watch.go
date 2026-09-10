@@ -1,0 +1,220 @@
+package pcops
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/bus/sqlite"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/gate"
+	"github.com/KJFromMicromonic/parallel-consciousness/pkg/protocol"
+)
+
+// maxSummary bounds a formatted line's body summary. Long test output and
+// merge conflicts routinely run to thousands of characters, which makes a
+// feed unreadable; --full opts out.
+const maxSummary = 120
+
+// abbrevVersion shortens a git SHA to the conventional short form. Versions
+// are opaque strings by contract, so a shorter one is returned unchanged.
+//
+// Rune-aware, not byte-aware: an opaque version string is not guaranteed
+// ASCII, and slicing bytes can split a multi-byte UTF-8 sequence and emit a
+// replacement character in the truncated result.
+func abbrevVersion(v string) string {
+	r := []rune(v)
+	if len(r) > 8 {
+		return string(r[:8])
+	}
+	return v
+}
+
+// FormatRecord renders one log record as one readable line.
+//
+// Pure by design: it takes a record and returns a string, so the format can
+// be asserted exhaustively in table tests without a database, a bus, or a
+// running gate anywhere in sight.
+func FormatRecord(r sqlite.Record, full bool) string {
+	to := r.Msg.To.Agent
+	if to == "" {
+		to = "#" + r.Msg.To.Topic
+	}
+	line := fmt.Sprintf("%s  %-11s → %-15s %-10s %s",
+		r.Msg.Timestamp.Format("15:04:05"), r.Msg.From.Agent, to,
+		string(r.Msg.Intent), summarise(r.Msg, full))
+	return strings.TrimRight(line, " ")
+}
+
+// summarise picks the most informative field for each intent.
+func summarise(m protocol.Message, full bool) string {
+	switch m.Intent {
+	case protocol.IntentReady:
+		if v, ok := m.Body["version"].(string); ok {
+			return "v=" + abbrevVersion(v)
+		}
+	case protocol.IntentRequest:
+		if vs := protocol.Versions(m.Body["versions"]); len(vs) > 0 {
+			names := make([]string, 0, len(vs))
+			for n := range vs {
+				names = append(names, n)
+			}
+			sort.Strings(names) // stable output; map order is not
+			parts := make([]string, 0, len(names))
+			for _, n := range names {
+				parts = append(parts, n+"="+abbrevVersion(vs[n]))
+			}
+			return strings.Join(parts, " ")
+		}
+	case protocol.IntentAck:
+		if out := protocol.Strings(m.Body["outstanding"]); len(out) > 0 {
+			return "waiting on " + strings.Join(out, ", ")
+		}
+	case protocol.IntentNack:
+		// Unlike the Ack above, a Nack carries "testing" (the version set the
+		// in-flight round is actually testing), not "outstanding" — see
+		// gate.go's onReady: open leaves gs.ready intact for a round's whole
+		// lifetime, only resolve clears it, so outstandingFor(gs) always
+		// returns an empty slice on this path. Rendering with describeVersions
+		// is deliberate: it is the exact same rendering pcops.Submit's own
+		// stderr line uses for this field, so the CLI and the log read
+		// identically for the same event.
+		if testing := protocol.Versions(m.Body["testing"]); len(testing) > 0 {
+			return "mid-round, testing " + describeVersions(testing)
+		}
+	case protocol.IntentInform:
+		// The verdict broadcast: gate.go's resolve stamps "versions" with the
+		// set the round actually tested. Tasks 1-3 built this viewer and Task
+		// 4 added Versions to the wire shape, but nothing connected the two —
+		// the spec justified building Watch FIRST on the grounds that the
+		// verdict-versions change would be far easier to verify once you
+		// could see what a verdict carries, so leaving it unrendered defeated
+		// that. describeVersions is the exact same rendering pcops.Submit's
+		// own stderr uses for a Nack's "testing" set, so an inform and the
+		// round that produced it read identically.
+		if vs := protocol.Versions(m.Body["versions"]); len(vs) > 0 {
+			text, _ := m.Body["text"].(string)
+			summary := clip(text, full)
+			tail := "(" + describeVersions(vs) + ")"
+			if summary == "" {
+				return tail
+			}
+			return summary + " " + tail
+		}
+	}
+	// Everything else: whichever human-readable field is present.
+	for _, k := range []string{"text", "detail"} {
+		if s, ok := m.Body[k].(string); ok && s != "" {
+			return clip(s, full)
+		}
+	}
+	return ""
+}
+
+// clip is rune-aware, not byte-aware, for the same reason as abbrevVersion:
+// it is applied to arbitrary runner detail (real Go test output routinely
+// contains non-ASCII), and slicing bytes at maxSummary can split a multi-byte
+// sequence mid-character.
+func clip(s string, full bool) string {
+	s = strings.ReplaceAll(strings.TrimSpace(s), "\n", " ")
+	if full {
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= maxSummary {
+		return s
+	}
+	return string(r[:maxSummary]) + "…"
+}
+
+// Watch renders the gate's activity feed to out: everything already recorded,
+// then — when follow is set — everything that arrives afterwards.
+//
+// It reads the durable log directly rather than subscribing, for two reasons.
+// A new subscriber starts at the log's HEAD, so it would see no history at
+// all; and Subscribe filters to messages addressed to the subscriber, so an
+// observer would miss the routed failure blocks and agent-to-agent traffic
+// that are the most useful things to watch.
+//
+// gateID filters to one gate when non-empty; a message belongs to a gate if
+// it rides that gate's topic or names it in its body.
+func Watch(ctx context.Context, cfg Config, gateID string, full, follow bool, out io.Writer) error {
+	// Tail's output channel closes for three separate reasons: ctx ending, the
+	// bus closing, or a mid-stream History error inside its poll loop — and
+	// only the first two leave anything in ctx.Err(). The third reaches the
+	// caller only through this hook, so it is captured here and checked after
+	// the follow loop, ahead of ctx.Err(): otherwise a live database failure
+	// closes the channel exactly like a clean stop, and Watch would report
+	// success for a feed that silently died. Reading tailErr after the range
+	// over ch ends is race-free — Tail's goroutine writes it (if at all)
+	// strictly before closing the channel via its deferred close(out), and a
+	// channel close is a happens-before edge for every receive that observes it.
+	var tailErr error
+	b, err := sqlite.Open(ctx, cfg.DB,
+		sqlite.WithPollInterval(250*time.Millisecond),
+		sqlite.WithErrorHook(func(err error) { tailErr = err }),
+	)
+	if err != nil {
+		return fmt.Errorf("open bus: %w", err)
+	}
+	defer b.Close()
+
+	write := func(r sqlite.Record) error {
+		if !matchesGate(r, gateID) {
+			return nil
+		}
+		_, err := fmt.Fprintln(out, FormatRecord(r, full))
+		return err
+	}
+
+	if !follow {
+		recs, err := b.History(ctx, 0)
+		if err != nil {
+			return fmt.Errorf("history: %w", err)
+		}
+		for _, r := range recs {
+			if err := write(r); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	ch, err := b.Tail(ctx, 0)
+	if err != nil {
+		return fmt.Errorf("tail: %w", err)
+	}
+	for r := range ch {
+		if err := write(r); err != nil {
+			return err
+		}
+	}
+	if tailErr != nil {
+		return fmt.Errorf("watch: %w", tailErr)
+	}
+	return ctx.Err()
+}
+
+func matchesGate(r sqlite.Record, gateID string) bool {
+	if gateID == "" {
+		return true
+	}
+	if r.Msg.To.Topic == gate.Topic(gateID) {
+		return true
+	}
+	if id, ok := r.Msg.Body["gate"].(string); ok {
+		return id == gateID
+	}
+	// No "gate" key in the body at all: pcops.Send's DIRECT peer traffic
+	// (pc send) carries no gate field and rides no topic, so there is
+	// nothing here to compare against gateID. Dropping it unconditionally —
+	// the shipped behaviour — re-creates precisely the blindness
+	// pkg/bus/sqlite.History exists to avoid: peer agent-to-agent messages
+	// are exactly what Subscribe's recipient filter hides and what this
+	// command exists to surface. Admit it only when it is actually a direct
+	// agent-to-agent message (not an untagged topic broadcast for some other
+	// gate, which must still be dropped).
+	return r.Msg.To.Topic == "" && r.Msg.To.Agent != ""
+}

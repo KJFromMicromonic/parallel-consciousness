@@ -38,11 +38,25 @@ func StartRunner(ctx context.Context, cfg Config, workdir string, branches []str
 		b.Close()
 		return nil, fmt.Errorf("join as %q: %w", cfg.Gate.Runner, err)
 	}
+	// cfg.RunnerTimeout is zero for a Config built by hand rather than loaded
+	// via LoadConfig; fall back rather than passing a zero timeout, which
+	// would make runShell's context expire before the command even starts.
+	// This mirrors StartCoordinator's own fallback in up.go — the two used to
+	// diverge, with the coordinator's wait bound operator-settable via
+	// runner_timeout and this shell's own timeout hardcoded to 10 minutes
+	// regardless, so a runner_timeout of 30m gave the coordinator half an
+	// hour while this killed the command at ten, and a runner_timeout of 2m
+	// let the shell burn on for eight minutes after the coordinator had
+	// already declared the round stalled.
+	runnerTimeout := cfg.RunnerTimeout
+	if runnerTimeout <= 0 {
+		runnerTimeout = DefaultRunnerTimeout
+	}
 	gate.ServeRunner(a, func(ctx context.Context, gateID string, versions map[string]string) gate.Verdict {
 		if detail, err := mergeAll(ctx, workdir, branches); err != nil {
 			return gate.Verdict{GateID: gateID, Passed: false, Detail: detail, Versions: versions}
 		}
-		out, err := runShell(ctx, workdir, cfg.Gate.Run)
+		out, err := runShell(ctx, workdir, cfg.Gate.Run, runnerTimeout)
 		if err != nil {
 			return gate.Verdict{GateID: gateID, Passed: false, Detail: trim(out), Versions: versions}
 		}
@@ -133,8 +147,8 @@ func gitIn(ctx context.Context, dir string, args ...string) (string, error) {
 	return string(out), err
 }
 
-func runShell(ctx context.Context, dir, command string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+func runShell(ctx context.Context, dir, command string, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.Dir = dir

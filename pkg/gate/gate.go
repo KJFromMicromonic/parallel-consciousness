@@ -59,7 +59,7 @@ func ServeRunner(a *agent.Agent, fn func(ctx context.Context, gateID string, ver
 		}
 		// Transport-safe: the in-memory bus passes versions as map[string]string;
 		// a JSON transport (e.g. pkg/bus/sqlite) delivers map[string]any.
-		versions := versionsFromBody(m.Body["versions"])
+		versions := protocol.Versions(m.Body["versions"])
 		v := fn(ctx, gateID, versions)
 		intent := protocol.IntentDone
 		if !v.Passed {
@@ -287,6 +287,29 @@ func (c *Coordinator) onReady(ctx context.Context, _ *agent.Agent, m protocol.Me
 			"outstanding": outstanding,
 		})
 		reply = &ack
+	} else if required {
+		// The readiness was dropped because a round is already in flight.
+		// Saying so turns an indistinguishable silence into a signal: a
+		// blocked `pc submit` can otherwise not tell "the gate has not run
+		// yet" from "no coordinator is running" from "a required peer is
+		// never coming".
+		//
+		// This deliberately does NOT carry outstandingFor(gs). open leaves
+		// gs.ready intact for the whole round (only resolve clears it), so on
+		// this path outstandingFor always returns an empty slice — which reads
+		// as "waiting on nobody", the opposite of what is happening. What is
+		// actually useful is the version set the in-flight round is testing
+		// instead of this submitter's.
+		//
+		// IntentNack for the same reason as the IntentAck above: the courier
+		// registers no handler for it, so it reaches pcops.Submit's own
+		// subscription and never gets forwarded into a live agent session.
+		// Do not add a courier handler for it.
+		nack := m.Reply(protocol.Address{Agent: c.a.Name}, protocol.IntentNack, map[string]any{
+			"gate":    gateID,
+			"testing": copyMap(gs.ready),
+		})
+		reply = &nack
 	}
 	gs.mu.Unlock()
 	if full {
@@ -396,11 +419,16 @@ func (c *Coordinator) resolve(ctx context.Context, gs *gateState, v Verdict, sta
 	gs.lastStalled = stalled
 	gs.mu.Unlock()
 
+	// versions makes the verdict self-describing: it says which participant was
+	// tested at which version. A participant needs that to tell whether this
+	// verdict covered its own submission — a gate id and a passed bool cannot.
+	// Without it, a readiness dropped mid-round would silently accept the
+	// in-flight round's verdict, one computed without its version at all.
 	_ = c.a.Send(ctx, protocol.New(
 		protocol.Address{Agent: c.a.Name},
 		protocol.Address{Topic: Topic(gateID)},
 		protocol.IntentInform,
-		map[string]any{"text": text, "gate": gateID, "passed": v.Passed},
+		map[string]any{"text": text, "gate": gateID, "passed": v.Passed, "versions": copyMap(v.Versions)},
 	))
 
 	if !v.Passed {
@@ -434,23 +462,4 @@ func copyMap(m map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
-}
-
-// versionsFromBody coerces a wire "versions" value into map[string]string,
-// accepting both the in-memory map[string]string and a JSON map[string]any.
-func versionsFromBody(v any) map[string]string {
-	switch mm := v.(type) {
-	case map[string]string:
-		return mm
-	case map[string]any:
-		out := make(map[string]string, len(mm))
-		for k, val := range mm {
-			if s, ok := val.(string); ok {
-				out[k] = s
-			}
-		}
-		return out
-	default:
-		return nil
-	}
 }

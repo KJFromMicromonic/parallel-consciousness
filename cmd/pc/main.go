@@ -6,6 +6,12 @@
 //	0  the gate passed
 //	1  the gate failed or stalled — the spanning test ran and did not pass
 //	2  no verdict — config, identity, connection error, or timeout
+//
+// pcops.Run's own sentinel errors (ErrSessionDied, ErrLeaseLost) have no exit
+// code here at all: nothing in this package dispatches Run, so they never
+// reach a CLI boundary to map. Documented so a reader comparing the sentinel
+// list above against Run's doesn't go looking for a mapping that does not
+// exist.
 package main
 
 import (
@@ -16,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -27,7 +34,106 @@ import (
 // usage lists every subcommand main actually dispatches. An earlier review
 // flagged advertising a command that did not exist; keep this list exact in
 // both directions as commands are added.
-const usage = "usage: pc <submit|send|up|run-gate> [flags]"
+const usage = "usage: pc <init|submit|send|up|run-gate|watch> [flags]"
+
+// initScaffoldDB is where initScaffold points the coordination database. Named
+// so cmdInit's directory creation and the scaffold text cannot drift apart —
+// deriving the directory with filepath.Dir here means there is exactly one
+// place that spells out the path.
+const initScaffoldDB = "./.pc/bus.db"
+
+// initScaffold is what `pc init` writes. It is a working scenario against the
+// committed fixture rather than a skeleton of empty keys: the fastest way to
+// understand a scenario file is to run one, and a scaffold that fails
+// validation teaches the wrong first lesson. Every value here satisfies
+// pcops.LoadConfig's validation — TestInitWritesAConfigThatLoadsAndValidates
+// asserts exactly that.
+var initScaffold = fmt.Sprintf(`# Parallel Consciousness scenario.
+#
+# A scenario is a hand-written loop definition: who participates, what gate
+# they must pass, and what bounds the run. This one drives the committed
+# two-service fixture; point repo/agents at your own code to adapt it.
+
+# The repository the agents work in. Each agent gets its own git worktree of it.
+repo: ./fixtures/two-service
+
+# The coordination database. Every pc command must agree on this path, so
+# either keep it here or set $PC_DB (which overrides this).
+db: %s
+
+gate:
+  # Gate id. Agents pass this to 'pc submit --gate'.
+  id: currency
+  # Every participant that must declare readiness before the gate runs.
+  # Each name must appear in 'agents' below.
+  required: [billing, gateway]
+  # Which agent runs the spanning test. Must match runner.name below.
+  runner: integrator
+  # The spanning test itself, run in the runner's worktree after every
+  # participant's branch is merged into it.
+  #
+  # EXPECTED_CURRENCY lives here on purpose: the value the two services must
+  # agree on is supplied by the integration environment, so neither agent can
+  # read it out of its own worktree. They learn it from a failing gate.
+  run: "EXPECTED_CURRENCY=USD go test ./integration/..."
+
+agents:
+  - name: billing
+    branch: agent/billing
+    role: implementer
+    task: "Render the invoice currency correctly. You own billing/ only."
+  - name: gateway
+    branch: agent/gateway
+    role: implementer
+    task: "Stamp the agreed currency on invoices you build. You own gateway/ only."
+
+runner:
+  name: integrator
+  branch: agent/integration
+
+budget:
+  # Total wall clock for one run. Omit for unbounded.
+  wall: 20m
+  # How long 'pc submit' waits for a verdict. Must exceed runner_timeout: a
+  # readiness that lands mid-round is nacked and then waits for that round to
+  # finish, so a shorter budget expires before the round it is waiting for.
+  submit_timeout: 12m
+  # How long the coordinator waits for the spanning test before calling the
+  # round stalled.
+  runner_timeout: 10m
+`, initScaffoldDB)
+
+// defaultConfigPath is what every command that needs a scenario falls back to
+// when --config is not given.
+const defaultConfigPath = ".pc.yaml"
+
+func cmdInit(_ context.Context, args []string) int {
+	fs := flag.NewFlagSet("init", flag.ExitOnError)
+	force := fs.Bool("force", false, "overwrite an existing "+defaultConfigPath)
+	fs.Parse(args)
+
+	if _, err := os.Stat(defaultConfigPath); err == nil && !*force {
+		// Refusing is the whole feature: a scenario file is hand-edited, and
+		// silently replacing one is destructive in a way no other pc command is.
+		fmt.Fprintf(os.Stderr, "pc init: %s already exists (use --force to overwrite)\n", defaultConfigPath)
+		return 2
+	}
+	// sqlite.Open creates the database file but not its parent directory, and
+	// the scaffold points db: at initScaffoldDB — so without this, the scaffold
+	// this command just wrote would fail on the very next command with a
+	// SQLite error that has nothing to do with the real problem.
+	dbDir := filepath.Dir(initScaffoldDB)
+	if err := os.MkdirAll(dbDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "pc init: creating %s: %v\n", dbDir, err)
+		return 2
+	}
+	if err := os.WriteFile(defaultConfigPath, []byte(initScaffold), 0o644); err != nil {
+		fmt.Fprintf(os.Stderr, "pc init: %v\n", err)
+		return 2
+	}
+	fmt.Printf("wrote %s\n", defaultConfigPath)
+	return 0
+}
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -44,6 +150,8 @@ func run(ctx context.Context, args []string) int {
 		return 2
 	}
 	switch args[0] {
+	case "init":
+		return cmdInit(ctx, args[1:])
 	case "submit":
 		return cmdSubmit(ctx, args[1:])
 	case "send":
@@ -52,6 +160,8 @@ func run(ctx context.Context, args []string) int {
 		return cmdUp(ctx, args[1:])
 	case "run-gate":
 		return cmdRunGate(ctx, args[1:])
+	case "watch":
+		return cmdWatch(ctx, args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", args[0])
 		return 2
@@ -154,10 +264,10 @@ func cmdSend(ctx context.Context, args []string) int {
 
 func cmdUp(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("up", flag.ExitOnError)
-	config := fs.String("config", "", "scenario file (required)")
+	config := fs.String("config", "", "scenario file (default: ./.pc.yaml if present)")
 	fs.Parse(args)
 
-	cfg, err := resolveUpConfig(*config)
+	cfg, err := resolveConfig(*config, "up")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
@@ -166,16 +276,24 @@ func cmdUp(ctx context.Context, args []string) int {
 	return exitForDaemon(pcops.Up(ctx, cfg, printVerdict))
 }
 
-// resolveUpConfig is loadConfig's sibling for the daemon commands: unlike
-// submit/send, up cannot fall back to an env-only Config, because hosting a
-// coordinator needs the gate definition — required participants, runner name
-// — that only a scenario file carries. Falling back silently here would start
-// a coordinator registered for no gate at all.
-func resolveUpConfig(path string) (pcops.Config, error) {
-	if path == "" {
-		return pcops.Config{}, fmt.Errorf("pc up: --config is required (no gate definition without one)")
+// resolveConfig loads the scenario a command needs, defaulting to ./.pc.yaml
+// when --config was not given.
+//
+// The default exists because an operator working in one scenario's directory
+// should not name the same file on every command. It is a fallback and not a
+// silent one: with neither the flag nor the file, the error names both, and
+// the error still explains WHY a scenario is mandatory — a command cannot
+// filter a feed, open a gate or merge branches without a gate definition, and
+// a missing one previously surfaced as a hang rather than a message.
+func resolveConfig(configPath, command string) (pcops.Config, error) {
+	if configPath == "" {
+		if _, err := os.Stat(defaultConfigPath); err != nil {
+			return pcops.Config{}, fmt.Errorf("pc %s: --config is required, or run in a directory containing %s (no gate definition without one; `pc init` writes one)",
+				command, defaultConfigPath)
+		}
+		configPath = defaultConfigPath
 	}
-	return pcops.LoadConfig(path)
+	return pcops.LoadConfig(configPath)
 }
 
 // printVerdict is the operator's only view of a live `pc up` run, so it prints
@@ -194,7 +312,7 @@ func printVerdict(v gate.Verdict) {
 
 func cmdRunGate(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("run-gate", flag.ExitOnError)
-	config := fs.String("config", "", "scenario file (required)")
+	config := fs.String("config", "", "scenario file (default: ./.pc.yaml if present)")
 	workdir := fs.String("workdir", "", "runner's git worktree (default: current directory)")
 	fs.Parse(args)
 
@@ -212,10 +330,7 @@ func cmdRunGate(ctx context.Context, args []string) int {
 // the bus or a git worktree, so a bad config fails fast instead of hanging
 // inside RunGate waiting for a gate opening that will never resolve.
 func resolveRunGateConfig(configPath, workdir string) (cfg pcops.Config, wd string, branches []string, err error) {
-	if configPath == "" {
-		return pcops.Config{}, "", nil, fmt.Errorf("pc run-gate: --config is required (no gate definition without one)")
-	}
-	cfg, err = pcops.LoadConfig(configPath)
+	cfg, err = resolveConfig(configPath, "run-gate")
 	if err != nil {
 		return pcops.Config{}, "", nil, err
 	}
@@ -250,6 +365,46 @@ func branchesFromConfig(cfg pcops.Config) ([]string, error) {
 		branches = append(branches, a.Branch)
 	}
 	return branches, nil
+}
+
+// cmdWatch streams the gate's activity feed. --config is required for the
+// same reason as up and run-gate: a feed without a gate definition cannot
+// filter, and a coordinator's database alone does not say which gates exist.
+func cmdWatch(ctx context.Context, args []string) int {
+	fs := flag.NewFlagSet("watch", flag.ExitOnError)
+	config := fs.String("config", "", "scenario file (default: ./.pc.yaml if present)")
+	gateID := fs.String("gate", "", "which gate to show (default: the scenario's gate.id; use --all to see everything)")
+	all := fs.Bool("all", false, "show every gate and all peer traffic, not just the scenario's gate")
+	full := fs.Bool("full", false, "do not truncate long details")
+	noFollow := fs.Bool("no-follow", false, "print recorded history and exit")
+	fs.Parse(args)
+
+	cfg, err := resolveConfig(*config, "watch")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	// --gate "" is deliberately not magic: it re-defaults to cfg.GateID just
+	// like omitting the flag, so the only way to reach the unfiltered path
+	// (matchesGate short-circuiting on an empty gate id) is the explicit
+	// --all flag. An empty string is not discoverable the way a flag is.
+	id := *gateID
+	if id == "" {
+		id = cfg.GateID
+	}
+	if *all {
+		id = ""
+	}
+	// A signal-cancelled ctx blocking inside --follow is a clean Ctrl-C, not a
+	// failure: main wires ctx to SIGINT/SIGTERM, so context.Canceled here means
+	// the operator asked to stop, exactly like exitForDaemon treats it for the
+	// other long-running commands.
+	if err := pcops.Watch(ctx, cfg, id, *full, !*noFollow, os.Stdout); err != nil &&
+		!errors.Is(err, context.Canceled) {
+		fmt.Fprintf(os.Stderr, "pc watch: %v\n", err)
+		return 2
+	}
+	return 0
 }
 
 // exitForDaemon maps a daemon's terminal error to an exit code. Up and
@@ -289,8 +444,16 @@ func resolveVersion(ctx context.Context, explicit string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// loadConfig prefers an explicit scenario file and otherwise synthesises the
-// minimum from the environment, so an agent needs only $PC_DB to participate.
+// loadConfig prefers an explicit scenario file, then $PC_DB's env-only path,
+// and only then falls back to ./.pc.yaml if one exists — so an agent needs
+// only $PC_DB to participate, and a human debugging by hand next to a
+// .pc.yaml is not told there is no config just because submit and send are
+// the two commands that went through this function instead of resolveConfig.
+//
+// The $PC_DB branch must keep working with no file present: that is the path
+// live-run.sh's recipes rely on (they export PC_DB and nothing else), so the
+// ./.pc.yaml fallback only applies once $PC_DB is absent, not in addition to
+// it.
 //
 // $PC_SUBMIT_TIMEOUT applies only on the env-only path, and deliberately so: a
 // scenario file already carries budget.submit_timeout, and pcops.Run injects
@@ -304,6 +467,9 @@ func loadConfig(path string) (pcops.Config, error) {
 	}
 	db := os.Getenv("PC_DB")
 	if db == "" {
+		if _, err := os.Stat(defaultConfigPath); err == nil {
+			return pcops.LoadConfig(defaultConfigPath)
+		}
 		return pcops.Config{}, fmt.Errorf("no config: pass --config or set $PC_DB")
 	}
 	return pcops.Config{DB: db, SubmitTimeout: submitTimeoutFromEnv()}, nil
