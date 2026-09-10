@@ -271,10 +271,12 @@ the live-fire findings behind them.
 - [x] Durable SQLite transport
 - [x] Cooperative interruption
 - [x] Cross-agent integration-test gates
-- [x] Local `pc` CLI over a shared domain core
+- [x] Local `pc` CLI over a shared domain service
 - [x] Worktree registration and exclusive leases
 - [x] Generic CLI contract for externally launched agents
 - [x] pi and Claude Code setup recipes
+- [ ] Event-backed domain core: goals, approved loop revisions, work items, attempts, and evidence
+- [ ] MCP contract
 - [ ] Explainable natural-language loop authoring
 - [ ] Implement/review/fix/verify workflow
 - [ ] Integration agent and automated failure routing
