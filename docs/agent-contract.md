@@ -10,11 +10,15 @@ Your task is in `$PC_TASK`. Your agent name is `$PC_AGENT`.
 When your change is ready:
 
 1. Commit it in your worktree.
-2. Run: `pc submit --gate <gate-id> --agent "$PC_AGENT"`
+2. Run: `pc submit --gate <gate-id> --as "$PC_AGENT"`
 
 `pc submit` blocks until a cross-service test gate has run and returns a
-verdict. Exit code 0 means the gate passed. A non-zero exit means it failed or
-could not decide; read its output.
+verdict. The exit code indicates the outcome:
+
+- 0 — the gate passed.
+- 1 — the gate ran and failed. Read the output; it says what it found.
+- 2 — no verdict was obtained. Something is wrong with the setup rather than
+  with your change, so re-running the same submit is unlikely to help.
 
 **You cannot run the spanning test yourself.** It lives outside both worktrees
 and only the gate can run it. Running your own tests locally is still useful
