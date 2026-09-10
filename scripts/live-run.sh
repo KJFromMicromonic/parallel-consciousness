@@ -265,10 +265,18 @@ printf 'run directory: %s\n\n' "$RUN_DIR"
 printf 'gate activity:\n'
 grep -E "ready|ack|nack|request|inform|block" "$LOG_DIR/watch.log" | tail -40 || true
 printf '\nverdicts seen by the coordinator:\n'
-grep -E "PASSED|FAILED|STALLED" "$LOG_DIR/up.log" || printf '  (none)\n'
+# printVerdict in cmd/pc/main.go is pc up's only stdout, and it writes
+# "gate <id>: PASS" or "gate <id>: FAIL — <detail>" — never the bus-message
+# words PASSED/FAILED/STALLED, which are pkg/gate body text that reaches
+# `pc watch`, not `pc up`. Grepping for those here always printed "(none)"
+# and made the exit-status check below fail even after a fully passing run.
+grep -E ": (PASS|FAIL)" "$LOG_DIR/up.log" || printf '  (none)\n'
 printf '\nlogs: %s\n' "$LOG_DIR"
 
-if grep -q "PASSED" "$LOG_DIR/up.log" 2>/dev/null; then
+# Anchored so a FAIL line — which never contains the substring ": PASS" —
+# cannot satisfy this, and so a PASS embedded partway through some other
+# line's detail text cannot either.
+if grep -qE "^gate [^:]+: PASS( |$)" "$LOG_DIR/up.log" 2>/dev/null; then
   printf '\nlive-run: the gate PASSED.\n'
   exit 0
 fi
