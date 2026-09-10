@@ -146,43 +146,95 @@ Loop engine  event log  coordination protocol
 
 ## What exists today
 
-This repository contains the working coordination substrate:
+A working coordination kernel and a CLI over it. Two agents from different
+vendors have converged through one shared test gate on one machine.
 
 ```text
-pkg/protocol       typed messages, addressing, threading, deadlines
-pkg/bus            pluggable transport contract and in-memory implementation
-pkg/bus/sqlite     durable cross-process transport with replayable cursors
-pkg/agent          conversation loop, intent dispatch, acknowledgements,
-                   cooperative interruption
-pkg/gate           cross-agent readiness quorum, test execution, verdicts,
-                   and failure routing
-cmd/demo           manager/worker dependency-negotiation demo
-cmd/gatedemo       cross-service integration-gate demo
-cmd/sqlitedemo     cross-process SQLite transport demo
+cmd/pc              the operator and agent interface: init, submit, send,
+                    up, run-gate, watch
+internal/pcops      composition root: the one place that knows about the
+                    gate, the bus, workspace leases and the agent runtime
+                    at the same time
+pkg/protocol        typed messages, addressing, threading, deadlines
+pkg/bus             pluggable transport contract (Publish + Subscribe) and
+                    in-memory implementation
+pkg/bus/sqlite      durable cross-process transport with replayable cursors,
+                    plus read-only History/Tail for observability
+pkg/agent           conversation loop, intent dispatch, acknowledgements,
+                    cooperative interruption
+pkg/gate            cross-agent readiness quorum, test execution, verdicts,
+                    version-matched answers, failure routing
+pkg/workspace       git-worktree leases with holder-token fencing
+pkg/runtime         harness-neutral agent contract (stdlib only)
+fixtures/two-service  a demo scenario: two services that must agree on one
+                    value, and a spanning test only the gate can run
 ```
 
-The transport contract is intentionally small: `Publish` and `Subscribe`.
-Agent behavior does not depend on whether messages are in-memory or durable.
+### Quickstart
 
-### Run the collaboration demo
+You need Go 1.22+, git, and at least one coding agent CLI — see the recipes
+below. Two terminals.
 
 ```bash
-go run ./cmd/demo
+# Build the CLI. Do this from the project root: building from elsewhere is how
+# one live run silently tested a stale binary for nine minutes.
+go build -o ./bin/pc ./cmd/pc
+export PATH="$PWD/bin:$PATH"
+
+# Write a scenario. The default one drives the committed fixture.
+pc init
+
+# Terminal 1 — the coordinator, and the runner that executes the gate.
+pc up &
+pc run-gate --workdir /path/to/integration-worktree
+
+# Terminal 2 — watch everything, including agent-to-agent messages.
+pc watch --all
 ```
 
-The planner, researcher, and writer negotiate a dependency and re-sequence work
-without polling a shared document.
-
-### Run the integration-gate demo
+Then launch your agents in their worktrees, following the recipe for your
+harness. Or run the whole thing at once:
 
 ```bash
-go run ./cmd/gatedemo
+scripts/live-run.sh
 ```
 
-Two service owners declare readiness, a runner executes the spanning test, and
-the coordinator broadcasts the verdict. A failing round routes a blocker to
-the participating owners; precise attribution is part of the planned product
-layer.
+### Recipes
+
+The contract every agent receives is one file: [docs/agent-contract.md](./docs/agent-contract.md).
+It is the same text for every harness — the strongest evidence for this
+project's agnostic claim is that it ported between two vendors with no edits.
+
+- [pi](./docs/recipes/pi.md) — verified end to end
+- [Claude Code](./docs/recipes/claude-code.md) — verified end to end
+- [other harnesses](./docs/recipes/other-harnesses.md) — what a harness needs;
+  no support claimed
+
+### What is proven, and what is not
+
+Proven: two agents from different vendors, launched separately, converging
+through one gate on one machine — including a failing round whose detail
+taught one agent a value that was verifiably absent from its own worktree.
+
+Not proven, and not claimed:
+
+- More than one machine, one repository, or one gate per coordinator.
+- Agent supervision. A human launches the agents; PC does not manage
+  processes.
+- Deliberately re-running a gate on an unchanged version.
+- Containment. Worktrees bound visibility, not capability — an agent can
+  still write outside its own tree.
+- Enforced token budgets. They are observed, not enforced.
+
+### The demos
+
+Three older binaries still exercise the kernel directly, without the CLI:
+
+```bash
+go run ./cmd/demo       # planner/researcher/writer negotiate a dependency
+go run ./cmd/gatedemo   # two service owners, a runner, and a failing round
+go run ./cmd/sqlitedemo # the same protocol across processes
+```
 
 ### Run the tests
 
@@ -190,9 +242,10 @@ layer.
 go test ./...
 ```
 
-See [PROTOCOL.md](./PROTOCOL.md) for the current wire contract and
+See [PROTOCOL.md](./PROTOCOL.md) for the wire contract,
 [the product design](./docs/superpowers/specs/2026-07-21-agent-coordination-loop-studio-design.md)
-for the complete direction.
+for the full direction, and `docs/superpowers/specs/` for the phase designs and
+the live-fire findings behind them.
 
 ## Principles
 
@@ -218,11 +271,10 @@ for the complete direction.
 - [x] Durable SQLite transport
 - [x] Cooperative interruption
 - [x] Cross-agent integration-test gates
-- [ ] Local `pc` daemon and event-backed domain core
-- [ ] Goals, approved loop revisions, work items, attempts, and evidence
-- [ ] Generic CLI and MCP contracts
-- [ ] Codex and Claude Code setup recipes
-- [ ] Worktree registration and exclusive leases
+- [x] Local `pc` CLI over a shared domain core
+- [x] Worktree registration and exclusive leases
+- [x] Generic CLI contract for externally launched agents
+- [x] pi and Claude Code setup recipes
 - [ ] Explainable natural-language loop authoring
 - [ ] Implement/review/fix/verify workflow
 - [ ] Integration agent and automated failure routing
