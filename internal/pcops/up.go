@@ -37,8 +37,14 @@ func StartCoordinator(ctx context.Context, cfg Config, onVerdict func(gate.Verdi
 	}
 	c := gate.NewCoordinator(a)
 	// The runner shells out to a real test command, which is far slower than
-	// the in-process default of 5s.
-	c.SetRunnerTimeout(10 * time.Minute)
+	// the in-process default of 5s. cfg.RunnerTimeout is zero for a Config
+	// built by hand rather than loaded via LoadConfig; fall back rather than
+	// setting a zero timeout, which would stall every round instantly.
+	runnerTimeout := cfg.RunnerTimeout
+	if runnerTimeout <= 0 {
+		runnerTimeout = DefaultRunnerTimeout
+	}
+	c.SetRunnerTimeout(runnerTimeout)
 	c.Register(gate.Spec{ID: cfg.GateID, Required: cfg.Gate.Required, Runner: cfg.Gate.Runner})
 	if onVerdict != nil {
 		c.OnVerdict(onVerdict)
