@@ -219,6 +219,20 @@ budget:
 			func(s string) string { return strings.Replace(s, "submit_timeout: 12m", "submit_timeout: 5m", 1) },
 			"budget.submit_timeout",
 		},
+		{
+			// The boundary itself: equal budgets are genuinely unusable, not
+			// merely under-tested — a submit's own context expires at the
+			// exact instant the round it is waiting for does, so it can never
+			// observe that round's verdict. A `<` typo in place of `<=` in
+			// validate() would pass every other row in this table while still
+			// claiming "must exceed" in its error text; only an equal-budgets
+			// row catches that.
+			"submit timeout equals runner timeout",
+			func(s string) string {
+				return strings.Replace(s, "submit_timeout: 12m", "submit_timeout: 10m", 1)
+			},
+			"budget.submit_timeout",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "pc.yaml")

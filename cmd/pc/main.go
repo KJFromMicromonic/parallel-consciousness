@@ -444,8 +444,16 @@ func resolveVersion(ctx context.Context, explicit string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// loadConfig prefers an explicit scenario file and otherwise synthesises the
-// minimum from the environment, so an agent needs only $PC_DB to participate.
+// loadConfig prefers an explicit scenario file, then $PC_DB's env-only path,
+// and only then falls back to ./.pc.yaml if one exists — so an agent needs
+// only $PC_DB to participate, and a human debugging by hand next to a
+// .pc.yaml is not told there is no config just because submit and send are
+// the two commands that went through this function instead of resolveConfig.
+//
+// The $PC_DB branch must keep working with no file present: that is the path
+// live-run.sh's recipes rely on (they export PC_DB and nothing else), so the
+// ./.pc.yaml fallback only applies once $PC_DB is absent, not in addition to
+// it.
 //
 // $PC_SUBMIT_TIMEOUT applies only on the env-only path, and deliberately so: a
 // scenario file already carries budget.submit_timeout, and pcops.Run injects
@@ -459,6 +467,9 @@ func loadConfig(path string) (pcops.Config, error) {
 	}
 	db := os.Getenv("PC_DB")
 	if db == "" {
+		if _, err := os.Stat(defaultConfigPath); err == nil {
+			return pcops.LoadConfig(defaultConfigPath)
+		}
 		return pcops.Config{}, fmt.Errorf("no config: pass --config or set $PC_DB")
 	}
 	return pcops.Config{DB: db, SubmitTimeout: submitTimeoutFromEnv()}, nil
