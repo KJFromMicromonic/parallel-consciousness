@@ -173,7 +173,27 @@ fixtures/two-service  a demo scenario: two services that must agree on one
 ### Quickstart
 
 You need Go 1.22+, git, and at least one coding agent CLI — see the recipes
-below. Two terminals.
+below.
+
+The supported route is the script — every recipe below was verified against
+it, and it does the setup a manual run needs (initialising the fixture as its
+own git repo, creating the three participant branches, adding the three
+worktrees) before starting anything:
+
+```bash
+scripts/live-run.sh
+```
+
+Pass `--preflight-only` to run every pre-flight check (harness smoke test, `pc`
+build and provenance) and stop before touching the fixture or spending any
+agent budget.
+
+The manual path below assumes those same worktrees already exist — `pc
+run-gate --workdir /path/to/integration-worktree` does not create one, and in a
+fresh clone `fixtures/two-service` is not yet a git repository and none of
+`agent/billing`, `agent/gateway`, or `agent/integration` exist. Do what
+`scripts/live-run.sh` does first (or just run the script), then, with two
+terminals:
 
 ```bash
 # Build the CLI. Do this from the project root: building from elsewhere is how
@@ -193,11 +213,7 @@ pc watch --all
 ```
 
 Then launch your agents in their worktrees, following the recipe for your
-harness. Or run the whole thing at once:
-
-```bash
-scripts/live-run.sh
-```
+harness.
 
 ### Recipes
 

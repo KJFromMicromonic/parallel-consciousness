@@ -12,5 +12,12 @@ conclave.tar.gz
 # Local tooling index (not part of the project)
 .codegraph/
 
+# pc's own runtime artifacts: `pc init`'s scenario/database and
+# scripts/live-run.sh's per-run binary, database, logs, and worktrees.
+# Uncommitted deliberately — a compiled binary, a SQLite database, and git
+# worktrees have no business in a `git add -A` from the project root.
+.pc/
+.pc.yaml
+
 # SDD scratch (ledger, briefs, review packages)
 .superpowers/
