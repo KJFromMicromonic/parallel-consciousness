@@ -631,6 +631,46 @@ which is exactly what a botched refactor trips. The plan must forbid touching
 any existing assertion in `submit_test.go`: a failure there is a signal to stop,
 not a test to adjust.
 
+## Four decisions taken while planning (2026-09-10)
+
+Repo facts that shaped them: there is no `fixtures/` directory, no `scripts/`,
+and no contract-snippet file. The live runs used a throwaway fixture that no
+longer exists, and the snippet lived only inside those sessions. Tasks 5, 6 and
+9 therefore build from scratch rather than formalising an existing artifact.
+
+**1. The contract snippet documents `pc send`.** The live-fire findings record
+that the snippet documented only `pc submit`, that `pc send` was "mentioned
+nowhere", and that agents nevertheless worked out they could message each other
+— three times, unprompted. That is the strongest evidence this project has that
+the protocol is legible rather than merely documented.
+
+Documenting `pc send` permanently forfeits observing that discovery again, since
+every future run is primed. It is still the right call: part 2's job is that
+someone else can install this, and withholding a working tool to preserve a
+research observation is the wrong trade once shipping. The observation is
+recorded and dated in the live-fire findings; it does not need to stay
+reproducible to stay true.
+
+**2. `scripts/live-run.sh` launches both agents itself**, backgrounded, one pi
+and one Claude Code, each with `< /dev/null`. Not a `--harness` flag, and not a
+script that prints two commands to paste. Two vendors side by side is the
+configuration the harness-agnostic claim actually rests on, and it is what was
+run. A script that only prints instructions cannot prevent either of the two
+non-code failures it exists to prevent — a stale binary silently under test, and
+a harness blocking on inherited stdin.
+
+**3. The README's "What exists today" section is restructured; the vision
+sections are left alone.** The problem, product-thesis and Loop Studio material
+remains accurate as intent. But that one section is a phase behind: it lists
+`pkg/protocol`, `pkg/bus`, `pkg/agent`, `pkg/gate` and the three demo binaries,
+and mentions `cmd/pc` zero times and `pc watch` zero times. The CLI is now the
+primary interface, and a README that omits it misleads exactly the design
+partners it is addressed to.
+
+**4. Part 2 builds on the unmerged part-1 branch.** Stacking runs three deep
+(#3 → #4 → part 2). Unavoidable: tasks 1-3 edit part 1's code directly, so they
+cannot sit on `main`.
+
 ## Task order
 
 1. Decode helpers → `pkg/protocol`.
