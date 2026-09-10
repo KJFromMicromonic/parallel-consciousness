@@ -13,6 +13,13 @@
 # per agent — and it is exactly the checking that would have prevented both
 # failures above.
 set -euo pipefail
+# set -m: put each backgrounded job in its own process group, so the whole
+# group can be signalled at once. Without this, killing a launch()'s $! only
+# reaches the wrapping subshell — `( cd "$wt" && ... pi/claude ... ) &` is not
+# exec-optimized away, so the harness runs as the subshell's child and is
+# reparented, orphaned, and left running when the subshell dies. That is what
+# survived a plain `kill` during this script's own verification.
+set -m
 
 PREFLIGHT_ONLY=0
 if [ "${1:-}" = "--preflight-only" ]; then
@@ -90,6 +97,20 @@ if [ ! -d "$FIXTURE/.git" ]; then
   git -C "$FIXTURE" -c user.email=live-run@local -c user.name=live-run commit -qm "fixture baseline"
 fi
 
+# A worktree add checks out the last commit, silently, whatever it is. Local
+# edits made to the fixture since the last run would otherwise be tested as
+# stale content with no error and no message — the same class of surprise
+# this script's provenance check exists to prevent for the pc binary, applied
+# here to the fixture. Commit is the right response, not die: "reset the
+# fixture" should mean what's on disk is what gets tested, but it must be
+# announced.
+if [ -n "$(git -C "$FIXTURE" status --porcelain)" ]; then
+  printf 'live-run: fixture has uncommitted changes, committing as the new baseline:\n'
+  git -C "$FIXTURE" status --porcelain
+  git -C "$FIXTURE" add -A
+  git -C "$FIXTURE" -c user.email=live-run@local -c user.name=live-run commit -qm "fixture baseline (auto, live-run)"
+fi
+
 for spec in "billing:agent/billing" "gateway:agent/gateway" "integrator:agent/integration"; do
   name="${spec%%:*}"; branch="${spec##*:}"
   path="$WORK_DIR/$name"
@@ -105,9 +126,9 @@ say "writing the scenario"
 
 export PC_DB="$RUN_DIR/bus.db"
 CONFIG="$RUN_DIR/pc.yaml"
-( cd "$RUN_DIR" && pc init --force >/dev/null )
+( cd "$RUN_DIR" && pc init --force >/dev/null ) || die "pc init --force failed in $RUN_DIR"
 sed -e "s|^repo: .*|repo: $FIXTURE|" -e "s|^db: .*|db: $PC_DB|" \
-  "$RUN_DIR/.pc.yaml" > "$CONFIG"
+  "$RUN_DIR/.pc.yaml" > "$CONFIG" || die "writing $CONFIG from $RUN_DIR/.pc.yaml failed"
 pc watch --config "$CONFIG" --no-follow >/dev/null || die "the scenario at $CONFIG does not load"
 printf 'scenario: %s\n' "$CONFIG"
 
@@ -122,9 +143,25 @@ GATE_PID=$!
 pc watch --config "$CONFIG" --all --full >"$LOG_DIR/watch.log" 2>&1 < /dev/null &
 WATCH_PID=$!
 
+# Killed by process group (negative PID), not by PID: with set -m each of
+# these is its own group leader, so -$pid reaches it and every child. This is
+# what actually stops a launched agent — killing launch()'s bare $! only
+# reaches the wrapping subshell in launch() and leaves the harness (pi/claude)
+# orphaned, which is exactly what survived a plain kill during this script's
+# own verification. Group-killing the three daemons this way is harmless:
+# each is a single command, so its group contains only itself.
+# ${AGENT_PIDS[@]+"${AGENT_PIDS[@]}"} rather than "${AGENT_PIDS[@]}" so this
+# is safe under set -u if cleanup fires before any agent has launched (e.g.
+# a die() during the daemon-liveness check below) — bash 3.2, which macOS
+# ships, has no other way to iterate a possibly-unset array without erroring.
 cleanup() {
-  kill "$UP_PID" "$GATE_PID" "$WATCH_PID" 2>/dev/null || true
-  wait "$UP_PID" "$GATE_PID" "$WATCH_PID" 2>/dev/null || true
+  local pid
+  for pid in "$UP_PID" "$GATE_PID" "$WATCH_PID" ${AGENT_PIDS[@]+"${AGENT_PIDS[@]}"}; do
+    kill -- -"$pid" 2>/dev/null || true
+  done
+  for pid in "$UP_PID" "$GATE_PID" "$WATCH_PID" ${AGENT_PIDS[@]+"${AGENT_PIDS[@]}"}; do
+    wait "$pid" 2>/dev/null || true
+  done
 }
 trap cleanup EXIT
 
@@ -180,7 +217,39 @@ AGENT_PIDS+=("$LAST_PID")
 # --------------------------------------------------------------------- report
 
 say "waiting for the agents"
-for pid in "${AGENT_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+
+# A bare `wait` here trusted the daemons to still be there when the agents
+# finished — checked once, two seconds after startup, and never again. If
+# `pc up` or `pc run-gate` dies mid-run, an operator would otherwise watch a
+# dead gate for the rest of the run: the same nine-minute waste this script
+# exists to stop, just moved to a different daemon. Poll instead: as long as
+# an agent is still running, check every few seconds that both daemons still
+# are too, and stop waiting the moment one of them is not.
+daemon_died=""
+while :; do
+  any_agent_alive=0
+  for pid in ${AGENT_PIDS[@]+"${AGENT_PIDS[@]}"}; do
+    kill -0 "$pid" 2>/dev/null && any_agent_alive=1
+  done
+  [ "$any_agent_alive" -eq 1 ] || break
+
+  if ! kill -0 "$UP_PID" 2>/dev/null; then
+    daemon_died="pc up exited mid-run; see $LOG_DIR/up.log"
+    break
+  fi
+  if ! kill -0 "$GATE_PID" 2>/dev/null; then
+    daemon_died="pc run-gate exited mid-run; see $LOG_DIR/run-gate.log"
+    break
+  fi
+  sleep 3
+done
+
+if [ -n "$daemon_died" ]; then
+  printf '\nlive-run: %s\n' "$daemon_died"
+  printf 'live-run: the gate is gone; not waiting on the agents further.\n'
+else
+  for pid in ${AGENT_PIDS[@]+"${AGENT_PIDS[@]}"}; do wait "$pid" 2>/dev/null || true; done
+fi
 
 say "report"
 printf 'run directory: %s\n\n' "$RUN_DIR"
