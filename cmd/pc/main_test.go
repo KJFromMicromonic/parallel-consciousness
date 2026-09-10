@@ -84,9 +84,9 @@ func writeScenario(t *testing.T, body string) string {
 // participants, runner name — that only a scenario file carries. Falling back
 // to an env-only config here would silently start a coordinator for no gate.
 func TestUpRequiresConfig(t *testing.T) {
-	_, err := resolveUpConfig("")
+	_, err := resolveConfig("", "up")
 	if err == nil {
-		t.Fatal("resolveUpConfig(\"\") = nil error, want one naming --config")
+		t.Fatal("resolveConfig(\"\", \"up\") = nil error, want one naming --config")
 	}
 	if !strings.Contains(err.Error(), "--config") {
 		t.Errorf("error %q does not name the missing --config flag", err.Error())
@@ -98,7 +98,7 @@ func TestUpRequiresConfig(t *testing.T) {
 }
 
 func TestUpLoadsTheGateFromConfig(t *testing.T) {
-	cfg, err := resolveUpConfig(writeScenario(t, sampleScenario))
+	cfg, err := resolveConfig(writeScenario(t, sampleScenario), "up")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,9 +204,9 @@ func TestBranchesFromConfigPreservesConfigOrder(t *testing.T) {
 // reason: a feed without one cannot filter, and a bare database does not say
 // which gates exist.
 func TestWatchRequiresConfig(t *testing.T) {
-	_, err := resolveWatchConfig("")
+	_, err := resolveConfig("", "watch")
 	if err == nil {
-		t.Fatal("resolveWatchConfig(\"\") = nil error, want one naming --config")
+		t.Fatal("resolveConfig(\"\", \"watch\") = nil error, want one naming --config")
 	}
 	if !strings.Contains(err.Error(), "--config") {
 		t.Errorf("error %q does not name the missing --config flag", err.Error())
@@ -355,11 +355,90 @@ runner:
 // The usage string is the operator's map of what pc can do; advertising a
 // command that does not exist (or omitting one that does) was already flagged
 // once in review, so pin the full, accurate list down with a test.
-func TestUsageListsAllFiveCommands(t *testing.T) {
-	for _, cmd := range []string{"submit", "send", "up", "run-gate", "watch"} {
+func TestUsageListsEveryCommand(t *testing.T) {
+	for _, cmd := range []string{"init", "submit", "send", "up", "run-gate", "watch"} {
 		if !strings.Contains(usage, cmd) {
 			t.Errorf("usage %q does not mention %q", usage, cmd)
 		}
+	}
+}
+
+// Round-trip, not byte comparison: what matters is that the scaffold is a
+// document this project's own loader accepts and validates. Asserting exact
+// bytes would break on every comment edit while proving less.
+func TestInitWritesAConfigThatLoadsAndValidates(t *testing.T) {
+	dir := t.TempDir()
+	chdir(t, dir)
+
+	if got := run(context.Background(), []string{"init"}); got != 0 {
+		t.Fatalf("pc init = %d, want 0", got)
+	}
+	if _, err := os.Stat(".pc.yaml"); err != nil {
+		t.Fatalf("pc init did not write .pc.yaml: %v", err)
+	}
+	if _, err := pcops.LoadConfig(".pc.yaml"); err != nil {
+		t.Fatalf("pc init wrote a scenario its own loader rejects: %v", err)
+	}
+}
+
+// Overwriting a scenario someone has edited is destructive and silent. It
+// needs an explicit flag.
+func TestInitRefusesToClobberWithoutForce(t *testing.T) {
+	dir := t.TempDir()
+	chdir(t, dir)
+
+	if err := os.WriteFile(".pc.yaml", []byte("# mine\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := run(context.Background(), []string{"init"}); got == 0 {
+		t.Fatal("pc init overwrote an existing .pc.yaml and exited 0")
+	}
+	b, err := os.ReadFile(".pc.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "# mine\n" {
+		t.Fatalf("pc init modified an existing file without --force; contents now %q", b)
+	}
+	if got := run(context.Background(), []string{"init", "--force"}); got != 0 {
+		t.Fatalf("pc init --force = %d, want 0", got)
+	}
+	if _, err := pcops.LoadConfig(".pc.yaml"); err != nil {
+		t.Fatalf("pc init --force wrote a scenario its own loader rejects: %v", err)
+	}
+}
+
+// The whole point of a default: an operator in a directory with a .pc.yaml
+// should not have to name it on every command.
+func TestConfigDefaultsToDotPcYamlWhenPresent(t *testing.T) {
+	dir := t.TempDir()
+	chdir(t, dir)
+
+	if got := run(context.Background(), []string{"init"}); got != 0 {
+		t.Fatal("pc init failed")
+	}
+	// The scaffold puts the database under ./.pc/, and cmdWatch reports a bus
+	// failure with the SAME exit code 2 it uses for a missing config — so
+	// without this directory the test would fail for a reason that has
+	// nothing to do with config defaulting.
+	if err := os.MkdirAll(".pc", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// watch --no-follow must now get past config resolution. Exit 2 here can
+	// only mean the default was not applied.
+	code := run(context.Background(), []string{"watch", "--no-follow"})
+	if code == 2 {
+		t.Errorf("pc watch with no --config exited 2 in a directory containing .pc.yaml; the default was not applied")
+	}
+}
+
+// And the inverse, so the default cannot silently mask a genuine mistake.
+func TestConfigStillRequiredWhenNoDotPcYaml(t *testing.T) {
+	dir := t.TempDir()
+	chdir(t, dir)
+
+	if got := run(context.Background(), []string{"watch", "--no-follow"}); got != 2 {
+		t.Errorf("pc watch with no --config and no .pc.yaml = %d, want 2", got)
 	}
 }
 
