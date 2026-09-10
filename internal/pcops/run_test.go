@@ -364,7 +364,28 @@ func TestRunFailsWhenALeaseIsLost(t *testing.T) {
 		if !strings.Contains(err.Error(), "billing") {
 			t.Fatalf("error does not name the agent: %v", err)
 		}
+		// The workspace sentinel must match too — same identity, one error.
+		if !errors.Is(err, workspace.ErrLeaseLost) {
+			t.Errorf("Run err = %v, want it to satisfy errors.Is(err, workspace.ErrLeaseLost) as well", err)
+		}
+		// The heartbeat saw a real error carrying the worktree path; dropping
+		// it and reporting only the agent name throws away the one detail
+		// that says WHICH directory was lost.
+		if !strings.Contains(err.Error(), "worktrees") {
+			t.Errorf("Run err = %v, want it to carry the underlying lease error (which names the worktree path)", err)
+		}
 	case <-time.After(45 * time.Second):
 		t.Fatal("Run did not fail after its lease was lost")
+	}
+}
+
+// One error identity, not two. A caller that already knows
+// workspace.ErrLeaseLost — the sentinel the workspace package documents as
+// the only way a holder learns it was reclaimed — must be able to match a run
+// failure with it. Two identically named sentinels in adjacent packages, only
+// one of them reachable, is a taxonomy trap.
+func TestErrLeaseLostIsReachableThroughTheWorkspaceSentinel(t *testing.T) {
+	if !errors.Is(pcops.ErrLeaseLost, workspace.ErrLeaseLost) {
+		t.Fatal("pcops.ErrLeaseLost does not wrap workspace.ErrLeaseLost: a caller holding the workspace sentinel cannot match a run failure with it")
 	}
 }
