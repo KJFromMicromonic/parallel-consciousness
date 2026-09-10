@@ -5,7 +5,19 @@
 # failed for reasons outside the code entirely: one silently tested a stale pc
 # binary for nine minutes, and one hung forever because a backgrounded `pi -p`
 # inherited an open stdin. Both are checked below before anything starts.
+#
+# Pass --preflight-only to run every pre-flight check (root, harness smoke
+# test, pc build and provenance) and then exit 0 without touching the
+# fixture, starting any daemon, or launching any agent. That is a real thing
+# an operator wants before committing to a run that can take several minutes
+# per agent — and it is exactly the checking that would have prevented both
+# failures above.
 set -euo pipefail
+
+PREFLIGHT_ONLY=0
+if [ "${1:-}" = "--preflight-only" ]; then
+  PREFLIGHT_ONLY=1
+fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$ROOT"
@@ -28,18 +40,11 @@ say "pre-flight"
 [ -f "$ROOT/go.mod" ] || die "not at the project root (no go.mod at $ROOT)"
 [ -d "$FIXTURE" ] || die "fixture missing at $FIXTURE"
 
-# Binary provenance. Built here, now, from this checkout — not found on PATH,
-# where it may be any age. This is the check that a stale binary defeated.
-say "building pc from $ROOT"
-go build -o "$BIN_DIR/pc" ./cmd/pc || die "go build ./cmd/pc failed"
-export PATH="$BIN_DIR:$PATH"
-command -v pc >/dev/null || die "pc not on PATH after build"
-resolved="$(command -v pc)"
-[ "$resolved" = "$BIN_DIR/pc" ] || die "pc resolves to $resolved, not the binary just built at $BIN_DIR/pc"
-printf 'pc: %s\n' "$resolved"
-
-# Harness smoke test. A harness that cannot even report its version will not
-# survive a nine-minute run, and finding that out now costs seconds.
+# Harness smoke test, before the (slower) build: an operator with no harness
+# on PATH gets stopped by that fact directly, not by a "go build failed" that
+# has nothing to do with their actual problem. A harness that cannot even
+# report its version will not survive a nine-minute run, and finding that out
+# now costs seconds.
 have_pi=0
 have_claude=0
 if command -v pi >/dev/null && pi --version >/dev/null 2>&1; then
@@ -56,6 +61,21 @@ fi
 if [ "$have_pi" -eq 0 ] || [ "$have_claude" -eq 0 ]; then
   printf '\nlive-run: only one harness available; running both agents on it.\n'
   printf 'The two-vendor configuration is what the agnostic claim rests on.\n'
+fi
+
+# Binary provenance. Built here, now, from this checkout — not found on PATH,
+# where it may be any age. This is the check that a stale binary defeated.
+say "building pc from $ROOT"
+go build -o "$BIN_DIR/pc" ./cmd/pc || die "go build ./cmd/pc failed"
+export PATH="$BIN_DIR:$PATH"
+command -v pc >/dev/null || die "pc not on PATH after build"
+resolved="$(command -v pc)"
+[ "$resolved" = "$BIN_DIR/pc" ] || die "pc resolves to $resolved, not the binary just built at $BIN_DIR/pc"
+printf 'pc: %s\n' "$resolved"
+
+if [ "$PREFLIGHT_ONLY" -eq 1 ]; then
+  say "pre-flight only: stopping before touching the fixture or starting anything"
+  exit 0
 fi
 
 # ------------------------------------------------------------- fixture reset
