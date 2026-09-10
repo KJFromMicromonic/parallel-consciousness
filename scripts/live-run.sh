@@ -138,6 +138,25 @@ fi
 # run is the wrong number.
 git -C "$FIXTURE" worktree prune
 
+# Then remove every worktree this fixture repo still has, wherever it lives.
+# Pruning alone is not enough and the first attempt at this fix got that wrong:
+# prune only clears registrations whose directory is GONE. A previous run whose
+# $RUN_DIR still exists has perfectly valid registrations holding agent/billing
+# and friends checked out — and because each run uses its own timestamped
+# directory, the per-agent `worktree remove` below only ever targets THIS run's
+# path and never touches them. So `branch -D` fails and `worktree add -b` dies
+# on "a branch named 'agent/billing' already exists".
+#
+# `worktree list --porcelain` puts the main worktree first, so drop that line
+# and remove the rest.
+git -C "$FIXTURE" worktree list --porcelain 2>/dev/null \
+  | awk '/^worktree /{print substr($0, 10)}' | tail -n +2 \
+  | while IFS= read -r stale; do
+      [ -n "$stale" ] || continue
+      git -C "$FIXTURE" worktree remove --force "$stale" 2>/dev/null || true
+    done
+git -C "$FIXTURE" worktree prune
+
 for spec in "billing:agent/billing" "gateway:agent/gateway" "integrator:agent/integration"; do
   name="${spec%%:*}"; branch="${spec##*:}"
   path="$WORK_DIR/$name"
