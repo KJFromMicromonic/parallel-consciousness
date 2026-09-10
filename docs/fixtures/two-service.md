@@ -8,6 +8,13 @@ It is a separate Go module so the parent project's `go build ./...`,
 `go vet ./...` and `go test ./...` do not see it. Agents mutate it freely
 during a run; nothing here is project source.
 
+This document lives outside `fixtures/two-service/` on purpose: `live-run.sh`
+checks out the fixture into each agent's own worktree, so anything committed
+inside it is agent-visible source, not just maintainer reading material. An
+earlier version of this file lived at `fixtures/two-service/README.md` and
+was excluded by name from the constraint-2 test below — the wrong fix, since
+an agent reads its own worktree's README same as any other file.
+
 ## The gate command
 
     EXPECTED_CURRENCY=USD go test ./integration/...

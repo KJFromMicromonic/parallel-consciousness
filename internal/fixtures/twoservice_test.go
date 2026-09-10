@@ -27,6 +27,12 @@ func fixtureRoot(t *testing.T) string {
 
 // copyTree copies src to dst so a test can run the fixture's own suite without
 // mutating the committed copy.
+//
+// It skips .git: that directory is machine state a live run's `git init` /
+// `git worktree add` leaves behind, not fixture content, and copying an
+// entire repository (including worktree admin files) into a temp dir for
+// every test run is both wasted work and a source of permission-bit and
+// worktree-link surprises neither test here cares about.
 func copyTree(t *testing.T, src, dst string) {
 	t.Helper()
 	err := filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
@@ -36,6 +42,9 @@ func copyTree(t *testing.T, src, dst string) {
 		rel, err := filepath.Rel(src, path)
 		if err != nil {
 			return err
+		}
+		if rel == ".git" {
+			return filepath.SkipDir
 		}
 		target := filepath.Join(dst, rel)
 		if info.IsDir() {
@@ -122,14 +131,30 @@ func TestFixtureHalvesCompileIndependently(t *testing.T) {
 // Constraint 2: the agreed value must be undiscoverable from either worktree.
 // A model that can read USD out of the fixture fixes the code first try, and
 // the failure branch — the interesting one — is never reached.
+//
+// This walk has exactly one exclusion: .git, and for the opposite reason a
+// content exclusion would have one. .git under the fixture root is machine
+// state a live run's `git init` / `git worktree add` leaves behind — reflogs
+// and COMMIT_EDITMSG containing agents' own commit subjects — not something
+// an agent is meant to read. Skipping it makes this walk cover MORE of what
+// actually matters, not less. That is the opposite of the README.md
+// exclusion this test used to carry: README.md is checked out into every
+// agent's own worktree by live-run.sh, so it is exactly the kind of
+// agent-visible content this test exists to catch, and excluding it by name
+// was wrong. The fixture's maintainer documentation now lives outside the
+// fixture module, at docs/fixtures/two-service.md, so there is nothing left
+// to exempt.
 func TestFixtureDoesNotContainTheAgreedValue(t *testing.T) {
 	root := fixtureRoot(t)
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
+		if err != nil {
 			return err
 		}
-		if filepath.Base(path) == "README.md" {
-			return nil // maintainer documentation, not agent-visible source
+		if info.IsDir() {
+			if info.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		b, readErr := os.ReadFile(path)
 		if readErr != nil {
