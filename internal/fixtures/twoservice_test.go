@@ -1,0 +1,134 @@
+package fixtures_test
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// fixtureRoot is the committed fixture. It is a separate Go module, so nothing
+// in the parent module's ./... ever compiles or runs it — which is exactly why
+// it needs a test here: an artifact excluded from the build surface rots
+// silently, and a fixture that has rotted into a PASSING state is worse than a
+// missing one, because a live run then proves nothing while appearing to work.
+func fixtureRoot(t *testing.T) string {
+	t.Helper()
+	root, err := filepath.Abs(filepath.Join("..", "..", "fixtures", "two-service"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "go.mod")); err != nil {
+		t.Fatalf("fixture module not found at %s: %v", root, err)
+	}
+	return root
+}
+
+// copyTree copies src to dst so a test can run the fixture's own suite without
+// mutating the committed copy.
+func copyTree(t *testing.T, src, dst string) {
+	t.Helper()
+	err := filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(target, b, info.Mode())
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Constraint 3, and the fixture's whole purpose: the baseline must FAIL under
+// the gate command. If this ever passes, round one of a live run succeeds
+// immediately, the failure-detail path is never exercised, and the
+// demonstration silently stops demonstrating anything.
+func TestFixtureBaselineFailsUnderTheGateCommand(t *testing.T) {
+	dst := t.TempDir()
+	copyTree(t, fixtureRoot(t), dst)
+
+	cmd := exec.Command("go", "test", "./integration/...")
+	cmd.Dir = dst
+	cmd.Env = append(os.Environ(), "EXPECTED_CURRENCY=USD")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("fixture baseline PASSED under EXPECTED_CURRENCY=USD; round one of a live run would succeed immediately and the failure-detail path would never be exercised:\n%s", out)
+	}
+	if !strings.Contains(string(out), "EUR") {
+		t.Errorf("baseline failed, but the failure detail does not mention the wrong value it found; an agent learns the right value from this text:\n%s", out)
+	}
+	if !strings.Contains(string(out), "USD") {
+		t.Errorf("baseline failed, but the failure detail does not name the wanted value; that text is the ONLY channel through which an agent can learn a value absent from its worktree:\n%s", out)
+	}
+}
+
+// Constraint 4: without the variable the spanning test skips, so an agent
+// running the suite in its own worktree is not misled into thinking it broke
+// something.
+func TestFixtureSpanningTestSkipsWithoutTheVariable(t *testing.T) {
+	dst := t.TempDir()
+	copyTree(t, fixtureRoot(t), dst)
+
+	cmd := exec.Command("go", "test", "./integration/...")
+	cmd.Dir = dst
+	// Explicitly cleared rather than merely unset in this process's env.
+	cmd.Env = append(os.Environ(), "EXPECTED_CURRENCY=")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("spanning test did not pass-by-skipping with no EXPECTED_CURRENCY; an agent running the suite locally would think it had broken something:\n%s", out)
+	}
+}
+
+// Constraint 1: each half builds alone. If one service cannot compile without
+// the other's change, the two agents deadlock instead of coordinating — which
+// is what an earlier arrangement of this fixture actually caused.
+func TestFixtureHalvesCompileIndependently(t *testing.T) {
+	root := fixtureRoot(t)
+	for _, pkg := range []string{"./billing/...", "./gateway/..."} {
+		cmd := exec.Command("go", "build", pkg)
+		cmd.Dir = root
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Errorf("go build %s failed, so this half cannot compile alone:\n%s", pkg, out)
+		}
+	}
+}
+
+// Constraint 2: the agreed value must be undiscoverable from either worktree.
+// A model that can read USD out of the fixture fixes the code first try, and
+// the failure branch — the interesting one — is never reached.
+func TestFixtureDoesNotContainTheAgreedValue(t *testing.T) {
+	root := fixtureRoot(t)
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return err
+		}
+		if filepath.Base(path) == "README.md" {
+			return nil // maintainer documentation, not agent-visible source
+		}
+		b, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		if strings.Contains(string(b), "USD") {
+			rel, _ := filepath.Rel(root, path)
+			t.Errorf("%s contains the agreed value: an agent can read it instead of learning it from a failing gate", rel)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
