@@ -93,6 +93,15 @@ say "resetting the fixture"
 # git repository so a run never touches project source; initialise it once.
 if [ ! -d "$FIXTURE/.git" ]; then
   git -C "$FIXTURE" init -q
+  # Pin the branch to main before the first commit rather than relying on
+  # init.defaultBranch, which is unset on plenty of machines (this one
+  # included) and falls back to `master`. mergeAll in
+  # internal/pcops/rungate.go hardcodes `git reset --hard -q main` in the
+  # runner's worktree, so an unpinned branch name fails every round on an
+  # unknown-revision git error that has nothing to do with the agents' work.
+  # symbolic-ref works on every git version (unlike `init -b`, which needs
+  # >= 2.28), and this script has no other git-version floor to lean on.
+  git -C "$FIXTURE" symbolic-ref HEAD refs/heads/main
   git -C "$FIXTURE" add -A
   git -C "$FIXTURE" -c user.email=live-run@local -c user.name=live-run commit -qm "fixture baseline"
 fi
