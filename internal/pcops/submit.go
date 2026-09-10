@@ -7,7 +7,6 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/KJFromMicromonic/parallel-consciousness/pkg/agent"
@@ -48,7 +47,7 @@ const AckTimeout = 10 * time.Second
 // agent name. Any tool that can run a shell command can participate.
 func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) (gate.Verdict, error) {
 	// The headline correctness guard this branch exists to deliver is
-	// versions[agentName] != version below. versionsFromBody returns "" for
+	// versions[agentName] != version below. protocol.Versions returns "" for
 	// a participant absent from a verdict's Versions map, so an empty
 	// version here would compare "" against "" and PASS that guard for a
 	// verdict that never tested this agent at all. `pc submit` cannot reach
@@ -79,39 +78,8 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 		return gate.Verdict{}, fmt.Errorf("join as %q: %w", agentName, err)
 	}
 
-	// readyAt is set immediately before each gate.Ready below and fences off
-	// every verdict from a previous round. The gate id plus a `passed` bool
-	// does not identify a round, and pkg/bus/sqlite resumes a subscription
-	// from the STORED cursor whenever a row exists for this agent name — so
-	// an earlier round's Inform can still be sitting unread in the log and
-	// would be returned instantly as this round's answer. Two paths reach
-	// that state: a PASSING verdict routes no blocks, so nothing advances the
-	// courier past its Inform; and an agent with no in-process courier only
-	// ever has short-lived submit processes, whose `defer b.Close()` makes
-	// the poller skip saveCursor entirely. protocol.New stamps Timestamp, so
-	// the round boundary is simply time.
-	//
-	// readyAt must be race-safe: the attempt loop below re-declares readiness
-	// (and so re-assigns readyAt) on every retry after a Nack, from the same
-	// goroutine that calls Submit, while the IntentInform handler reads it
-	// from the agent's own dispatch goroutine. A bare variable written once
-	// before go a.Run(ctx) was safe by construction (the goroutine start is
-	// itself a happens-before edge); re-assigning it per attempt after that
-	// point is a data race without a mutex.
-	var (
-		readyMu sync.Mutex
-		readyAt time.Time
-	)
-	readAt := func() time.Time { readyMu.Lock(); defer readyMu.Unlock(); return readyAt }
-	setReadyAt := func(t time.Time) { readyMu.Lock(); readyAt = t; readyMu.Unlock() }
+	w := newSubmitWaiter()
 
-	// declined fires when a verdict for this gate arrives that did NOT test
-	// this agent's version. After a Nack, that is exactly the proof the
-	// in-flight round that displaced our readiness has resolved — which is
-	// when re-declaring readiness can succeed.
-	declined := make(chan struct{}, 1)
-
-	verdicts := make(chan gate.Verdict, 1)
 	a.On(protocol.IntentInform, func(_ context.Context, _ *agent.Agent, m protocol.Message) *protocol.Message {
 		if id, _ := m.Body["gate"].(string); id != gateID {
 			return nil
@@ -120,7 +88,7 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 		if !ok {
 			return nil // not a verdict broadcast
 		}
-		if m.Timestamp.Before(readAt()) {
+		if !w.fresh(m) {
 			return nil // a previous round's verdict, replayed from the cursor
 		}
 		// A gate id and a passed bool do not identify a round. Accept a verdict
@@ -128,16 +96,13 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 		// pkg/gate drops a readiness that arrives while a round is already in
 		// flight, so without this guard an agent would accept the in-flight
 		// round's verdict — computed entirely without its version.
-		versions := versionsFromBody(m.Body["versions"])
+		versions := protocol.Versions(m.Body["versions"])
 		if versions[agentName] != version {
 			// This verdict resolved the in-flight round that displaced our own
 			// readiness (see the Nack handler below) — it is proof that round
 			// is done, which is exactly what waitForRoundToResolve is waiting
 			// for, so a re-declared readiness can now succeed.
-			select {
-			case declined <- struct{}{}:
-			default:
-			}
+			w.offerDeclined()
 			return nil
 		}
 		// The broadcast carries one "text" line for both outcomes ("<gate>
@@ -147,42 +112,22 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 		if !passed {
 			detail, _ = m.Body["text"].(string)
 		}
-		select {
-		case verdicts <- gate.Verdict{GateID: gateID, Passed: passed, Detail: detail, Versions: versions}:
-		default:
-		}
+		w.offerVerdict(gate.Verdict{GateID: gateID, Passed: passed, Detail: detail, Versions: versions})
 		return nil
 	})
 	// acked carries the coordinator's IntentAck for THIS gate, decoded to the
 	// required participants it is still waiting on. See gate.go's onReady:
 	// every readiness it records gets one of these back, which is F4's whole
 	// fix — a blocked submit gets a prompt, positive signal instead of total
-	// silence. Buffered 1 like verdicts, for the same reason: the handler
-	// must never block the agent's dispatch loop on a send nobody is
-	// reading yet.
-	acked := make(chan []string, 1)
+	// silence.
 	a.On(protocol.IntentAck, func(_ context.Context, _ *agent.Agent, m protocol.Message) *protocol.Message {
 		if id, _ := m.Body["gate"].(string); id != gateID {
 			return nil
 		}
-		// An Ack is a direct reply, exactly like the Nack below, so it sits on
-		// the same replay path the Inform handler guards against above: a
-		// submit process that was killed after being acked (or nacked) but
-		// before exiting cleanly leaves that reply sitting unread, and
-		// pkg/bus/sqlite resumes the next submit under this agent name from
-		// the stored cursor, handing it straight back as if it were fresh. An
-		// unfenced stale Ack here would satisfy the acknowledgement wait for a
-		// round that already ended, then block on the verdict wait until ctx
-		// expires — the same ErrNoVerdict-instead-of-ErrNotAcknowledged
-		// misdiagnosis Ruling 1 exists to prevent, just arriving from this
-		// handler instead of the timer.
-		if m.Timestamp.Before(readAt()) {
+		if !w.fresh(m) {
 			return nil // a previous round's ack, replayed from the cursor
 		}
-		select {
-		case acked <- outstandingFromBody(m.Body["outstanding"]):
-		default:
-		}
+		w.offerAck(protocol.Strings(m.Body["outstanding"]))
 		return nil
 	})
 	// nacked carries the coordinator's IntentNack: this readiness was dropped
@@ -190,28 +135,14 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 	// testing instead. IntentNack for the same reason as IntentAck — the
 	// courier registers no handler for it, so it reaches this subscription
 	// and is never forwarded into a live agent session.
-	nacked := make(chan map[string]string, 1)
 	a.On(protocol.IntentNack, func(_ context.Context, _ *agent.Agent, m protocol.Message) *protocol.Message {
 		if id, _ := m.Body["gate"].(string); id != gateID {
 			return nil
 		}
-		// A Nack is a direct reply too, so it is just as exposed to a lagging
-		// cursor as the Inform and Ack handlers: a submit killed right after
-		// being nacked (F2 measured models doing exactly this) leaves the
-		// Nack unread, and the next submit under this agent name is handed it
-		// back as its first message. Without this fence that stale Nack would
-		// print a false "gate is mid-round" line and enter
-		// waitForRoundToResolve for a round that is not this attempt's round
-		// at all — and that wait has no AckTimeout bound, so with no
-		// coordinator left to signal declined it would block the full
-		// SubmitTimeout instead of failing fast with ErrNotAcknowledged.
-		if m.Timestamp.Before(readAt()) {
+		if !w.fresh(m) {
 			return nil // a previous round's nack, replayed from the cursor
 		}
-		select {
-		case nacked <- versionsFromBody(m.Body["testing"]):
-		default:
-		}
+		w.offerNack(protocol.Versions(m.Body["testing"]))
 		return nil
 	})
 	go a.Run(ctx)
@@ -224,31 +155,8 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 	// codes meaningful instead of adding a fourth outcome for an agent to
 	// mishandle.
 	for {
-		setReadyAt(time.Now())
-		// declined, acked and nacked are all cross-attempt state: any of the
-		// three can hold a stale signal from a previous attempt's reply,
-		// buffered here (capacity 1) before this attempt's own Ready is even
-		// declared. TestSubmitDeclinesAVerdictThatDidNotIncludeIt is exactly
-		// this for declined: a foreign-version verdict can leave a stale
-		// signal sitting here long before any Nack exists. The three
-		// handlers apply the readAt() fence uniformly against replay from
-		// the cursor, but a fence on arrival does not drain what an earlier
-		// attempt already buffered — so drain all three before declaring a
-		// fresh Ready, not just declined.
-		select {
-		case <-declined:
-		default:
-		}
-		select {
-		case <-acked:
-		default:
-		}
-		select {
-		case <-nacked:
-		default:
-		}
-		if err := gate.Ready(ctx, a, gateID, version); err != nil {
-			return gate.Verdict{}, fmt.Errorf("declare ready: %w", err)
+		if err := w.declareReady(ctx, a, gateID, version); err != nil {
+			return gate.Verdict{}, err
 		}
 
 		// First wait for the acknowledgement — bounded by AckTimeout, not the
@@ -260,7 +168,7 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 		// for it. Treating "verdict arrived" as "acknowledged" is what keeps
 		// that path from regressing into a spurious ErrNotAcknowledged.
 		select {
-		case outstanding := <-acked:
+		case outstanding := <-w.acked:
 			if len(outstanding) > 0 {
 				// Surfaced directly here, not threaded back through the return
 				// value: Submit's signature is a fixed public contract (just a
@@ -272,10 +180,10 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 				fmt.Fprintf(os.Stderr, "pc submit: gate %q acknowledged; still waiting on %s\n",
 					gateID, strings.Join(outstanding, ", "))
 			}
-		case testing := <-nacked:
+		case testing := <-w.nacked:
 			fmt.Fprintf(os.Stderr, "pc submit: gate %q is mid-round (testing %s); waiting for it to finish\n",
 				gateID, describeVersions(testing))
-			res := waitForRoundToResolve(ctx, declined, verdicts)
+			res := w.waitForRoundToResolve(ctx)
 			if !res.resolved {
 				return gate.Verdict{}, ErrNoVerdict
 			}
@@ -283,7 +191,7 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 				return res.verdict, nil
 			}
 			continue
-		case v := <-verdicts:
+		case v := <-w.verdicts:
 			return v, nil
 		case <-time.After(AckTimeout):
 			return gate.Verdict{}, fmt.Errorf("gate %q: %w", gateID, ErrNotAcknowledged)
@@ -293,7 +201,7 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 
 		// Acknowledged: wait for the verdict that tested this version.
 		select {
-		case v := <-verdicts:
+		case v := <-w.verdicts:
 			return v, nil
 		// A Nack arriving here, for an attempt that was already acked, looks
 		// impossible from onReady's logic alone: it answers one Ready with
@@ -303,16 +211,16 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 		// are not this code's assumption to make. Two live paths reach here
 		// regardless: a stale Nack replayed from a lagging cursor (the fence
 		// above rejects a stale nack for THIS agent's own earlier attempt,
-		// but not one whose timestamp happens to postdate readAt() while
-		// still answering a round this attempt no longer cares about); and
-		// two coordinators on one database, since nothing prevents a second
-		// `pc up` from also joining as "coordinator" — both subscribe to the
-		// same topic and share one cursor row, and either can answer the same
-		// Ready differently. Keep this arm.
-		case testing := <-nacked:
+		// but not one whose timestamp happens to postdate the round boundary
+		// while still answering a round this attempt no longer cares about);
+		// and two coordinators on one database, since nothing prevents a
+		// second `pc up` from also joining as "coordinator" — both subscribe
+		// to the same topic and share one cursor row, and either can answer
+		// the same Ready differently. Keep this arm.
+		case testing := <-w.nacked:
 			fmt.Fprintf(os.Stderr, "pc submit: gate %q is mid-round (testing %s); waiting for it to finish\n",
 				gateID, describeVersions(testing))
-			res := waitForRoundToResolve(ctx, declined, verdicts)
+			res := w.waitForRoundToResolve(ctx)
 			if !res.resolved {
 				return gate.Verdict{}, ErrNoVerdict
 			}
@@ -323,43 +231,6 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 		case <-ctx.Done():
 			return gate.Verdict{}, ErrNoVerdict
 		}
-	}
-}
-
-// roundResolution reports how waitForRoundToResolve concluded. resolved is
-// false only when ctx ended before the in-flight round did. hasVerdict is
-// set when the round resolved WITH a verdict that answers this attempt
-// directly (the race-won case below) — the caller must return it as-is
-// rather than looping back to re-declare readiness, which would publish a
-// second, spurious gate.Ready at a version the round already resolved.
-type roundResolution struct {
-	verdict    gate.Verdict
-	hasVerdict bool
-	resolved   bool
-}
-
-// waitForRoundToResolve blocks until the in-flight round that displaced our
-// readiness has resolved. Two things can report that: declined, signalled by
-// a verdict for this gate that did not test our version (proof the round is
-// done, with nothing further to hand back); or verdicts, when the verdict
-// that resolves the round happens to be OUR OWN — a race this attempt wins
-// outright, since there is nothing left to wait for. Unlike an earlier
-// version of this function, that verdict is returned to the caller rather
-// than re-buffered into verdicts and left for the loop to pick up on its next
-// iteration: re-declaring readiness after a verdict already answered this
-// attempt would publish a redundant gate.Ready at the same version, and in
-// gate.go that hits the F2 cache and replays another resolve — another
-// broadcast, another block fanout on failure, another OnVerdict, and (via
-// pcops.Run's round counter) a run that can be failed a round early by a
-// purely spurious cache replay.
-func waitForRoundToResolve(ctx context.Context, declined <-chan struct{}, verdicts chan gate.Verdict) roundResolution {
-	select {
-	case <-declined:
-		return roundResolution{resolved: true}
-	case v := <-verdicts:
-		return roundResolution{verdict: v, hasVerdict: true, resolved: true}
-	case <-ctx.Done():
-		return roundResolution{}
 	}
 }
 
@@ -375,26 +246,4 @@ func describeVersions(vs map[string]string) string {
 	}
 	sort.Strings(parts)
 	return strings.Join(parts, ", ")
-}
-
-// outstandingFromBody coerces a wire "outstanding" value into []string,
-// accepting both the in-memory []string (pkg/gate builds it that way
-// directly, and the in-memory bus passes values through unchanged) and a
-// JSON []any (what pkg/bus/sqlite delivers after a round trip through the
-// database). Mirrors gate.go's versionsFromBody for the same reason.
-func outstandingFromBody(v any) []string {
-	switch vv := v.(type) {
-	case []string:
-		return vv
-	case []any:
-		out := make([]string, 0, len(vv))
-		for _, e := range vv {
-			if s, ok := e.(string); ok {
-				out = append(out, s)
-			}
-		}
-		return out
-	default:
-		return nil
-	}
 }

@@ -3,6 +3,7 @@ package pcops_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -96,8 +97,8 @@ func TestLoadConfig(t *testing.T) {
 	if cfg.Wall != 15*time.Minute {
 		t.Errorf("Wall = %v", cfg.Wall)
 	}
-	if cfg.SubmitTimeout != 5*time.Minute {
-		t.Errorf("SubmitTimeout default = %v, want 5m", cfg.SubmitTimeout)
+	if cfg.SubmitTimeout != 12*time.Minute {
+		t.Errorf("SubmitTimeout default = %v, want 12m", cfg.SubmitTimeout)
 	}
 }
 
@@ -143,5 +144,163 @@ run: go test ./integration/...
 func TestMissingDBIsAnError(t *testing.T) {
 	if _, err := pcops.LoadConfig(writeConfig(t, "gate:\n  id: g\n")); err == nil {
 		t.Fatal("want an error when no db is configured")
+	}
+}
+
+// One table, one invalid shape per row, each mapping to a specific error. A
+// mismatch here used to produce a silent hang to the wall budget: pc up would
+// start, no readiness would ever satisfy a gate that named a participant not
+// in agents, and an operator would wait out the whole scenario to learn it.
+func TestLoadConfigRejectsIncoherentScenarios(t *testing.T) {
+	const valid = `
+repo: /tmp/repo
+db: /tmp/bus.db
+gate:
+  id: currency
+  required: [billing]
+  runner: integrator
+  run: "go test ./integration/..."
+agents:
+  - name: billing
+    branch: agent/billing
+runner:
+  name: integrator
+  branch: agent/integration
+budget:
+  wall: 10m
+  submit_timeout: 12m
+  runner_timeout: 10m
+`
+	for _, tc := range []struct {
+		name    string
+		mutate  func(string) string
+		wantErr string
+	}{
+		{
+			"gate id empty",
+			func(s string) string { return strings.Replace(s, "  id: currency", `  id: ""`, 1) },
+			"gate.id",
+		},
+		{
+			"required names an agent that does not exist",
+			func(s string) string { return strings.Replace(s, "required: [billing]", "required: [nosuch]", 1) },
+			"gate.required",
+		},
+		{
+			"runner does not match runner.name",
+			func(s string) string { return strings.Replace(s, "runner: integrator", "runner: nosuch", 1) },
+			"gate.runner",
+		},
+		{
+			"duplicate agent name",
+			func(s string) string {
+				return strings.Replace(s, "  - name: billing\n    branch: agent/billing",
+					"  - name: billing\n    branch: agent/billing\n  - name: billing\n    branch: agent/other", 1)
+			},
+			"duplicate agent name",
+		},
+		{
+			"duplicate branch",
+			func(s string) string {
+				return strings.Replace(s, "  - name: billing\n    branch: agent/billing",
+					"  - name: billing\n    branch: agent/billing\n  - name: gateway\n    branch: agent/billing", 1)
+			},
+			"duplicate branch",
+		},
+		{
+			"runner reuses an agent's branch",
+			func(s string) string {
+				return strings.Replace(s, "  branch: agent/integration", "  branch: agent/billing", 1)
+			},
+			"duplicate branch",
+		},
+		{
+			"submit timeout below runner timeout",
+			func(s string) string { return strings.Replace(s, "submit_timeout: 12m", "submit_timeout: 5m", 1) },
+			"budget.submit_timeout",
+		},
+		{
+			// The boundary itself: equal budgets are genuinely unusable, not
+			// merely under-tested — a submit's own context expires at the
+			// exact instant the round it is waiting for does, so it can never
+			// observe that round's verdict. A `<` typo in place of `<=` in
+			// validate() would pass every other row in this table while still
+			// claiming "must exceed" in its error text; only an equal-budgets
+			// row catches that.
+			"submit timeout equals runner timeout",
+			func(s string) string {
+				return strings.Replace(s, "submit_timeout: 12m", "submit_timeout: 10m", 1)
+			},
+			"budget.submit_timeout",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "pc.yaml")
+			if err := os.WriteFile(path, []byte(tc.mutate(valid)), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := pcops.LoadConfig(path)
+			if err == nil {
+				t.Fatalf("LoadConfig accepted an invalid scenario (%s)", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("LoadConfig error = %q, want it to name %q so an operator knows which key to fix", err, tc.wantErr)
+			}
+		})
+	}
+
+	// The control: the unmutated document must load, or every row above
+	// could be passing for the wrong reason.
+	path := filepath.Join(t.TempDir(), "pc.yaml")
+	if err := os.WriteFile(path, []byte(valid), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := pcops.LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig rejected the valid control document: %v", err)
+	}
+	if cfg.RunnerTimeout != 10*time.Minute {
+		t.Errorf("RunnerTimeout = %v, want 10m from budget.runner_timeout", cfg.RunnerTimeout)
+	}
+	if cfg.SubmitTimeout != 12*time.Minute {
+		t.Errorf("SubmitTimeout = %v, want 12m", cfg.SubmitTimeout)
+	}
+}
+
+// Both budgets must have working defaults, because a scenario file is allowed
+// to omit the whole budget block — and the defaults must not be the inverted
+// pair that made the Nack retry unusable.
+func TestLoadConfigDefaultsLeaveTheRetryUsable(t *testing.T) {
+	const minimal = `
+repo: /tmp/repo
+db: /tmp/bus.db
+gate:
+  id: currency
+  required: [billing]
+  runner: integrator
+  run: "go test ./integration/..."
+agents:
+  - name: billing
+    branch: agent/billing
+runner:
+  name: integrator
+  branch: agent/integration
+`
+	path := filepath.Join(t.TempDir(), "pc.yaml")
+	if err := os.WriteFile(path, []byte(minimal), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := pcops.LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.RunnerTimeout <= 0 {
+		t.Fatalf("RunnerTimeout = %v, want a working default", cfg.RunnerTimeout)
+	}
+	// The whole point: a submit nacked by a long round has to be able to
+	// outlast that round, or the retry it was built for cannot complete.
+	if cfg.SubmitTimeout <= cfg.RunnerTimeout {
+		t.Fatalf("default SubmitTimeout %v <= default RunnerTimeout %v: a nacked submit exhausts its own context before the round it waits for can finish",
+			cfg.SubmitTimeout, cfg.RunnerTimeout)
 	}
 }

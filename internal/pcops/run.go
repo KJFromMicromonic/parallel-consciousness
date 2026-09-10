@@ -44,7 +44,14 @@ var ErrSessionDied = errors.New("pcops: agent session ended before a verdict")
 // Continuing would mean working in a directory the run no longer owns, so it
 // stops and reports which agent's lease was lost — the same attributed-failure
 // shape as ErrSessionDied.
-var ErrLeaseLost = errors.New("pcops: lease lost to another holder")
+//
+// It WRAPS workspace.ErrLeaseLost deliberately, rather than being a second
+// sentinel with the same name. pkg/workspace documents its own ErrLeaseLost as
+// the only way a holder learns it was reclaimed, so that is the name a caller
+// already has; two identically named sentinels in adjacent packages, with the
+// outer one not reachable through the inner, is a trap rather than a taxonomy.
+// One identity: errors.Is matches either name.
+var ErrLeaseLost = fmt.Errorf("pcops: lease lost to another holder: %w", workspace.ErrLeaseLost)
 
 // sessionFailure carries a terminal session event out of the drainer, with the
 // PC-assigned agent name attached so the run can name who died. The name comes
@@ -54,6 +61,16 @@ type sessionFailure struct {
 	agent string
 	kind  runtime.EventKind
 	err   string
+}
+
+// leaseLoss carries a fenced lease out of its heartbeat goroutine: the
+// PC-assigned agent name so the run can say who lost the workspace, and the
+// error the heartbeat actually saw, which names the worktree path. Mirrors
+// sessionFailure above, for the same reason — an attributed failure needs both
+// the identity and the cause.
+type leaseLoss struct {
+	agent string
+	err   error
 }
 
 // Run executes one scenario: lease a workspace per participant, launch each
@@ -90,7 +107,7 @@ func Run(ctx context.Context, cfg Config, r runtime.Runtime) (gate.Verdict, erro
 	// Buffered to hold one loss per lease this run could ever hold (the
 	// runner's plus one per agent) so a fenced heartbeat goroutine's
 	// non-blocking send never has to be discarded.
-	lost := make(chan string, 1+len(cfg.Agents))
+	lost := make(chan leaseLoss, 1+len(cfg.Agents))
 
 	verdicts := make(chan gate.Verdict, 4)
 	cstop, err := StartCoordinator(ctx, cfg, func(v gate.Verdict) {
@@ -209,12 +226,15 @@ func Run(ctx context.Context, cfg Config, r runtime.Runtime) (gate.Verdict, erro
 			}
 			return gate.Verdict{GateID: cfg.GateID},
 				fmt.Errorf("agent %q reported %s: %w", f.agent, f.kind, ErrSessionDied)
-		case agentName := <-lost:
+		case l := <-lost:
 			// Not transient: another holder now owns this workspace.
 			// Continuing would mean working in a directory this run no
 			// longer owns, so stop and attribute the failure the same
-			// way ErrSessionDied does.
-			return gate.Verdict{GateID: cfg.GateID}, fmt.Errorf("%w: %s", ErrLeaseLost, agentName)
+			// way ErrSessionDied does. ErrLeaseLost already wraps
+			// workspace.ErrLeaseLost, so both names match; l.err is
+			// included because it is what names the worktree path.
+			return gate.Verdict{GateID: cfg.GateID},
+				fmt.Errorf("agent %q: %w (%v)", l.agent, ErrLeaseLost, l.err)
 		case <-ctx.Done():
 			return gate.Verdict{GateID: cfg.GateID}, fmt.Errorf("scenario budget exhausted: %w", ctx.Err())
 		}
@@ -252,7 +272,7 @@ func drainEvents(agent string, s runtime.Session, failures chan<- sessionFailure
 // ends it. The returned func must be deferred AFTER (so it runs BEFORE, since
 // defers are LIFO) the lease's own Release, so the heartbeat goroutine is
 // guaranteed to have stopped issuing renewals before the lease row is deleted.
-func startHeartbeat(ctx context.Context, l *workspace.Lease, lost chan<- string) (stop func()) {
+func startHeartbeat(ctx context.Context, l *workspace.Lease, lost chan<- leaseLoss) (stop func()) {
 	hctx, cancel := context.WithCancel(ctx)
 	go heartbeatLease(hctx, l, lost)
 	return cancel
@@ -276,7 +296,7 @@ func startHeartbeat(ctx context.Context, l *workspace.Lease, lost chan<- string)
 // either holder. That reattach-on-match behaviour is deliberate (it is how
 // crash recovery works), which is exactly why a holder that is genuinely
 // still alive must keep renewing for as long as it holds the lease.
-func heartbeatLease(ctx context.Context, l *workspace.Lease, lost chan<- string) {
+func heartbeatLease(ctx context.Context, l *workspace.Lease, lost chan<- leaseLoss) {
 	t := time.NewTicker(heartbeatInterval)
 	defer t.Stop()
 	for {
@@ -288,9 +308,12 @@ func heartbeatLease(ctx context.Context, l *workspace.Lease, lost chan<- string)
 				if errors.Is(err, workspace.ErrLeaseLost) {
 					// Not transient: another holder owns this workspace
 					// now. Stop heartbeating a lease we do not hold, and
-					// tell Run.
+					// tell Run — with the error, not just the name: it
+					// carries the worktree path and any SQL context, and
+					// that is the detail that says which directory was
+					// lost.
 					select {
-					case lost <- l.Agent:
+					case lost <- leaseLoss{agent: l.Agent, err: err}:
 					default:
 					}
 					return

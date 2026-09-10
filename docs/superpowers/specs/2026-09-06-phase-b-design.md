@@ -413,6 +413,13 @@ see what a verdict carries.
 
 ## Open questions
 
+> **Answered.** All three were resolved on 2026-09-09; see the Part 2 addendum
+> at the end of this document. Summarised: no `pc watch` summary mode, no Codex
+> recipe in this phase, and the contract snippet stays a file recipes point at.
+> They are left here as written because the reasoning that resolved them is
+> only legible against the question.
+
+
 - Whether `pc watch` should learn a compact summary mode (current round, who the
   gate waits on) before a web dashboard exists, or whether the feed suffices.
 - Whether the contract snippet should eventually ship as an installable pi
@@ -420,3 +427,300 @@ see what a verdict carries.
 - Whether Codex should be added as a third verified harness during this phase or
   left to Phase C; adding it means driving it end to end first, since the
   principle is to claim only what has been verified.
+
+---
+
+# Part 2 addendum — resolved scope (2026-09-09)
+
+Part 1 shipped (`pc watch` plus the three correctness items) and is open as
+PR #4. This addendum records what part 2 actually contains: the open questions
+above are now answered, part 1's execution added items this spec never covered,
+and one thing this spec asserted turned out to be untrue.
+
+Everything under "The fixture", "Packaging" and "Testing" above carries forward
+unchanged and is not restated here. This section covers only what is new or
+decided.
+
+## The open questions, answered
+
+**`pc watch` summary mode: no.** The feed suffices for now. Every fact a summary
+would compute is already in the feed, and the right time to decide what an
+operator actually misses is after watching a real run — not before. Deferred
+without a scheduled home.
+
+**Codex as a third verified harness: no, deferred to Phase C.** The principle
+that recipes ship only for harnesses driven end to end is the reason: adding
+Codex means a full live run first, with its own harness quirks to discover, and
+part 2 cannot ship until that run succeeds. Two of the prior live runs each
+failed once for reasons outside the code entirely. Phase C is the adapter phase,
+so harness work clusters there. Part 2 ships recipes for pi and Claude Code and,
+for everything else, documents what a harness needs rather than claiming
+support.
+
+**Contract snippet as an installable package: unchanged, still deferred.** It
+ships as one file that recipes point at.
+
+## Correction to the "Packaging" section
+
+That section says validation "moves into `LoadConfig`, not just `init`, so every
+command fails fast", and lists the rules. That stands. But it implies the
+timeout budgets are already coherent, and they are not:
+
+`budget.submit_timeout` is a config field (`config.go:65`) defaulting to five
+minutes. The coordinator's runner timeout is **hardcoded** at ten minutes in
+`up.go:41` and is not reachable from a scenario file at all. So the shipped
+default pair is inverted: a submit nacked by a genuinely long round exhausts its
+own context before the round it is waiting for can finish, and returns
+`ErrNoVerdict`. Part 1 made that survivable — the submit now prints an
+explanatory line rather than sitting silent — but the retry it was built to
+enable cannot complete under the default configuration.
+
+Two numbers govern one interaction and only one of them is the operator's. The
+fix is to make both theirs:
+
+- Add `budget.runner_timeout`, defaulting to ten minutes, replacing the
+  hardcoded `SetRunnerTimeout` call.
+- Validate `submit_timeout > runner_timeout` as one of the table-driven
+  `LoadConfig` cases.
+
+This belongs in part 2 rather than a later phase because it is the same class as
+every other item in the validation work: configuration that produces a silent
+hang instead of an error. It also makes both budgets visible in the `.pc.yaml`
+that `pc init` scaffolds, which the "bound autonomy" principle wants — budgets
+explicit rather than buried in a composition root.
+
+The alternative considered was simply raising `DefaultSubmitTimeout` above ten
+minutes. Rejected: cheaper, but it leaves the runner timeout invisible and the
+relationship between the two undocumented, so the next reader hits the same
+puzzle with no way to see either number.
+
+## Three refactors this spec did not cover
+
+Part 1's reviews deferred four cleanup items with reasons recorded. Three are
+folded into part 2. The fourth — replacing three test poll loops with
+`Tail`-based waits — stays deferred; it is test-only and buys little.
+
+### Decode helpers belong in `pkg/protocol`
+
+A body value that has crossed the SQLite bus arrives as `map[string]any` or
+`[]any` after its JSON round trip and must be coerced back. There are three
+definitions of that one concern and eight call sites:
+
+- `pkg/gate/gate.go:469` defines `versionsFromBody`; used at `gate.go:62`.
+- `internal/pcops/watch.go:227` defines a byte-equivalent `versionsFromBody`;
+  used at `watch.go:59, 84, 97` and `submit.go:131, 212`.
+- `internal/pcops/submit.go:385` defines `outstandingFromBody`; used at
+  `submit.go:183` and `watch.go:72`.
+
+The two version decoders cannot share today because `internal/arch` forbids
+`pkg/` importing `internal/` — correctly, since `pkg/` is public API. But
+`pkg/protocol` imports only `time` and `uuid`, both packages already import it,
+and this is a wire-format concern, which is what `protocol` is for.
+
+New file `pkg/protocol/body.go`:
+
+```go
+// Versions coerces a wire participant→version map back to map[string]string.
+func Versions(v any) map[string]string
+// Strings coerces a wire string list back to []string.
+func Strings(v any) []string
+```
+
+All three local definitions are deleted and their table tests move. The
+JSON-asymmetry rationale is documented once instead of three times. This matters
+beyond tidiness: this branch alone added two producers of version maps, and a
+fourth decoder drifting from the other three is a silent wire-format bug.
+
+### `ErrLeaseLost` has two problems
+
+`pcops.ErrLeaseLost` shadows `workspace.ErrLeaseLost` by name while not being
+reachable through it, so `errors.Is(runErr, workspace.ErrLeaseLost)` is false —
+a trap for a caller reaching for the name they already know. Separately,
+`heartbeatLease` matches the workspace sentinel and then reports only
+`l.Agent`, discarding the wrapped chain that carries the worktree path and any
+SQL context.
+
+Fix both. Define the sentinel so it wraps, giving one error identity rather than
+two:
+
+```go
+var ErrLeaseLost = fmt.Errorf("pcops: lease lost to another holder: %w", workspace.ErrLeaseLost)
+```
+
+and change the loss channel from `chan<- string` to carry a small
+`leaseLoss{agent string; err error}`, mirroring the `sessionFailure` struct
+already at `run.go:53`, so the run's failure names the agent *and* preserves
+what the heartbeat saw.
+
+### `submitWaiter` — making two invariants structural
+
+`Submit` is 279 lines holding a mutex, two accessor closures, three message
+handlers, four channels, and an attempt loop with two selects. Three reviews
+walked it and none could construct a wrong outcome, so this is not a bug fix.
+It is a fix for how the correctness is *maintained*: two invariants are enforced
+by repetition, and each has already been got wrong once.
+
+1. **Fence every arriving message against the round boundary.** Three handlers
+   carry three byte-identical copies of
+   `if m.Timestamp.Before(readAt()) { return nil }`. The `IntentNack` handler
+   did not carry it — the whole-branch review's first Important finding — and a
+   stale replayed Nack sent `Submit` into the one wait with no `AckTimeout`
+   bound, turning a dead coordinator into five minutes of silence reported as
+   the wrong error class.
+2. **Drain cross-attempt state before declaring readiness.** Three
+   near-identical non-blocking drains. The first version drained one of three.
+
+One struct owns exactly the state the handlers and the loop share:
+
+```go
+// submitWaiter owns the state Submit's handlers and its attempt loop share:
+// the round boundary, and the channels the handlers signal on.
+type submitWaiter struct {
+	mu      sync.Mutex
+	readyAt time.Time
+
+	verdicts chan gate.Verdict      // buffered 1
+	acked    chan []string          // buffered 1
+	nacked   chan map[string]string // buffered 1
+	declined chan struct{}          // buffered 1
+}
+
+// fresh reports whether m belongs to the current attempt rather than being
+// replayed from the durable cursor. Every handler calls this.
+func (w *submitWaiter) fresh(m protocol.Message) bool
+
+// declareReady stamps a new round boundary, drains every cross-attempt
+// channel, and publishes readiness — in that order.
+func (w *submitWaiter) declareReady(ctx context.Context, a *agent.Agent, gateID, version string) error
+```
+
+**`declareReady` publishes rather than merely stamping, and that is the point of
+the design.** The current order — stamp, drain, publish — is load-bearing in a
+way three consecutive statements do not advertise:
+
+- Stamping before draining means any handler running after the stamp fences
+  correctly on arrival, and the drain clears only what was buffered before it.
+- Draining before publishing means no reply to *this* attempt can exist yet, so
+  the drain cannot discard a legitimate signal.
+
+Reverse either and a bug returns: drain-then-stamp leaves a window where a
+pre-stamp message survives in the buffer, and publish-then-drain throws away
+this attempt's own acknowledgement. Folding the publish inside the method makes
+the ordering unreachable from outside — the caller cannot get it wrong because
+it no longer has an order to get right.
+
+What stays out of the struct: the bus, the agent, the config, the gate id, the
+version. It owns the round boundary and the four channels, and nothing whose
+lifetime differs from those.
+
+**Testing.** No new behaviour, so the existing suite is the specification. All
+of these must pass unchanged: `TestSubmitDeclinesAVerdictThatDidNotIncludeIt`,
+`TestSubmitRedeclaresAfterNackAndReturnsTheReDeclaredVerdict`,
+`TestSubmitIgnoresAVerdictFromAPreviousRound`, and
+`TestSubmitRedundantResubmitAnsweredFromCacheDoesNotErrorAsUnacknowledged`. Two
+additions pin the invariants at the level they now live at: that `fresh` rejects
+a message stamped before the boundary and accepts one after, and that
+`declareReady` clears a pre-buffered signal on each of the four channels.
+
+**Residual risk, stated plainly.** This is a pure refactor of the branch's most
+delicate function; the only available outcomes are "unchanged" and "worse". The
+mitigation is that the tests constraining it are unusually strong — two were
+repaired from vacuous versions during part 1, and one asserts a *negative* (that
+`Submit` refuses to return while only a foreign-version verdict is available),
+which is exactly what a botched refactor trips. The plan must forbid touching
+any existing assertion in `submit_test.go`: a failure there is a signal to stop,
+not a test to adjust.
+
+## Four decisions taken while planning (2026-09-10)
+
+Repo facts that shaped them: there is no `fixtures/` directory, no `scripts/`,
+and no contract-snippet file. The live runs used a throwaway fixture that no
+longer exists, and the snippet lived only inside those sessions. Tasks 5, 6 and
+9 therefore build from scratch rather than formalising an existing artifact.
+
+**1. The contract snippet documents `pc send`.** The live-fire findings record
+that the snippet documented only `pc submit`, that `pc send` was "mentioned
+nowhere", and that agents nevertheless worked out they could message each other
+— three times, unprompted. That is the strongest evidence this project has that
+the protocol is legible rather than merely documented.
+
+Documenting `pc send` permanently forfeits observing that discovery again, since
+every future run is primed. It is still the right call: part 2's job is that
+someone else can install this, and withholding a working tool to preserve a
+research observation is the wrong trade once shipping. The observation is
+recorded and dated in the live-fire findings; it does not need to stay
+reproducible to stay true.
+
+**2. `scripts/live-run.sh` launches both agents itself**, backgrounded, one pi
+and one Claude Code, each with `< /dev/null`. Not a `--harness` flag, and not a
+script that prints two commands to paste. Two vendors side by side is the
+configuration the harness-agnostic claim actually rests on, and it is what was
+run. A script that only prints instructions cannot prevent either of the two
+non-code failures it exists to prevent — a stale binary silently under test, and
+a harness blocking on inherited stdin.
+
+**3. The README's "What exists today" section is restructured; the vision
+sections are left alone.** The problem, product-thesis and Loop Studio material
+remains accurate as intent. But that one section is a phase behind: it lists
+`pkg/protocol`, `pkg/bus`, `pkg/agent`, `pkg/gate` and the three demo binaries,
+and mentions `cmd/pc` zero times and `pc watch` zero times. The CLI is now the
+primary interface, and a README that omits it misleads exactly the design
+partners it is addressed to.
+
+**4. Part 2 builds on the unmerged part-1 branch.** Stacking runs three deep
+(#3 → #4 → part 2). Unavoidable: tasks 1-3 edit part 1's code directly, so they
+cannot sit on `main`.
+
+## Task order
+
+1. Decode helpers → `pkg/protocol`.
+2. `ErrLeaseLost` taxonomy + `leaseLoss` payload.
+3. `submitWaiter` extraction.
+4. `budget.runner_timeout` + table-driven `LoadConfig` validation.
+5. `fixtures/two-service` as its own module + the copy-to-temp baseline-fails test.
+6. Contract snippet + pi and Claude Code recipes.
+7. `pc init` + `--config` defaulting to `./.pc.yaml`.
+8. README.
+9. `scripts/live-run.sh`.
+
+**Refactors lead** because they are behaviour-free, so what catches a mistake is
+the existing suite — and that suite is at its most constraining exactly as part 1
+left it. Tasks 5-9 add a fixture module and an operator script and make the
+surface noisier. Do the invisible risky work while the net is tightest.
+
+Two hard ordering constraints: **4 precedes 7**, because `pc init`'s scaffold
+must include `budget.runner_timeout` or it ships a template omitting a field
+validation now requires; and **9 is last**, because `live-run.sh` drives the
+fixture and the recipes.
+
+Tasks 1, 2 and 4 are mechanical with enumerated values. Task 3 needs judgment.
+Tasks 5 and 6 are artifacts a human drives, and their correctness is "does a
+real agent do the right thing with this", which no unit test settles.
+
+## What part 2 proves, and what it does not
+
+The spec's own principle is to claim only what has been verified, so:
+
+- Tasks 1-4 and 7 are fully covered by automated tests, including one
+  table-driven case per invalid config shape and a `pc init` → `LoadConfig`
+  round trip rather than byte assertions.
+- Task 5's baseline-fails test is insurance against the fixture rotting into a
+  passing state. It does not prove the fixture teaches an agent anything.
+- Tasks 6, 8 and 9 are **not** verifiable by the suite. A recipe is correct when
+  a real harness ingests it and works; `live-run.sh` is an operator tool, not CI.
+
+**The plan's exit gate** is therefore: full suite green under `-race`, the usual
+`gofmt`/`vet`/`build`, and `live-run.sh`'s *pre-flight* checks passing against
+the real fixture — binary provenance and harness smoke test, the two failures
+that each cost a nine-minute run. The live run itself is a separate step taken
+after the branch is green, using the script. Folding a manual run into an
+automated gate would be the same overclaim this spec warns against everywhere
+else.
+
+## Still deferred after part 2
+
+- Replacing `waitForLogged`'s `History` polling and two other test poll loops
+  with `Tail`-based waits.
+- `pc watch` summary mode; the contract snippet as an installable package;
+  Codex as a verified harness.
+- Everything under "Known limitations after Phase B" above, unchanged.
