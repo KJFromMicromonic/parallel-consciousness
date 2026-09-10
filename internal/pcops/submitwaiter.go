@@ -30,7 +30,12 @@ import (
 // and the version. This owns the round boundary and the four channels, and
 // nothing whose lifetime differs from those.
 type submitWaiter struct {
-	mu      sync.Mutex
+	mu sync.Mutex
+	// readyAt is written once per attempt by declareReady, called from
+	// Submit's own goroutine, and read by fresh from the agent's dispatch
+	// goroutine — which is why this field is guarded by mu while the four
+	// channels below it are not: a channel is already safe for concurrent
+	// use without one.
 	readyAt time.Time
 
 	// All four are buffered 1 and all four are written by non-blocking sends:
@@ -71,18 +76,18 @@ func newSubmitWaiter() *submitWaiter {
 // were fresh. An unfenced stale Ack would satisfy the acknowledgement wait
 // for a round that already ended, then block on the verdict wait until ctx
 // expires — the same ErrNoVerdict-instead-of-ErrNotAcknowledged
-// misdiagnosis this fence exists to prevent elsewhere, just arriving from
-// the Ack handler instead of the timer.
+// misdiagnosis Ruling 1 exists to prevent, just arriving from the Ack
+// handler instead of the timer.
 //
 // A stale Nack is worse than a stale Ack: it is just as exposed to a lagging
 // cursor as the Inform and Ack cases above (a submit killed right after
-// being nacked leaves that Nack unread for the next submit under the same
-// name to receive as its first message), but an unfenced stale Nack would
-// print a false "gate is mid-round" line and enter waitForRoundToResolve for
-// a round that is not this attempt's round at all — and that wait has no
-// AckTimeout bound, so with no coordinator left to signal declined it would
-// block the full SubmitTimeout instead of failing fast with
-// ErrNotAcknowledged.
+// being nacked — F2 measured models doing exactly this — leaves that Nack
+// unread for the next submit under the same name to receive as its first
+// message), but an unfenced stale Nack would print a false "gate is
+// mid-round" line and enter waitForRoundToResolve for a round that is not
+// this attempt's round at all — and that wait has no AckTimeout bound, so
+// with no coordinator left to signal declined it would block the full
+// SubmitTimeout instead of failing fast with ErrNotAcknowledged.
 //
 // protocol.New stamps Timestamp, so the round boundary is simply time. Every
 // handler must call this — the whole point of the method is that a fourth
@@ -117,6 +122,20 @@ func (w *submitWaiter) stampReadyAt(t time.Time) {
 // The publish lives inside this method rather than beside its call site
 // precisely so that ordering is unreachable from outside: a caller cannot get
 // the order wrong because it no longer has an order to get right.
+//
+// Draining verdicts is a deliberate tightening beyond the three channels the
+// pre-refactor loop drained (declined, acked, nacked): every signal sitting
+// in verdicts at the instant of the stamp was necessarily published before
+// the new boundary, so this fourth drain makes that channel obey on
+// re-declaration exactly the rule fresh already applies to it on arrival.
+//
+// declined, acked and nacked are all cross-attempt state too: any of the
+// three can hold a stale signal from a previous attempt's reply, buffered
+// before this attempt's own Ready is even declared.
+// TestSubmitDeclinesAVerdictThatDidNotIncludeIt is exactly this for
+// declined: a foreign-version verdict can leave a stale signal sitting there
+// long before any Nack exists — a fence on arrival does not drain what an
+// earlier attempt already buffered, which is what this drain is for.
 func (w *submitWaiter) declareReady(ctx context.Context, a *agent.Agent, gateID, version string) error {
 	w.stampReadyAt(time.Now())
 
@@ -201,7 +220,23 @@ type roundResolution struct {
 // — another broadcast, another block fanout on failure, another OnVerdict,
 // and (via pcops.Run's round counter) a run that can be failed a round early
 // by a purely spurious cache replay.
+//
+// verdicts is checked first, on its own, before the select that also watches
+// declined: both can be buffered at once (the round that displaced us
+// resolved with a verdict that also happens to test our own version), and
+// Go's select picks uniformly among ready cases when more than one is ready.
+// Without this non-blocking first look, the correct answer — a verdict that
+// tested our version is a final answer, where declined only reports that the
+// displacing round finished — would be discarded half the time, sending the
+// attempt back to declareReady to re-declare readiness for a round that had
+// already answered it, and losing that verdict to the same F2 cache-replay
+// consequence chain described above.
 func (w *submitWaiter) waitForRoundToResolve(ctx context.Context) roundResolution {
+	select {
+	case v := <-w.verdicts:
+		return roundResolution{verdict: v, hasVerdict: true, resolved: true}
+	default:
+	}
 	select {
 	case <-w.declined:
 		return roundResolution{resolved: true}

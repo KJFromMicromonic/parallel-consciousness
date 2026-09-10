@@ -46,6 +46,20 @@ func TestSubmitWaiterFreshFencesMessagesFromBeforeTheBoundary(t *testing.T) {
 	if !w.fresh(current) {
 		t.Fatal("fresh() rejected a message stamped after the boundary; this attempt would ignore its own reply")
 	}
+
+	// fresh is !Before, i.e. an inclusive boundary: a message stamped exactly
+	// AT readyAt must count as fresh, not stale. This is the case that
+	// distinguishes !Before from a stricter After, and on this platform ties
+	// are the norm for closely-spaced messages (protocol.New's Timestamp is
+	// UTC wall-clock, which was measured not to advance on ~97% of
+	// back-to-back reads) — so it is the boundary case most likely to occur
+	// in production, not an edge case invented for coverage.
+	exact := protocol.New(protocol.Address{Agent: "coordinator"},
+		protocol.Address{Agent: "billing"}, protocol.IntentAck, map[string]any{"gate": "g"})
+	exact.Timestamp = boundary
+	if !w.fresh(exact) {
+		t.Fatal("fresh() rejected a message stamped exactly at the boundary; the reply to THIS attempt's own declareReady can legitimately tie its own stamp")
+	}
 }
 
 // Each of the four channels holds one buffered signal, and any of them can be
@@ -63,6 +77,25 @@ func TestSubmitWaiterDeclareReadyDrainsEveryChannel(t *testing.T) {
 	w.offerAck([]string{"gateway"})
 	w.offerNack(map[string]string{"gateway": "v1"})
 	w.offerDeclined()
+
+	// Confirm the fill actually landed before declareReady runs: without
+	// this, a channel that silently failed to fill (e.g. an unbuffered
+	// channel whose offer* fell through to its own default case) would still
+	// read len == 0 after declareReady and pass the drain assertions below
+	// having drained nothing at all.
+	for _, tc := range []struct {
+		name string
+		full bool
+	}{
+		{"verdicts", len(w.verdicts) == 1},
+		{"acked", len(w.acked) == 1},
+		{"nacked", len(w.nacked) == 1},
+		{"declined", len(w.declined) == 1},
+	} {
+		if !tc.full {
+			t.Fatalf("%s did not hold a buffered signal after offering one; the drain assertions below would be vacuous", tc.name)
+		}
+	}
 
 	b := bus.NewInMemory(8)
 	a, err := agent.New(ctx, b, "billing", nil)

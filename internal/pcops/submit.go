@@ -119,9 +119,7 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 	// required participants it is still waiting on. See gate.go's onReady:
 	// every readiness it records gets one of these back, which is F4's whole
 	// fix — a blocked submit gets a prompt, positive signal instead of total
-	// silence. Buffered 1 like verdicts, for the same reason: the handler
-	// must never block the agent's dispatch loop on a send nobody is
-	// reading yet.
+	// silence.
 	a.On(protocol.IntentAck, func(_ context.Context, _ *agent.Agent, m protocol.Message) *protocol.Message {
 		if id, _ := m.Body["gate"].(string); id != gateID {
 			return nil
