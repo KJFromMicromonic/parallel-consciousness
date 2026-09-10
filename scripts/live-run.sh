@@ -22,9 +22,16 @@ set -euo pipefail
 set -m
 
 PREFLIGHT_ONLY=0
-if [ "${1:-}" = "--preflight-only" ]; then
-  PREFLIGHT_ONLY=1
-fi
+usage() { printf 'usage: %s [--preflight-only]\n' "${BASH_SOURCE[0]}" >&2; exit 2; }
+# Parse properly rather than only checking $1: a bare invocation already
+# launched two paid agents once by mistake, so anything this script does not
+# recognise must stop the run rather than silently fall through to it.
+for arg in "$@"; do
+  case "$arg" in
+    --preflight-only) PREFLIGHT_ONLY=1 ;;
+    *) usage ;;
+  esac
+done
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$ROOT"
@@ -192,13 +199,13 @@ launch() {
   # output. This cost two nine-minute runs.
   case "$harness" in
     pi)
-      ( cd "$wt" && PC_AGENT="$name" PC_TASK="$task" PC_DB="$PC_DB" \
+      ( cd "$wt" && PC_AGENT="$name" PC_GATE="currency" PC_TASK="$task" PC_DB="$PC_DB" \
         pi --skill "$ROOT/docs/agent-contract.md" -p "$task" < /dev/null ) \
         >"$LOG_DIR/$name.log" 2>&1 &
       ;;
     claude)
       cp "$ROOT/docs/agent-contract.md" "$wt/CLAUDE.md"
-      ( cd "$wt" && PC_AGENT="$name" PC_TASK="$task" PC_DB="$PC_DB" \
+      ( cd "$wt" && PC_AGENT="$name" PC_GATE="currency" PC_TASK="$task" PC_DB="$PC_DB" \
         claude -p "$task" --permission-mode acceptEdits \
         --allowedTools Read Edit Write Bash < /dev/null ) \
         >"$LOG_DIR/$name.log" 2>&1 &

@@ -3,14 +3,15 @@
 You own one service in a shared repository. Another agent owns the other. You
 each work in your own git worktree and cannot see each other's files.
 
-Your task is in `$PC_TASK`. Your agent name is `$PC_AGENT`.
+Your task is in `$PC_TASK`. Your agent name is `$PC_AGENT`. Your gate id is
+`$PC_GATE`.
 
 ## Committing and submitting
 
 When your change is ready:
 
 1. Commit it in your worktree.
-2. Run: `pc submit --gate <gate-id> --as "$PC_AGENT"`
+2. Run: `pc submit --gate "$PC_GATE" --as "$PC_AGENT"`
 
 `pc submit` blocks until a cross-service test gate has run and returns a
 verdict. The exit code indicates the outcome:

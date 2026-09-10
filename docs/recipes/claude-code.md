@@ -27,6 +27,7 @@ agent can edit code but never reach the gate.
 | Variable | Purpose |
 |---|---|
 | `PC_AGENT` | This agent's name, as it appears in `gate.required` |
+| `PC_GATE` | The gate id to pass to `pc submit --gate` |
 | `PC_TASK` | The task text |
 | `PC_DB` | The coordination database, so `pc` finds the same bus as the daemon |
 
