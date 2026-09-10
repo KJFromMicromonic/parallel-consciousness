@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# Drive one live run of the two-service fixture with two real coding agents.
+#
+# This is an operator tool, not CI. Its pre-flight exists because two live runs
+# failed for reasons outside the code entirely: one silently tested a stale pc
+# binary for nine minutes, and one hung forever because a backgrounded `pi -p`
+# inherited an open stdin. Both are checked below before anything starts.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+cd "$ROOT"
+
+RUN_DIR="${RUN_DIR:-$ROOT/.pc/live-$(date +%Y%m%d-%H%M%S)}"
+BIN_DIR="$RUN_DIR/bin"
+LOG_DIR="$RUN_DIR/logs"
+WORK_DIR="$RUN_DIR/worktrees"
+FIXTURE="$ROOT/fixtures/two-service"
+
+mkdir -p "$BIN_DIR" "$LOG_DIR" "$WORK_DIR"
+
+say() { printf '\n=== %s\n' "$*"; }
+die() { printf '\nlive-run: %s\n' "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- pre-flight
+
+say "pre-flight"
+
+[ -f "$ROOT/go.mod" ] || die "not at the project root (no go.mod at $ROOT)"
+[ -d "$FIXTURE" ] || die "fixture missing at $FIXTURE"
+
+# Binary provenance. Built here, now, from this checkout — not found on PATH,
+# where it may be any age. This is the check that a stale binary defeated.
+say "building pc from $ROOT"
+go build -o "$BIN_DIR/pc" ./cmd/pc || die "go build ./cmd/pc failed"
+export PATH="$BIN_DIR:$PATH"
+command -v pc >/dev/null || die "pc not on PATH after build"
+resolved="$(command -v pc)"
+[ "$resolved" = "$BIN_DIR/pc" ] || die "pc resolves to $resolved, not the binary just built at $BIN_DIR/pc"
+printf 'pc: %s\n' "$resolved"
+
+# Harness smoke test. A harness that cannot even report its version will not
+# survive a nine-minute run, and finding that out now costs seconds.
+have_pi=0
+have_claude=0
+if command -v pi >/dev/null && pi --version >/dev/null 2>&1; then
+  have_pi=1
+  printf 'pi: %s (%s)\n' "$(command -v pi)" "$(pi --version 2>&1 | head -1)"
+fi
+if command -v claude >/dev/null && claude --version >/dev/null 2>&1; then
+  have_claude=1
+  printf 'claude: %s (%s)\n' "$(command -v claude)" "$(claude --version 2>&1 | head -1)"
+fi
+if [ "$have_pi" -eq 0 ] && [ "$have_claude" -eq 0 ]; then
+  die "no verified harness found: install pi or claude (see docs/recipes/)"
+fi
+if [ "$have_pi" -eq 0 ] || [ "$have_claude" -eq 0 ]; then
+  printf '\nlive-run: only one harness available; running both agents on it.\n'
+  printf 'The two-vendor configuration is what the agnostic claim rests on.\n'
+fi
+
+# ------------------------------------------------------------- fixture reset
+
+say "resetting the fixture"
+
+# Each agent gets its own worktree of the fixture repo. The fixture is its own
+# git repository so a run never touches project source; initialise it once.
+if [ ! -d "$FIXTURE/.git" ]; then
+  git -C "$FIXTURE" init -q
+  git -C "$FIXTURE" add -A
+  git -C "$FIXTURE" -c user.email=live-run@local -c user.name=live-run commit -qm "fixture baseline"
+fi
+
+for spec in "billing:agent/billing" "gateway:agent/gateway" "integrator:agent/integration"; do
+  name="${spec%%:*}"; branch="${spec##*:}"
+  path="$WORK_DIR/$name"
+  git -C "$FIXTURE" worktree remove --force "$path" 2>/dev/null || true
+  git -C "$FIXTURE" branch -D "$branch" 2>/dev/null || true
+  git -C "$FIXTURE" worktree add -q -b "$branch" "$path" HEAD
+  printf '%-11s %s (%s)\n' "$name" "$path" "$branch"
+done
+
+# --------------------------------------------------------------- the scenario
+
+say "writing the scenario"
+
+export PC_DB="$RUN_DIR/bus.db"
+CONFIG="$RUN_DIR/pc.yaml"
+( cd "$RUN_DIR" && pc init --force >/dev/null )
+sed -e "s|^repo: .*|repo: $FIXTURE|" -e "s|^db: .*|db: $PC_DB|" \
+  "$RUN_DIR/.pc.yaml" > "$CONFIG"
+pc watch --config "$CONFIG" --no-follow >/dev/null || die "the scenario at $CONFIG does not load"
+printf 'scenario: %s\n' "$CONFIG"
+
+# ----------------------------------------------------------------- the daemons
+
+say "starting the coordinator and the runner"
+
+pc up --config "$CONFIG" >"$LOG_DIR/up.log" 2>&1 < /dev/null &
+UP_PID=$!
+pc run-gate --config "$CONFIG" --workdir "$WORK_DIR/integrator" >"$LOG_DIR/run-gate.log" 2>&1 < /dev/null &
+GATE_PID=$!
+pc watch --config "$CONFIG" --all --full >"$LOG_DIR/watch.log" 2>&1 < /dev/null &
+WATCH_PID=$!
+
+cleanup() {
+  kill "$UP_PID" "$GATE_PID" "$WATCH_PID" 2>/dev/null || true
+  wait "$UP_PID" "$GATE_PID" "$WATCH_PID" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# StartCoordinator returns only after its subscription is live, but these are
+# separate processes — give them a moment to reach that point before any agent
+# can declare readiness into a log nobody is watching.
+sleep 2
+kill -0 "$UP_PID" 2>/dev/null || die "pc up exited immediately; see $LOG_DIR/up.log"
+kill -0 "$GATE_PID" 2>/dev/null || die "pc run-gate exited immediately; see $LOG_DIR/run-gate.log"
+
+# ------------------------------------------------------------------ the agents
+
+say "launching the agents"
+
+launch() {
+  local name="$1" harness="$2" task="$3" wt="$WORK_DIR/$1"
+  # < /dev/null on BOTH harnesses. `pi -p` merges piped stdin into the prompt,
+  # so a backgrounded invocation with an inherited stdin blocks forever with no
+  # output. This cost two nine-minute runs.
+  case "$harness" in
+    pi)
+      ( cd "$wt" && PC_AGENT="$name" PC_TASK="$task" PC_DB="$PC_DB" \
+        pi --skill "$ROOT/docs/agent-contract.md" -p "$task" < /dev/null ) \
+        >"$LOG_DIR/$name.log" 2>&1 &
+      ;;
+    claude)
+      cp "$ROOT/docs/agent-contract.md" "$wt/CLAUDE.md"
+      ( cd "$wt" && PC_AGENT="$name" PC_TASK="$task" PC_DB="$PC_DB" \
+        claude -p "$task" --permission-mode acceptEdits \
+        --allowedTools Read Edit Write Bash < /dev/null ) \
+        >"$LOG_DIR/$name.log" 2>&1 &
+      ;;
+  esac
+  # Set explicitly rather than leaving the caller to read $!: a background
+  # job started inside a function does set $! in the calling shell, but that
+  # is subtle enough to be worth not depending on.
+  LAST_PID=$!
+  printf '%-11s %s (pid %d, log %s)\n' "$name" "$harness" "$LAST_PID" "$LOG_DIR/$name.log"
+}
+
+# Two vendors when both are available — that pairing is the configuration the
+# harness-agnostic claim actually rests on.
+if [ "$have_pi" -eq 1 ]; then billing_harness=pi; else billing_harness=claude; fi
+if [ "$have_claude" -eq 1 ]; then gateway_harness=claude; else gateway_harness=pi; fi
+
+launch billing "$billing_harness" \
+  "Render the invoice currency correctly. You own billing/ only. Submit with: pc submit --gate currency --agent billing"
+AGENT_PIDS=("$LAST_PID")
+launch gateway "$gateway_harness" \
+  "Stamp the agreed currency on invoices you build. You own gateway/ only. Submit with: pc submit --gate currency --agent gateway"
+AGENT_PIDS+=("$LAST_PID")
+
+# --------------------------------------------------------------------- report
+
+say "waiting for the agents"
+for pid in "${AGENT_PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+
+say "report"
+printf 'run directory: %s\n\n' "$RUN_DIR"
+printf 'gate activity:\n'
+grep -E "ready|ack|nack|request|inform|block" "$LOG_DIR/watch.log" | tail -40 || true
+printf '\nverdicts seen by the coordinator:\n'
+grep -E "PASSED|FAILED|STALLED" "$LOG_DIR/up.log" || printf '  (none)\n'
+printf '\nlogs: %s\n' "$LOG_DIR"
+
+if grep -q "PASSED" "$LOG_DIR/up.log" 2>/dev/null; then
+  printf '\nlive-run: the gate PASSED.\n'
+  exit 0
+fi
+printf '\nlive-run: no passing verdict. Read %s and %s.\n' "$LOG_DIR/watch.log" "$LOG_DIR/up.log"
+exit 1
