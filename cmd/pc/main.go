@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -35,13 +36,19 @@ import (
 // both directions as commands are added.
 const usage = "usage: pc <init|submit|send|up|run-gate|watch> [flags]"
 
+// initScaffoldDB is where initScaffold points the coordination database. Named
+// so cmdInit's directory creation and the scaffold text cannot drift apart —
+// deriving the directory with filepath.Dir here means there is exactly one
+// place that spells out the path.
+const initScaffoldDB = "./.pc/bus.db"
+
 // initScaffold is what `pc init` writes. It is a working scenario against the
 // committed fixture rather than a skeleton of empty keys: the fastest way to
 // understand a scenario file is to run one, and a scaffold that fails
 // validation teaches the wrong first lesson. Every value here satisfies
 // pcops.LoadConfig's validation — TestInitWritesAConfigThatLoadsAndValidates
 // asserts exactly that.
-const initScaffold = `# Parallel Consciousness scenario.
+var initScaffold = fmt.Sprintf(`# Parallel Consciousness scenario.
 #
 # A scenario is a hand-written loop definition: who participates, what gate
 # they must pass, and what bounds the run. This one drives the committed
@@ -52,7 +59,7 @@ repo: ./fixtures/two-service
 
 # The coordination database. Every pc command must agree on this path, so
 # either keep it here or set $PC_DB (which overrides this).
-db: ./.pc/bus.db
+db: %s
 
 gate:
   # Gate id. Agents pass this to 'pc submit --gate'.
@@ -94,7 +101,7 @@ budget:
   # How long the coordinator waits for the spanning test before calling the
   # round stalled.
   runner_timeout: 10m
-`
+`, initScaffoldDB)
 
 // defaultConfigPath is what every command that needs a scenario falls back to
 // when --config is not given.
@@ -109,6 +116,15 @@ func cmdInit(_ context.Context, args []string) int {
 		// Refusing is the whole feature: a scenario file is hand-edited, and
 		// silently replacing one is destructive in a way no other pc command is.
 		fmt.Fprintf(os.Stderr, "pc init: %s already exists (use --force to overwrite)\n", defaultConfigPath)
+		return 2
+	}
+	// sqlite.Open creates the database file but not its parent directory, and
+	// the scaffold points db: at initScaffoldDB — so without this, the scaffold
+	// this command just wrote would fail on the very next command with a
+	// SQLite error that has nothing to do with the real problem.
+	dbDir := filepath.Dir(initScaffoldDB)
+	if err := os.MkdirAll(dbDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "pc init: creating %s: %v\n", dbDir, err)
 		return 2
 	}
 	if err := os.WriteFile(defaultConfigPath, []byte(initScaffold), 0o644); err != nil {

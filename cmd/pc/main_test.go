@@ -417,15 +417,12 @@ func TestConfigDefaultsToDotPcYamlWhenPresent(t *testing.T) {
 	if got := run(context.Background(), []string{"init"}); got != 0 {
 		t.Fatal("pc init failed")
 	}
-	// The scaffold puts the database under ./.pc/, and cmdWatch reports a bus
-	// failure with the SAME exit code 2 it uses for a missing config — so
-	// without this directory the test would fail for a reason that has
-	// nothing to do with config defaulting.
-	if err := os.MkdirAll(".pc", 0o755); err != nil {
-		t.Fatal(err)
-	}
 	// watch --no-follow must now get past config resolution. Exit 2 here can
-	// only mean the default was not applied.
+	// only mean the default was not applied — cmdWatch reports a bus failure
+	// with the SAME exit code 2 it uses for a missing config, so this test
+	// depends on pc init having also created the scaffold's database
+	// directory; if it stops doing that, this goes back to failing here for
+	// a reason unrelated to config defaulting.
 	code := run(context.Background(), []string{"watch", "--no-follow"})
 	if code == 2 {
 		t.Errorf("pc watch with no --config exited 2 in a directory containing .pc.yaml; the default was not applied")
