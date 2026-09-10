@@ -39,7 +39,10 @@ func copyTree(t *testing.T, src, dst string) {
 		}
 		target := filepath.Join(dst, rel)
 		if info.IsDir() {
-			return os.MkdirAll(target, 0o755)
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+			return os.Chmod(target, info.Mode())
 		}
 		b, err := os.ReadFile(path)
 		if err != nil {
@@ -78,17 +81,27 @@ func TestFixtureBaselineFailsUnderTheGateCommand(t *testing.T) {
 // Constraint 4: without the variable the spanning test skips, so an agent
 // running the suite in its own worktree is not misled into thinking it broke
 // something.
+//
+// The exit-zero check alone is insufficient: it cannot distinguish "the test
+// skipped" from "the test ran and happened to pass", and those are different
+// fixture states — only the former satisfies constraint 4. So this also
+// asserts on the verbose output for the literal "--- SKIP" marker, which is
+// the only way to confirm the test actually took the skip branch rather than
+// running to completion.
 func TestFixtureSpanningTestSkipsWithoutTheVariable(t *testing.T) {
 	dst := t.TempDir()
 	copyTree(t, fixtureRoot(t), dst)
 
-	cmd := exec.Command("go", "test", "./integration/...")
+	cmd := exec.Command("go", "test", "-v", "./integration/...")
 	cmd.Dir = dst
 	// Explicitly cleared rather than merely unset in this process's env.
 	cmd.Env = append(os.Environ(), "EXPECTED_CURRENCY=")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("spanning test did not pass-by-skipping with no EXPECTED_CURRENCY; an agent running the suite locally would think it had broken something:\n%s", out)
+	}
+	if !strings.Contains(string(out), "--- SKIP") {
+		t.Errorf("suite exited zero, but the output does not show the test skipping; an exit-zero pass could also mean the test ran and happened to pass, which does not satisfy constraint 4:\n%s", out)
 	}
 }
 
