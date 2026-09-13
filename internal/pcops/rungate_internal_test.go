@@ -85,14 +85,18 @@ func TestMergeAllReportsTheShasItMerged(t *testing.T) {
 
 	repo := t.TempDir()
 	gitT(t, repo, "init", "-q", "-b", "main")
-	os.WriteFile(filepath.Join(repo, "seed.txt"), []byte("seed\n"), 0o644)
+	if err := os.WriteFile(filepath.Join(repo, "seed.txt"), []byte("seed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	gitT(t, repo, "add", ".")
 	gitT(t, repo, "commit", "-q", "-m", "init")
 
 	want := map[string]string{}
 	for _, b := range []string{"a", "b"} {
 		gitT(t, repo, "checkout", "-q", "-b", b, "main")
-		os.WriteFile(filepath.Join(repo, b+".txt"), []byte(b), 0o644)
+		if err := os.WriteFile(filepath.Join(repo, b+".txt"), []byte(b), 0o644); err != nil {
+			t.Fatal(err)
+		}
 		gitT(t, repo, "add", ".")
 		gitT(t, repo, "commit", "-q", "-m", b)
 		out, err := exec.Command("git", "-C", repo, "rev-parse", b).Output()
@@ -129,14 +133,18 @@ func TestMergeAllReportsNothingWhenAMergeFails(t *testing.T) {
 
 	repo := t.TempDir()
 	gitT(t, repo, "init", "-q", "-b", "main")
-	os.WriteFile(filepath.Join(repo, "f.txt"), []byte("base\n"), 0o644)
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	gitT(t, repo, "add", ".")
 	gitT(t, repo, "commit", "-q", "-m", "init")
 
 	// Two branches that edit the same line: the second merge conflicts.
 	for _, b := range []string{"x", "y"} {
 		gitT(t, repo, "checkout", "-q", "-b", b, "main")
-		os.WriteFile(filepath.Join(repo, "f.txt"), []byte(b+"\n"), 0o644)
+		if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte(b+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 		gitT(t, repo, "add", ".")
 		gitT(t, repo, "commit", "-q", "-m", b)
 	}

@@ -111,13 +111,26 @@ func mergeAll(ctx context.Context, workdir string, branches []string) (map[strin
 	}
 	merged := make(map[string]string, len(branches))
 	for _, br := range branches {
-		out, err := gitIn(ctx, workdir, "merge", "--no-edit", "-q", br)
+		// Resolve BEFORE merging, and merge the resolved commit rather than
+		// the branch name. Merging `br` and then asking what `br` points at
+		// re-reads a mutable ref: an agent committing in the gap between those
+		// two git invocations would have us record a commit this run never
+		// merged — the very defect truthful versions exist to remove, in
+		// miniature. Merging the sha closes the window: what we merge and what
+		// we report are the same value by construction.
+		shaOut, shaErr := gitIn(ctx, workdir, "rev-parse", br)
+		if shaErr != nil {
+			// Same "merge failed on %s" prefix as the ordinary merge-failure
+			// path below: a branch that cannot even be resolved is a plain
+			// merge failure, not a conflict, and existing callers already key
+			// off that phrasing to tell the two apart.
+			return nil, fmt.Sprintf("merge failed on %s: cannot resolve: %v: %s", br, shaErr, trim(shaOut)), shaErr
+		}
+		sha := trim(shaOut)
+
+		out, err := gitIn(ctx, workdir, "merge", "--no-edit", "-q", sha)
 		if err == nil {
-			sha, shaErr := gitIn(ctx, workdir, "rev-parse", br)
-			if shaErr != nil {
-				return nil, fmt.Sprintf("merged %s but could not resolve its tip: %v: %s", br, shaErr, trim(sha)), shaErr
-			}
-			merged[br] = trim(sha)
+			merged[br] = sha
 			continue
 		}
 		// Classify before aborting: `merge --abort` clears the unmerged index
