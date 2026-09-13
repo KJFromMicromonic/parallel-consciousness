@@ -163,11 +163,28 @@ runner that does not report — an older build, or a third-party implementation 
 `ServeRunner`'s contract — gets exactly today's behaviour. This is additive to
 the wire protocol, not a breaking change.
 
-**Why the key sets agree.** The runner merges `cfg.Agents`' branches and
-`gs.ready` is keyed by participant. `Config.validate` already requires every
-`gate.required` name to appear in `agents`, so the two sets match by
-construction. If that validation were ever relaxed, a verdict could name a
-participant the runner never merged.
+**Why the merge must filter to required participants.** An earlier draft of
+this section claimed the key sets agree by construction, reasoning that
+`Config.validate` requires every `gate.required` name to appear in `agents`.
+That is true and it is the wrong inclusion. It gives `required` ⊆ `agents`;
+the merge needs `agents` ⊆ `required`, and nothing enforces that —
+`internal/pcops/config.go:175` explicitly permits an agent that is not in
+`gate.required`, while the runner reports a version for every branch it
+merged. So a verdict can and does name a participant the gate does not
+require.
+
+Under the old wholesale clear that was harmless: the extra key vanished at the
+end of the round. Under standing readiness nothing clears `gs.ready`, so the
+extra key is permanent — and quorum is an exact length equality, which can
+then never be true again. The gate runs exactly once and starves forever, with
+`outstandingFor` still reporting "waiting on nobody" because it iterates
+`Required`. Discovered in review by reproduction, not by reading: a three-agent
+config with two required participants opens round two before this change and
+starves after it.
+
+`resolve` therefore merges only keys in `Spec.Required`, the same filter
+`onReady` applies to incoming readiness. A name the filter drops could not have
+entered `gs.ready` through the front door either, so the filter loses nothing.
 
 ---
 
