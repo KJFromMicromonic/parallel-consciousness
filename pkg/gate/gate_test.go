@@ -1063,3 +1063,99 @@ func TestVerdictBroadcastCarriesTheVersionsItTested(t *testing.T) {
 		t.Fatal("no verdict broadcast observed")
 	}
 }
+
+// The runner is the only participant that knows what was actually merged, so
+// its reply is the only channel that can carry that back. Today ServeRunner
+// builds a reply body of {gate, detail} and silently drops whatever Versions
+// the callback set — internal/pcops/rungate.go has been setting that field on
+// every return path and having it discarded.
+func TestServeRunnerReplyCarriesVersions(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b := bus.NewInMemory(8)
+
+	r, err := agent.New(ctx, b, "runner", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate.ServeRunner(r, func(_ context.Context, gateID string, _ map[string]string) gate.Verdict {
+		return gate.Verdict{
+			GateID:   gateID,
+			Passed:   true,
+			Versions: map[string]string{"billing": "sha-b", "gateway": "sha-g"},
+		}
+	})
+	go r.Run(ctx)
+
+	asker, err := agent.New(ctx, b, "asker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replies := make(chan protocol.Message, 4)
+	asker.On(protocol.IntentDone, func(_ context.Context, _ *agent.Agent, m protocol.Message) *protocol.Message {
+		replies <- m
+		return nil
+	})
+	go asker.Run(ctx)
+
+	req := protocol.New(protocol.Address{Agent: "asker"}, protocol.Address{Agent: "runner"},
+		protocol.IntentRequest, map[string]any{"gate": "g", "versions": map[string]string{"billing": "declared"}})
+	if err := b.Publish(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case m := <-replies:
+		got := protocol.Versions(m.Body["versions"])
+		if got["billing"] != "sha-b" || got["gateway"] != "sha-g" {
+			t.Fatalf("reply versions = %v, want the runner's reported shas", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no reply from the runner")
+	}
+}
+
+// A runner that reports nothing — an older build, or a third-party
+// implementation of this contract — must keep working. The coordinator's
+// backfill is the compatibility path, and it only fires when the field is
+// absent, so ServeRunner must not invent an empty map.
+func TestServeRunnerOmitsVersionsWhenTheCallbackReportsNone(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b := bus.NewInMemory(8)
+
+	r, err := agent.New(ctx, b, "runner", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate.ServeRunner(r, func(_ context.Context, gateID string, _ map[string]string) gate.Verdict {
+		return gate.Verdict{GateID: gateID, Passed: true} // Versions left nil
+	})
+	go r.Run(ctx)
+
+	asker, err := agent.New(ctx, b, "asker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replies := make(chan protocol.Message, 4)
+	asker.On(protocol.IntentDone, func(_ context.Context, _ *agent.Agent, m protocol.Message) *protocol.Message {
+		replies <- m
+		return nil
+	})
+	go asker.Run(ctx)
+
+	req := protocol.New(protocol.Address{Agent: "asker"}, protocol.Address{Agent: "runner"},
+		protocol.IntentRequest, map[string]any{"gate": "g"})
+	if err := b.Publish(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case m := <-replies:
+		if _, present := m.Body["versions"]; present {
+			t.Fatalf("reply carries a versions key for a callback that reported none: %+v", m.Body)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no reply from the runner")
+	}
+}

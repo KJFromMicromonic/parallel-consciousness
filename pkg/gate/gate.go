@@ -69,6 +69,16 @@ func ServeRunner(a *agent.Agent, fn func(ctx context.Context, gateID string, ver
 			"gate":   gateID,
 			"detail": v.Detail,
 		})
+		// Only set when the runner actually reported. The coordinator backfills
+		// a verdict's versions from the readiness it recorded whenever this key
+		// is absent, and that backfill is the compatibility path for a runner
+		// that does not report — an older build, or a third-party
+		// implementation of this contract. Inventing an empty map here would
+		// suppress the backfill and leave such a verdict with no versions at
+		// all.
+		if len(v.Versions) > 0 {
+			reply.Body["versions"] = v.Versions
+		}
 		return &reply
 	})
 }
