@@ -53,7 +53,7 @@ func StartRunner(ctx context.Context, cfg Config, workdir string, branches []str
 		runnerTimeout = DefaultRunnerTimeout
 	}
 	gate.ServeRunner(a, func(ctx context.Context, gateID string, versions map[string]string) gate.Verdict {
-		if detail, err := mergeAll(ctx, workdir, branches); err != nil {
+		if _, detail, err := mergeAll(ctx, workdir, branches); err != nil {
 			return gate.Verdict{GateID: gateID, Passed: false, Detail: detail, Versions: versions}
 		}
 		out, err := runShell(ctx, workdir, cfg.Gate.Run, runnerTimeout)
@@ -86,9 +86,18 @@ func RunGate(ctx context.Context, cfg Config, workdir string, branches []string)
 	return ctx.Err()
 }
 
-// mergeAll resets the runner's worktree to main and merges each branch in turn.
-// The reset makes every round independent of the last.
-func mergeAll(ctx context.Context, workdir string, branches []string) (string, error) {
+// mergeAll resets the runner's worktree to main and merges each participant's
+// branch into it, returning the commit it merged per branch.
+//
+// The returned map is what makes a verdict truthful. The coordinator otherwise
+// backfills a verdict's Versions from the readiness it recorded — the versions
+// participants DECLARED — and those diverge from what was tested the moment an
+// agent commits again after submitting. Reporting the tip that actually went in
+// is the only way the verdict can describe the run rather than the intent.
+//
+// On any failure it returns a nil map: the merge is aborted, so nothing
+// coherent was tested and there is no honest SHA to report.
+func mergeAll(ctx context.Context, workdir string, branches []string) (map[string]string, string, error) {
 	// Deliberately no `checkout main`: main is checked out in the primary
 	// worktree, and git refuses to check out a branch twice. Resetting the
 	// runner's own branch to main achieves the same clean baseline.
@@ -97,12 +106,18 @@ func mergeAll(ctx context.Context, workdir string, branches []string) (string, e
 		{"clean", "-qfd"},
 	} {
 		if out, err := gitIn(ctx, workdir, args...); err != nil {
-			return trim(out), err
+			return nil, trim(out), err
 		}
 	}
+	merged := make(map[string]string, len(branches))
 	for _, br := range branches {
 		out, err := gitIn(ctx, workdir, "merge", "--no-edit", "-q", br)
 		if err == nil {
+			sha, shaErr := gitIn(ctx, workdir, "rev-parse", br)
+			if shaErr != nil {
+				return nil, fmt.Sprintf("merged %s but could not resolve its tip: %v: %s", br, shaErr, trim(sha)), shaErr
+			}
+			merged[br] = trim(sha)
 			continue
 		}
 		// Classify before aborting: `merge --abort` clears the unmerged index
@@ -113,11 +128,11 @@ func mergeAll(ctx context.Context, workdir string, branches []string) (string, e
 		conflict := isMergeConflict(err, out) || hasUnmergedPaths(ctx, workdir)
 		_, _ = gitIn(ctx, workdir, "merge", "--abort")
 		if conflict {
-			return fmt.Sprintf("merge conflict on %s: %s", br, trim(out)), err
+			return nil, fmt.Sprintf("merge conflict on %s: %s", br, trim(out)), err
 		}
-		return fmt.Sprintf("merge failed on %s: %v: %s", br, err, trim(out)), err
+		return nil, fmt.Sprintf("merge failed on %s: %v: %s", br, err, trim(out)), err
 	}
-	return "", nil
+	return merged, "", nil
 }
 
 // isMergeConflict reports whether a failed `git merge` failed because of a

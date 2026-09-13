@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // gitT runs git in dir with a fixed identity so commits work on a bare CI box.
@@ -51,7 +52,7 @@ func TestMergeAllDistinguishesAConflictFromAnyOtherFailure(t *testing.T) {
 	work := filepath.Join(t.TempDir(), "integrator")
 	gitT(t, repo, "worktree", "add", "-q", "-B", "agent/integration", work)
 
-	detail, err := mergeAll(ctx, work, []string{"a", "b"})
+	_, detail, err := mergeAll(ctx, work, []string{"a", "b"})
 	if err == nil {
 		t.Fatal("merging two branches that edit the same line should have failed")
 	}
@@ -61,7 +62,7 @@ func TestMergeAllDistinguishesAConflictFromAnyOtherFailure(t *testing.T) {
 
 	// A branch that does not exist is not a conflict, and must not be reported
 	// as one.
-	detail, err = mergeAll(ctx, work, []string{"no-such-branch"})
+	_, detail, err = mergeAll(ctx, work, []string{"no-such-branch"})
 	if err == nil {
 		t.Fatal("merging a nonexistent branch should have failed")
 	}
@@ -70,5 +71,88 @@ func TestMergeAllDistinguishesAConflictFromAnyOtherFailure(t *testing.T) {
 	}
 	if !strings.Contains(detail, "merge failed on no-such-branch") {
 		t.Fatalf("detail = %q, want it to report a plain merge failure", detail)
+	}
+}
+
+// The verdict has to be able to say what was actually tested, which means the
+// runner must report the commit it merged rather than echoing back the version
+// a participant declared. Those two diverge the moment an agent commits again
+// after submitting, and a verdict naming the declared value is then a lie about
+// what ran.
+func TestMergeAllReportsTheShasItMerged(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	repo := t.TempDir()
+	gitT(t, repo, "init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(repo, "seed.txt"), []byte("seed\n"), 0o644)
+	gitT(t, repo, "add", ".")
+	gitT(t, repo, "commit", "-q", "-m", "init")
+
+	want := map[string]string{}
+	for _, b := range []string{"a", "b"} {
+		gitT(t, repo, "checkout", "-q", "-b", b, "main")
+		os.WriteFile(filepath.Join(repo, b+".txt"), []byte(b), 0o644)
+		gitT(t, repo, "add", ".")
+		gitT(t, repo, "commit", "-q", "-m", b)
+		out, err := exec.Command("git", "-C", repo, "rev-parse", b).Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		want[b] = strings.TrimSpace(string(out))
+	}
+	gitT(t, repo, "checkout", "-q", "main")
+
+	work := filepath.Join(t.TempDir(), "integrator")
+	gitT(t, repo, "worktree", "add", "-B", "agent/integration", work)
+
+	merged, detail, err := mergeAll(ctx, work, []string{"a", "b"})
+	if err != nil {
+		t.Fatalf("mergeAll: %v (%s)", err, detail)
+	}
+	if len(merged) != 2 {
+		t.Fatalf("merged = %v, want an entry per branch", merged)
+	}
+	for br, sha := range want {
+		if merged[br] != sha {
+			t.Errorf("merged[%q] = %q, want the branch tip %q", br, merged[br], sha)
+		}
+	}
+}
+
+// A failed merge is aborted, so nothing coherent was tested and there is no
+// honest SHA to name. Reporting a partial set would let a verdict claim it
+// tested branches whose merge was rolled back.
+func TestMergeAllReportsNothingWhenAMergeFails(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	repo := t.TempDir()
+	gitT(t, repo, "init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(repo, "f.txt"), []byte("base\n"), 0o644)
+	gitT(t, repo, "add", ".")
+	gitT(t, repo, "commit", "-q", "-m", "init")
+
+	// Two branches that edit the same line: the second merge conflicts.
+	for _, b := range []string{"x", "y"} {
+		gitT(t, repo, "checkout", "-q", "-b", b, "main")
+		os.WriteFile(filepath.Join(repo, "f.txt"), []byte(b+"\n"), 0o644)
+		gitT(t, repo, "add", ".")
+		gitT(t, repo, "commit", "-q", "-m", b)
+	}
+	gitT(t, repo, "checkout", "-q", "main")
+
+	work := filepath.Join(t.TempDir(), "integrator")
+	gitT(t, repo, "worktree", "add", "-B", "agent/integration", work)
+
+	merged, detail, err := mergeAll(ctx, work, []string{"x", "y"})
+	if err == nil {
+		t.Fatalf("mergeAll succeeded on conflicting branches; detail=%q merged=%v", detail, merged)
+	}
+	if merged != nil {
+		t.Errorf("merged = %v, want nil: the merge was aborted, so nothing was tested", merged)
+	}
+	if !strings.Contains(detail, "conflict") {
+		t.Errorf("detail = %q, want it to name the conflict", detail)
 	}
 }
