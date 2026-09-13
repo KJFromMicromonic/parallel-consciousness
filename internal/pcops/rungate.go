@@ -52,15 +52,33 @@ func StartRunner(ctx context.Context, cfg Config, workdir string, branches []str
 	if runnerTimeout <= 0 {
 		runnerTimeout = DefaultRunnerTimeout
 	}
-	gate.ServeRunner(a, func(ctx context.Context, gateID string, versions map[string]string) gate.Verdict {
-		if _, detail, err := mergeAll(ctx, workdir, branches); err != nil {
-			return gate.Verdict{GateID: gateID, Passed: false, Detail: detail, Versions: versions}
+	// mergeAll reports per branch; the coordinator keys readiness by
+	// participant. Build the translation from cfg directly rather than zipping
+	// it against the branches slice: that slice is produced by cmd/pc's
+	// branchesFromConfig, whose ordering is an implementation detail of another
+	// package, and a mismatch would mis-attribute every version silently.
+	participantOf := make(map[string]string, len(cfg.Agents))
+	for _, ag := range cfg.Agents {
+		participantOf[ag.Branch] = ag.Name
+	}
+	gate.ServeRunner(a, func(ctx context.Context, gateID string, _ map[string]string) gate.Verdict {
+		merged, detail, err := mergeAll(ctx, workdir, branches)
+		if err != nil {
+			// No versions: the merge was aborted, so nothing was tested and the
+			// coordinator's backfill should describe the round instead.
+			return gate.Verdict{GateID: gateID, Passed: false, Detail: detail}
+		}
+		tested := make(map[string]string, len(merged))
+		for br, sha := range merged {
+			if name, ok := participantOf[br]; ok {
+				tested[name] = sha
+			}
 		}
 		out, err := runShell(ctx, workdir, cfg.Gate.Run, runnerTimeout)
 		if err != nil {
-			return gate.Verdict{GateID: gateID, Passed: false, Detail: trim(out), Versions: versions}
+			return gate.Verdict{GateID: gateID, Passed: false, Detail: trim(out), Versions: tested}
 		}
-		return gate.Verdict{GateID: gateID, Passed: true, Versions: versions}
+		return gate.Verdict{GateID: gateID, Passed: true, Versions: tested}
 	})
 	go a.Run(ctx)
 

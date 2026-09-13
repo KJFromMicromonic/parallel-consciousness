@@ -300,6 +300,45 @@ func TestFullReadinessOpensAndPasses(t *testing.T) {
 	}
 }
 
+// The whole point of the runner reporting is that its report wins. A verdict
+// must describe what the runner merged, not what the coordinator recorded when
+// readiness was declared — those diverge whenever a branch moves after its
+// owner submits.
+func TestVerdictPrefersTheRunnersReportedVersions(t *testing.T) {
+	h := setupGate(t, checkoutSpec(), func(gateID string, _ map[string]string) gate.Verdict {
+		return gate.Verdict{
+			GateID:   gateID,
+			Passed:   true,
+			Versions: map[string]string{"billing": "merged-b", "gateway": "merged-g"},
+		}
+	})
+	defer h.cancel()
+
+	h.ready(t, "billing", "declared-b")
+	h.ready(t, "gateway", "declared-g")
+
+	v := recvVerdict(t, h.verdict)
+	if v.Versions["billing"] != "merged-b" || v.Versions["gateway"] != "merged-g" {
+		t.Fatalf("versions = %v, want the runner's merged shas, not the declared ones", v.Versions)
+	}
+}
+
+// And the inverse: a runner that reports nothing must still produce a verdict
+// describing the round, via the coordinator's backfill. This is the
+// compatibility path for an older or third-party runner.
+func TestVerdictFallsBackToRecordedReadinessWhenTheRunnerReportsNone(t *testing.T) {
+	h := setupGate(t, checkoutSpec(), passRunner) // passRunner leaves Versions nil
+	defer h.cancel()
+
+	h.ready(t, "billing", "b1")
+	h.ready(t, "gateway", "g1")
+
+	v := recvVerdict(t, h.verdict)
+	if v.Versions["billing"] != "b1" || v.Versions["gateway"] != "g1" {
+		t.Fatalf("versions = %v, want the recorded readiness as a fallback", v.Versions)
+	}
+}
+
 func TestDuplicateReadyLastVersionWins(t *testing.T) {
 	h := setupGate(t, checkoutSpec(), passRunner)
 	defer h.cancel()

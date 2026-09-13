@@ -382,7 +382,17 @@ func (c *Coordinator) onVerdictMsg(ctx context.Context, _ *agent.Agent, m protoc
 		return nil
 	}
 	detail, _ := m.Body["detail"].(string)
-	c.resolve(ctx, gs, Verdict{GateID: gateID, Passed: m.Intent == protocol.IntentDone, Detail: detail}, false, false)
+	// The runner reports what it actually merged. When it does, that is the
+	// truth about the round and it wins; resolve's backfill from recorded
+	// readiness then fires only for a runner that reported nothing, which is
+	// the compatibility path rather than the normal one.
+	v := Verdict{
+		GateID:   gateID,
+		Passed:   m.Intent == protocol.IntentDone,
+		Detail:   detail,
+		Versions: protocol.Versions(m.Body["versions"]),
+	}
+	c.resolve(ctx, gs, v, false, false)
 	return nil
 }
 
