@@ -568,24 +568,36 @@ func TestResubmitDifferentVersionRecordsReadinessNormally(t *testing.T) {
 	recvMsg(t, h.informs) // drain round 1's broadcast
 
 	// billing committed something since: a genuinely new version must be
-	// recorded as fresh readiness, not answered from the stale cache — so
-	// with only billing resubmitted, the gate stays partial (no verdict).
-	// This is the assertion that stops the fix from breaking the actual loop.
+	// recorded as fresh readiness, never answered from the stale cache.
+	//
+	// Under standing readiness this now OPENS a round rather than leaving the
+	// gate partial — gateway's claim at g1 still stands, so billing's b2
+	// completes the quorum. That is the point of standing readiness, and the
+	// symmetric twin of TestStandingReadinessLetsAPeerReSubmitAlone: this test
+	// once asserted the very deadlock that one exists to remove.
+	//
+	// What this test has always really been about survives, and gets stronger:
+	// a round opened by a LONE resubmit is exactly where a stale remembered
+	// verdict would wrongly answer, and that case did not previously exist.
 	h.ready(t, "billing", "b2")
-	select {
-	case v := <-h.verdict:
-		t.Fatalf("gate opened with partial readiness: %+v", v)
-	case <-time.After(200 * time.Millisecond):
-	}
-
-	h.ready(t, "gateway", "g2")
 	v := recvVerdict(t, h.verdict)
-	if !v.Passed || v.Versions["billing"] != "b2" || v.Versions["gateway"] != "g2" {
-		t.Fatalf("round 2 verdict = %+v, want passed billing=b2 gateway=g2", v)
+	if !v.Passed || v.Versions["billing"] != "b2" || v.Versions["gateway"] != "g1" {
+		t.Fatalf("round 2 verdict = %+v, want a fresh round over billing=b2 with gateway's standing g1", v)
 	}
 	m := recvMsg(t, h.informs)
 	if text, _ := m.Body["text"].(string); strings.Contains(text, "already tested") {
 		t.Fatalf("round 2 inform text = %q, must not carry the cached-answer marker", text)
+	}
+
+	// gateway moving on likewise opens a fresh round rather than a cached answer.
+	h.ready(t, "gateway", "g2")
+	v = recvVerdict(t, h.verdict)
+	if !v.Passed || v.Versions["billing"] != "b2" || v.Versions["gateway"] != "g2" {
+		t.Fatalf("round 3 verdict = %+v, want passed billing=b2 gateway=g2", v)
+	}
+	m = recvMsg(t, h.informs)
+	if text, _ := m.Body["text"].(string); strings.Contains(text, "already tested") {
+		t.Fatalf("round 3 inform text = %q, must not carry the cached-answer marker", text)
 	}
 }
 
@@ -1196,5 +1208,102 @@ func TestServeRunnerOmitsVersionsWhenTheCallbackReportsNone(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("no reply from the runner")
+	}
+}
+
+// The bug this whole plan exists for. A participant whose half is already
+// correct submits once, gets a round that fails for the OTHER participant's
+// reason, and stops — correctly, because it has nothing to fix. Clearing
+// readiness after every round then made the peer's corrected re-submission
+// unable to ever reach quorum again.
+//
+// billing submits exactly once here. If you find yourself making it re-submit
+// to get this passing, the test has stopped testing the bug.
+func TestStandingReadinessLetsAPeerReSubmitAlone(t *testing.T) {
+	var rounds int32
+	h := setupGate(t, checkoutSpec(), func(gateID string, versions map[string]string) gate.Verdict {
+		// Fail while gateway is at g1; pass once it moves to g2.
+		if versions["gateway"] == "g2" {
+			return gate.Verdict{GateID: gateID, Passed: true, Versions: versions}
+		}
+		atomic.AddInt32(&rounds, 1)
+		return gate.Verdict{GateID: gateID, Passed: false, Detail: "gateway is wrong", Versions: versions}
+	})
+	defer h.cancel()
+
+	h.ready(t, "billing", "b1")
+	h.ready(t, "gateway", "g1")
+
+	first := recvVerdict(t, h.verdict)
+	if first.Passed {
+		t.Fatalf("first round = %+v, want a failure", first)
+	}
+
+	// billing does NOT submit again — its half was correct all along.
+	h.ready(t, "gateway", "g2")
+
+	second := recvVerdict(t, h.verdict)
+	if !second.Passed {
+		t.Fatalf("second round = %+v, want a pass: billing's standing readiness should still count", second)
+	}
+	if second.Versions["billing"] != "b1" {
+		t.Errorf("versions = %v, want billing's standing claim b1 carried into the round", second.Versions)
+	}
+}
+
+// Standing readiness must not make the gate re-run work it has already done. A
+// participant resubmitting a version the last round already tested is answered
+// from the remembered verdict, and the runner is not invoked again. Asserting
+// on the invocation count rather than the verdict is deliberate: a cache that
+// has stopped working still produces correct verdicts, just expensively.
+func TestStandingReadinessDoesNotOpenARedundantRound(t *testing.T) {
+	var runs int32
+	h := setupGate(t, checkoutSpec(), func(gateID string, versions map[string]string) gate.Verdict {
+		atomic.AddInt32(&runs, 1)
+		return gate.Verdict{GateID: gateID, Passed: true, Versions: versions}
+	})
+	defer h.cancel()
+
+	h.ready(t, "billing", "b1")
+	h.ready(t, "gateway", "g1")
+	recvVerdict(t, h.verdict)
+
+	// Unchanged resubmit: must be answered from the remembered verdict.
+	h.ready(t, "gateway", "g1")
+	recvVerdict(t, h.verdict)
+
+	if got := atomic.LoadInt32(&runs); got != 1 {
+		t.Fatalf("runner invoked %d times, want 1: the unchanged resubmit should be answered from cache", got)
+	}
+}
+
+// F2, replayed under standing readiness. Sticky invalidation is what keeps this
+// design sound: without it, an unchanged resubmit would hit the cache and be
+// answered with a verdict for a combination that no longer holds, because the
+// other participant's standing claim moved underneath it.
+func TestStandingReadinessStillInvalidatesOnDivergence(t *testing.T) {
+	var lastTested map[string]string
+	h := setupGate(t, checkoutSpec(), func(gateID string, versions map[string]string) gate.Verdict {
+		lastTested = versions
+		passed := versions["billing"] == "b2"
+		return gate.Verdict{GateID: gateID, Passed: passed, Versions: versions}
+	})
+	defer h.cancel()
+
+	h.ready(t, "billing", "b1")
+	h.ready(t, "gateway", "g1")
+	if v := recvVerdict(t, h.verdict); v.Passed {
+		t.Fatalf("first round = %+v, want a failure", v)
+	}
+
+	// billing fixes its half. gateway then resubmits UNCHANGED — it must not be
+	// answered from the pre-fix verdict.
+	h.ready(t, "billing", "b2")
+	second := recvVerdict(t, h.verdict)
+	if !second.Passed {
+		t.Fatalf("second round = %+v, want a pass once billing moved to b2", second)
+	}
+	if lastTested["billing"] != "b2" || lastTested["gateway"] != "g1" {
+		t.Fatalf("runner saw %v, want billing=b2 with gateway's standing g1", lastTested)
 	}
 }

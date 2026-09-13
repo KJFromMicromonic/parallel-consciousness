@@ -413,7 +413,24 @@ func (c *Coordinator) resolve(ctx context.Context, gs *gateState, v Verdict, sta
 	if v.Versions == nil {
 		v.Versions = copyMap(gs.ready)
 	}
-	gs.ready = make(map[string]string) // re-arm for the next round
+	// Readiness is a standing claim about a version — "my half is ready at X" —
+	// not an event this round consumes. Clearing it here meant a participant
+	// whose half was already correct starved the gate permanently by finishing
+	// and exiting: its peer's corrected re-submission could never reach quorum
+	// again. A live run lost exactly that way, with billing submitting once,
+	// the round failing for gateway's reason, and billing correctly concluding
+	// it had nothing to fix.
+	//
+	// Updated per key rather than replaced wholesale: each participant the
+	// verdict names has its claim overwritten with what was actually tested,
+	// and any participant the verdict does not name keeps the claim it had. The
+	// key sets agree in practice — Config.validate requires every gate.required
+	// name to appear in agents, and the runner reports one entry per merged
+	// branch — but a per-key merge means a verdict that ever named a subset
+	// could not silently erase the rest of the quorum.
+	for name, tested := range v.Versions {
+		gs.ready[name] = tested
+	}
 	owners := append([]string(nil), gs.spec.Required...)
 	gateID := gs.spec.ID
 
