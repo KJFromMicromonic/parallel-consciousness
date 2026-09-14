@@ -224,8 +224,7 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 		case v := <-w.verdicts:
 			return v, nil
 		case tested := <-w.mismatched:
-			return gate.Verdict{}, fmt.Errorf("%w: gate %q tested %q, you declared %q — resubmit at your current HEAD",
-				ErrVersionMismatch, gateID, tested, version)
+			return gate.Verdict{}, versionMismatchError(gateID, tested, version)
 		case <-time.After(AckTimeout):
 			return gate.Verdict{}, fmt.Errorf("gate %q: %w", gateID, ErrNotAcknowledged)
 		case <-ctx.Done():
@@ -237,8 +236,7 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 		case v := <-w.verdicts:
 			return v, nil
 		case tested := <-w.mismatched:
-			return gate.Verdict{}, fmt.Errorf("%w: gate %q tested %q, you declared %q — resubmit at your current HEAD",
-				ErrVersionMismatch, gateID, tested, version)
+			return gate.Verdict{}, versionMismatchError(gateID, tested, version)
 		// A Nack arriving here, for an attempt that was already acked, looks
 		// impossible from onReady's logic alone: it answers one Ready with
 		// exactly one of {ack, nack}, never both. But that mutual exclusion
@@ -268,6 +266,16 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 			return gate.Verdict{}, ErrNoVerdict
 		}
 	}
+}
+
+// versionMismatchError builds the error Submit returns when a verdict names
+// this agent at a version other than the one it declared. Both mismatch
+// arms in Submit's attempt loop — pre-ack and post-ack — hit exactly this
+// outcome, so this is the one place that wraps ErrVersionMismatch, keeping
+// the message text and the %w wrapping identical no matter which arm fires.
+func versionMismatchError(gateID, tested, declared string) error {
+	return fmt.Errorf("%w: gate %q tested %q, you declared %q — resubmit at your current HEAD",
+		ErrVersionMismatch, gateID, tested, declared)
 }
 
 // describeVersions renders a version set for one line of operator output,

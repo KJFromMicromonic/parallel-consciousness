@@ -12,7 +12,7 @@ import (
 )
 
 // submitWaiter owns the state Submit's message handlers and its attempt loop
-// share: the round boundary, and the four channels the handlers signal on.
+// share: the round boundary, and the five channels the handlers signal on.
 //
 // It exists because two invariants of that shared state were previously
 // maintained by repetition, and each was got wrong once:
@@ -24,18 +24,18 @@ import (
 //  2. Every attempt must drain cross-attempt state before declaring
 //     readiness, or a signal buffered by a previous attempt answers this one.
 //     Three near-identical drains; the first version drained one of three.
-//     Now declareReady does all four.
+//     Now declareReady does all five.
 //
 // What deliberately stays outside: the bus, the agent, the config, the gate id
-// and the version. This owns the round boundary and the four channels, and
+// and the version. This owns the round boundary and the five channels, and
 // nothing whose lifetime differs from those.
 type submitWaiter struct {
 	mu sync.Mutex
 	// readyAt is written once per attempt by declareReady, called from
 	// Submit's own goroutine, and read by fresh from the agent's dispatch
-	// goroutine — which is why this field is guarded by mu while the four
-	// channels below it are not: a channel is already safe for concurrent
-	// use without one.
+	// goroutine — which is why this field is guarded by mu, along with
+	// recorded just below, while the five channels after them are not: a
+	// channel is already safe for concurrent use without one.
 	readyAt time.Time
 
 	// recorded reports whether the coordinator told us, via an Ack, that THIS
@@ -56,7 +56,7 @@ type submitWaiter struct {
 	// done rather than anything to act on.
 	recorded bool
 
-	// All four are buffered 1 and all four are written by non-blocking sends:
+	// All five are buffered 1 and all five are written by non-blocking sends:
 	// a handler runs on the agent's dispatch goroutine and must never block
 	// it on a send nobody is reading yet.
 	verdicts chan gate.Verdict
@@ -176,6 +176,11 @@ func (w *submitWaiter) isRecorded() bool {
 // declined: a foreign-version verdict can leave a stale signal sitting there
 // long before any Nack exists — a fence on arrival does not drain what an
 // earlier attempt already buffered, which is what this drain is for.
+//
+// mismatched is the fifth and gets the same treatment for the same reason: a
+// previous attempt's own mismatch, buffered by the IntentInform handler
+// before this attempt's Ready is even declared, must not be handed to this
+// attempt as if it were an answer to a version this attempt never declared.
 func (w *submitWaiter) declareReady(ctx context.Context, a *agent.Agent, gateID, version string) error {
 	w.stampReadyAt(time.Now())
 	// A fresh attempt starts unrecorded: whether the coordinator actually
@@ -210,7 +215,7 @@ func (w *submitWaiter) declareReady(ctx context.Context, a *agent.Agent, gateID,
 	return nil
 }
 
-// The four offer* methods are the handlers' only way to signal. Each is a
+// The five offer* methods are the handlers' only way to signal. Each is a
 // non-blocking send for the reason given on the struct's channel fields.
 
 func (w *submitWaiter) offerVerdict(v gate.Verdict) {
@@ -263,11 +268,15 @@ type roundResolution struct {
 }
 
 // waitForRoundToResolve blocks until the in-flight round that displaced our
-// readiness has resolved. Two things can report that: declined, signalled by
-// a verdict for this gate that did not test our version (proof the round is
-// done, with nothing further to hand back); or verdicts, when the verdict
+// readiness has resolved. Three things can report that: declined, signalled
+// by a verdict for this gate that did not test our version (proof the round
+// is done, with nothing further to hand back); verdicts, when the verdict
 // that resolves the round happens to be OUR OWN — a race this attempt wins
-// outright, since there is nothing left to wait for.
+// outright, since there is nothing left to wait for; or mismatched, when the
+// inform that resolves the displacing round names us at some other version —
+// still just proof the round is over, not a mismatch to act on, since
+// isRecorded() is false throughout this wait (see the mismatched field's and
+// isRecorded's doc comments).
 //
 // That verdict is returned to the caller rather than re-buffered and left for
 // the loop's next iteration: re-declaring readiness after a verdict already
@@ -298,6 +307,12 @@ func (w *submitWaiter) waitForRoundToResolve(ctx context.Context) roundResolutio
 		return roundResolution{resolved: true}
 	case v := <-w.verdicts:
 		return roundResolution{verdict: v, hasVerdict: true, resolved: true}
+	case <-w.mismatched:
+		// An inform naming us is proof the round ended, whichever version
+		// it named. Treating it as resolution rather than as a mismatch is
+		// right here: this wait exists only to learn that the round which
+		// displaced our readiness is over, so that we can re-declare.
+		return roundResolution{resolved: true}
 	case <-ctx.Done():
 		return roundResolution{}
 	}
