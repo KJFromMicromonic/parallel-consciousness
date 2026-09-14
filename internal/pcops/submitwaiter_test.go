@@ -62,21 +62,22 @@ func TestSubmitWaiterFreshFencesMessagesFromBeforeTheBoundary(t *testing.T) {
 	}
 }
 
-// Each of the four channels holds one buffered signal, and any of them can be
+// Each of the five channels holds one buffered signal, and any of them can be
 // left full by a previous attempt. A fence on arrival does not empty a buffer
 // something already got into, so declaring a fresh readiness has to drain all
-// four — the first version of this drained one of three.
+// five — the first version of this drained one of three.
 func TestSubmitWaiterDeclareReadyDrainsEveryChannel(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	w := newSubmitWaiter()
 
-	// Fill all four, as a previous attempt's replies would have.
+	// Fill all five, as a previous attempt's replies would have.
 	w.offerVerdict(gateVerdictForTest())
 	w.offerAck([]string{"gateway"})
 	w.offerNack(map[string]string{"gateway": "v1"})
 	w.offerDeclined()
+	w.offerMismatch("v1")
 
 	// Confirm the fill actually landed before declareReady runs: without
 	// this, a channel that silently failed to fill (e.g. an unbuffered
@@ -91,6 +92,7 @@ func TestSubmitWaiterDeclareReadyDrainsEveryChannel(t *testing.T) {
 		{"acked", len(w.acked) == 1},
 		{"nacked", len(w.nacked) == 1},
 		{"declined", len(w.declined) == 1},
+		{"mismatched", len(w.mismatched) == 1},
 	} {
 		if !tc.full {
 			t.Fatalf("%s did not hold a buffered signal after offering one; the drain assertions below would be vacuous", tc.name)
@@ -115,6 +117,7 @@ func TestSubmitWaiterDeclareReadyDrainsEveryChannel(t *testing.T) {
 		{"acked", len(w.acked) == 0},
 		{"nacked", len(w.nacked) == 0},
 		{"declined", len(w.declined) == 0},
+		{"mismatched", len(w.mismatched) == 0},
 	} {
 		if !tc.empty {
 			t.Errorf("%s still held a buffered signal after declareReady; a stale reply from a previous attempt would answer this one", tc.name)

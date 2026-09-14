@@ -215,6 +215,18 @@ budget:
 			"duplicate branch",
 		},
 		{
+			// len(Required) is the quorum target and gs.ready is keyed by
+			// participant, so a name listed twice makes the target one higher
+			// than the map can ever hold. outstandingFor reports nobody
+			// outstanding the whole time, which is exactly the shape of
+			// failure this branch's correctness argument assumes away.
+			"duplicate entry in gate.required",
+			func(s string) string {
+				return strings.Replace(s, "required: [billing]", "required: [billing, billing]", 1)
+			},
+			"duplicate gate.required",
+		},
+		{
 			"submit timeout below runner timeout",
 			func(s string) string { return strings.Replace(s, "submit_timeout: 12m", "submit_timeout: 5m", 1) },
 			"budget.submit_timeout",

@@ -27,8 +27,17 @@ for the harnesses that have it — over one implementation so they never drift.
 
 1. **One core, many skins.** All logic lives in `internal/pcops`; the CLI and the
    MCP server are thin adapters. No duplicated coordination logic.
-2. **Harness-agnostic.** Plain inputs only — a gate id, an opaque version string,
-   an agent name. Nothing tied to a specific harness.
+2. **Harness-agnostic.** Plain inputs only — a gate id, a version string, an
+   agent name. Nothing tied to a specific harness.
+
+   The version is opaque to `pkg/gate` and to `pcops.Submit`, which compare it
+   and never interpret it. It is NOT opaque at the `pc submit` boundary: the
+   runner merges git branches and reports the commits it merged, so a declared
+   version that names no commit can never match a verdict. `pc submit` therefore
+   resolves `--version` through git and rejects what does not resolve. The
+   harness-agnosticism that matters is preserved — nothing here knows about
+   Claude Code or Codex — but the git-backed runner is not agnostic about git,
+   and this principle used to imply it was.
 3. **Reuse the durable log.** `pc` adds no new coordination semantics; it drives
    `pkg/gate` over `pkg/bus/sqlite`. `Submit`'s correctness rides the durable cursor.
 4. **Floor: `go 1.23` (resolved 2026-06-23).** The MCP `go-sdk` hard-requires
@@ -73,7 +82,16 @@ defaults:
 - **DB:** `$PC_DB` → else `.pc.yaml` `db` → else error.
 - **Agent identity (`submit`):** `--as` → `$PC_AGENT` → error. Must be explicit and
   stable (it is the durable cursor key).
-- **Version (`submit`):** `--version` → `git rev-parse HEAD` in the cwd → error.
+- **Version (`submit`):** `--version`, RESOLVED through git in the cwd
+  (`git rev-parse --verify <v>^{commit}`) → else `git rev-parse HEAD` in the cwd
+  → else error. A `--version` that does not name a commit is rejected, not passed
+  through, and never silently replaced by HEAD. This narrows the opaque-string
+  contract at this layer only, and it is forced: the runner merges git branches
+  and reports the commit it actually merged per participant, so a declared value
+  that is not a commit can never match the verdict that comes back — the agent
+  would resubmit forever, opening a full spanning-test round each time, while the
+  gate passed without it. `pkg/gate` still takes any string; the requirement is
+  the git-backed `cmd/pc`/`pcops` layer's alone.
 - **Config file path:** `--config` → `./.pc.yaml`.
 
 With config in place the agent's instruction snippet collapses to

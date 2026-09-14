@@ -32,6 +32,17 @@ var ErrNoVerdict = errors.New("pcops: no verdict before timeout")
 // this reason.
 var ErrNotAcknowledged = errors.New("pcops: gate did not acknowledge readiness")
 
+// ErrVersionMismatch means a verdict arrived for this gate that named THIS
+// agent at a version other than the one declared — the agent's branch moved
+// after it submitted, so the gate merged and tested a later commit.
+//
+// It is actionable and must stay distinct from ErrNoVerdict: the gate is alive
+// and working, and the right response is to resubmit at the current HEAD rather
+// than to investigate a missing coordinator. Without this outcome the agent
+// waits out its whole SubmitTimeout in silence, which is the F4 failure class
+// (see docs/superpowers/specs/2026-09-02-live-fire-findings.md).
+var ErrVersionMismatch = errors.New("pcops: the gate tested a different version than was declared")
+
 // AckTimeout bounds how long Submit waits for the coordinator's IntentAck
 // after declaring readiness, before concluding no coordinator is listening.
 // This is deliberately much shorter than SubmitTimeout: it tolerates a
@@ -98,6 +109,33 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 		// round's verdict — computed entirely without its version.
 		versions := protocol.Versions(m.Body["versions"])
 		if versions[agentName] != version {
+			if tested, named := versions[agentName]; named && w.isRecorded() {
+				// The gate actually recorded OUR readiness for this attempt
+				// (we were Acked, not Nacked) and this verdict still tested us
+				// at a different commit than we declared — our branch moved
+				// after we submitted. Actionable, and distinct from a foreign
+				// round.
+				//
+				// isRecorded() is the fence that keeps this from misfiring on
+				// the Nack-recovery path: after a Nack, the round that
+				// displaced us can resolve naming US too — at whatever
+				// version Task 5's sticky standing-claim last recorded for
+				// us, from before the Nack — and that is proof the displacing
+				// round is done, not a mismatch to act on. isRecorded() is
+				// false throughout that wait (declareReady resets it, and
+				// offerNack clears it again), so it falls through to
+				// offerDeclined below exactly as it must.
+				//
+				// Pinned by
+				// TestSubmitDoesNotReportAMismatchAgainstItsOwnStandingClaim,
+				// which had to reach the ACKNOWLEDGEMENT wait of a second
+				// attempt to see it: waitForRoundToResolve's own mismatched
+				// arm treats a mismatch as resolution, so on the Nack wait
+				// itself deleting this fence changes nothing observable. Do
+				// not reason about this fence from that wait alone.
+				w.offerMismatch(tested)
+				return nil
+			}
 			// This verdict resolved the in-flight round that displaced our own
 			// readiness (see the Nack handler below) — it is proof that round
 			// is done, which is exactly what waitForRoundToResolve is waiting
@@ -193,6 +231,8 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 			continue
 		case v := <-w.verdicts:
 			return v, nil
+		case tested := <-w.mismatched:
+			return gate.Verdict{}, versionMismatchError(gateID, tested, version)
 		case <-time.After(AckTimeout):
 			return gate.Verdict{}, fmt.Errorf("gate %q: %w", gateID, ErrNotAcknowledged)
 		case <-ctx.Done():
@@ -203,6 +243,8 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 		select {
 		case v := <-w.verdicts:
 			return v, nil
+		case tested := <-w.mismatched:
+			return gate.Verdict{}, versionMismatchError(gateID, tested, version)
 		// A Nack arriving here, for an attempt that was already acked, looks
 		// impossible from onReady's logic alone: it answers one Ready with
 		// exactly one of {ack, nack}, never both. But that mutual exclusion
@@ -232,6 +274,16 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 			return gate.Verdict{}, ErrNoVerdict
 		}
 	}
+}
+
+// versionMismatchError builds the error Submit returns when a verdict names
+// this agent at a version other than the one it declared. Both mismatch
+// arms in Submit's attempt loop — pre-ack and post-ack — hit exactly this
+// outcome, so this is the one place that wraps ErrVersionMismatch, keeping
+// the message text and the %w wrapping identical no matter which arm fires.
+func versionMismatchError(gateID, tested, declared string) error {
+	return fmt.Errorf("%w: gate %q tested %q, you declared %q — resubmit at your current HEAD",
+		ErrVersionMismatch, gateID, tested, declared)
 }
 
 // describeVersions renders a version set for one line of operator output,

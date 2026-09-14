@@ -52,15 +52,33 @@ func StartRunner(ctx context.Context, cfg Config, workdir string, branches []str
 	if runnerTimeout <= 0 {
 		runnerTimeout = DefaultRunnerTimeout
 	}
-	gate.ServeRunner(a, func(ctx context.Context, gateID string, versions map[string]string) gate.Verdict {
-		if detail, err := mergeAll(ctx, workdir, branches); err != nil {
-			return gate.Verdict{GateID: gateID, Passed: false, Detail: detail, Versions: versions}
+	// mergeAll reports per branch; the coordinator keys readiness by
+	// participant. Build the translation from cfg directly rather than zipping
+	// it against the branches slice: that slice is produced by cmd/pc's
+	// branchesFromConfig, whose ordering is an implementation detail of another
+	// package, and a mismatch would mis-attribute every version silently.
+	participantOf := make(map[string]string, len(cfg.Agents))
+	for _, ag := range cfg.Agents {
+		participantOf[ag.Branch] = ag.Name
+	}
+	gate.ServeRunner(a, func(ctx context.Context, gateID string, _ map[string]string) gate.Verdict {
+		merged, detail, err := mergeAll(ctx, workdir, branches)
+		if err != nil {
+			// No versions: the merge was aborted, so nothing was tested and the
+			// coordinator's backfill should describe the round instead.
+			return gate.Verdict{GateID: gateID, Passed: false, Detail: detail}
+		}
+		tested := make(map[string]string, len(merged))
+		for br, sha := range merged {
+			if name, ok := participantOf[br]; ok {
+				tested[name] = sha
+			}
 		}
 		out, err := runShell(ctx, workdir, cfg.Gate.Run, runnerTimeout)
 		if err != nil {
-			return gate.Verdict{GateID: gateID, Passed: false, Detail: trim(out), Versions: versions}
+			return gate.Verdict{GateID: gateID, Passed: false, Detail: trim(out), Versions: tested}
 		}
-		return gate.Verdict{GateID: gateID, Passed: true, Versions: versions}
+		return gate.Verdict{GateID: gateID, Passed: true, Versions: tested}
 	})
 	go a.Run(ctx)
 
@@ -86,9 +104,18 @@ func RunGate(ctx context.Context, cfg Config, workdir string, branches []string)
 	return ctx.Err()
 }
 
-// mergeAll resets the runner's worktree to main and merges each branch in turn.
-// The reset makes every round independent of the last.
-func mergeAll(ctx context.Context, workdir string, branches []string) (string, error) {
+// mergeAll resets the runner's worktree to main and merges each participant's
+// branch into it, returning the commit it merged per branch.
+//
+// The returned map is what makes a verdict truthful. The coordinator otherwise
+// backfills a verdict's Versions from the readiness it recorded — the versions
+// participants DECLARED — and those diverge from what was tested the moment an
+// agent commits again after submitting. Reporting the tip that actually went in
+// is the only way the verdict can describe the run rather than the intent.
+//
+// On any failure it returns a nil map: the merge is aborted, so nothing
+// coherent was tested and there is no honest SHA to report.
+func mergeAll(ctx context.Context, workdir string, branches []string) (map[string]string, string, error) {
 	// Deliberately no `checkout main`: main is checked out in the primary
 	// worktree, and git refuses to check out a branch twice. Resetting the
 	// runner's own branch to main achieves the same clean baseline.
@@ -97,12 +124,40 @@ func mergeAll(ctx context.Context, workdir string, branches []string) (string, e
 		{"clean", "-qfd"},
 	} {
 		if out, err := gitIn(ctx, workdir, args...); err != nil {
-			return trim(out), err
+			return nil, trim(out), err
 		}
 	}
+	merged := make(map[string]string, len(branches))
 	for _, br := range branches {
-		out, err := gitIn(ctx, workdir, "merge", "--no-edit", "-q", br)
+		// Resolve BEFORE merging, and merge the resolved commit rather than
+		// the branch name. Merging `br` and then asking what `br` points at
+		// re-reads a mutable ref: an agent committing in the gap between those
+		// two git invocations would have us record a commit this run never
+		// merged — the very defect truthful versions exist to remove, in
+		// miniature. Merging the sha closes the window: what we merge and what
+		// we report are the same value by construction.
+		//
+		// This comment is the ONLY thing holding that ordering. Reverting to
+		// `merge br` followed by `rev-parse br` leaves every test in this
+		// package green, because reproducing the defect needs a commit landing
+		// inside the gap between two git invocations — a race no test here can
+		// open deterministically, which is why there is no test for it and why
+		// there is unlikely ever to be one. So do not "simplify" the two-step
+		// resolve-then-merge back into merging the branch name: nothing but
+		// this paragraph will stop you, and nothing will tell you afterwards.
+		shaOut, shaErr := gitIn(ctx, workdir, "rev-parse", br)
+		if shaErr != nil {
+			// Same "merge failed on %s" prefix as the ordinary merge-failure
+			// path below: a branch that cannot even be resolved is a plain
+			// merge failure, not a conflict, and existing callers already key
+			// off that phrasing to tell the two apart.
+			return nil, fmt.Sprintf("merge failed on %s: cannot resolve: %v: %s", br, shaErr, trim(shaOut)), shaErr
+		}
+		sha := trim(shaOut)
+
+		out, err := gitIn(ctx, workdir, "merge", "--no-edit", "-q", sha)
 		if err == nil {
+			merged[br] = sha
 			continue
 		}
 		// Classify before aborting: `merge --abort` clears the unmerged index
@@ -113,11 +168,11 @@ func mergeAll(ctx context.Context, workdir string, branches []string) (string, e
 		conflict := isMergeConflict(err, out) || hasUnmergedPaths(ctx, workdir)
 		_, _ = gitIn(ctx, workdir, "merge", "--abort")
 		if conflict {
-			return fmt.Sprintf("merge conflict on %s: %s", br, trim(out)), err
+			return nil, fmt.Sprintf("merge conflict on %s: %s", br, trim(out)), err
 		}
-		return fmt.Sprintf("merge failed on %s: %v: %s", br, err, trim(out)), err
+		return nil, fmt.Sprintf("merge failed on %s: %v: %s", br, err, trim(out)), err
 	}
-	return "", nil
+	return merged, "", nil
 }
 
 // isMergeConflict reports whether a failed `git merge` failed because of a

@@ -34,6 +34,114 @@ const heartbeatInterval = leaseTTL / 3
 // unbounded, so a scenario file with no `budget.wall` retried forever.
 const maxRounds = 3
 
+// fixCycle decides which failing verdicts count against maxRounds, so the cap
+// bounds FIX CYCLES rather than raw failing verdicts.
+//
+// The cap's meaning changed underneath this file when readiness became a
+// standing claim, without a line of this file being touched. Before that, a
+// round could only open once EVERY required participant had re-declared, so
+// one failing verdict WAS one full fix cycle: three participants each fixing
+// their own half produced two runner invocations (one FAIL, then a PASS once
+// all three had re-declared). After it, one participant's re-declaration
+// completes the standing quorum on its own, so the same three fixes produce
+// four — FAIL(b1,g1,d1), FAIL(b2,g1,d1), FAIL(b2,g2,d1), PASS(b2,g2,d2) — and
+// `rounds++` on every failing verdict trips a cap of 3 the moment the SECOND
+// participant finishes fixing, before the third has submitted its fix at all.
+// Each of those rounds is also a full run of the spanning test, a ten-minute
+// budget in the live config.
+//
+// A failing verdict therefore advances the counter only when it ENDS a cycle,
+// which is either of two things:
+//
+//   - every required participant has moved since the round that last counted.
+//     That is the post-branch spelling of "the whole quorum re-declared",
+//     which is exactly what one round used to mean.
+//
+//   - nothing new was contributed: either nobody has moved since the round
+//     that last counted, or the only participants that moved had already
+//     moved earlier in this same cycle. Waiting for the rest of a cycle that
+//     is no longer accumulating anything is waiting for nothing.
+//
+//     This half is load-bearing, and it is why "an unchanged re-run is free"
+//     is NOT the rule here. pkg/gate answers a resubmit at a version set it
+//     already tested from its remembered verdict WITHOUT running the spanning
+//     test, and routes that answer through resolve — broadcast, failure
+//     blocks and OnVerdict included — so a steered agent that resubmits
+//     unchanged is steered again, and busy-loops. pkg/gate's gateState doc
+//     comment records that exact loop being observed live, and names this
+//     counter as what bounds it. cfg.Wall == 0 is documented as unbounded, so
+//     a rule that never counted an unchanged re-run would restore an infinite
+//     loop rather than remove one. TestRunStopsAfterTheRoundCap is that case:
+//     one participant, resubmitting the same version forever.
+//
+// A verdict where SOME but not all required participants have newly moved is
+// one cycle still in progress, and does not advance the counter.
+type fixCycle struct {
+	required []string
+	// started is false until the first failing verdict, which always counts:
+	// there is no earlier round to have moved since.
+	started bool
+	// base is the version set of the round that last counted — the state this
+	// cycle is measured against, not the previous verdict's state. Comparing
+	// against the previous verdict would make each participant's fix look like
+	// fresh movement forever, since a participant that fixed two rounds ago
+	// still differs from base and must not be counted as moving again.
+	base map[string]string
+	// moved is which required participants have already moved since base,
+	// accumulated across the verdicts of this cycle.
+	moved map[string]bool
+}
+
+func newFixCycle(required []string) *fixCycle {
+	return &fixCycle{required: required, moved: make(map[string]bool, len(required))}
+}
+
+// completes reports whether v ends a fix cycle and so advances the round cap.
+// It must be called exactly once per failing verdict, in arrival order: it
+// carries the cycle's state forward.
+func (fc *fixCycle) completes(v gate.Verdict) bool {
+	if !fc.started {
+		fc.start(v)
+		return true
+	}
+	// A required participant counts as moved only when the verdict actually
+	// names it at a version differing from base. An absent participant is not
+	// movement: a merge failure produces a verdict with no versions at all,
+	// and reading "absent" as "changed" would call that a completed cycle.
+	movedNow := make([]string, 0, len(fc.required))
+	for _, p := range fc.required {
+		if tested, named := v.Versions[p]; named && tested != fc.base[p] {
+			movedNow = append(movedNow, p)
+		}
+	}
+	if len(movedNow) == len(fc.required) {
+		fc.start(v) // the whole quorum has re-declared: one cycle, as before
+		return true
+	}
+	fresh := false
+	for _, p := range movedNow {
+		if !fc.moved[p] {
+			fresh = true
+		}
+		fc.moved[p] = true
+	}
+	if !fresh {
+		fc.start(v) // nothing new is arriving; this cycle is not progressing
+		return true
+	}
+	return false
+}
+
+// start makes v the state the next cycle is measured against.
+func (fc *fixCycle) start(v gate.Verdict) {
+	fc.started = true
+	fc.base = make(map[string]string, len(v.Versions))
+	for name, version := range v.Versions {
+		fc.base[name] = version
+	}
+	fc.moved = make(map[string]bool, len(fc.required))
+}
+
 // ErrSessionDied reports that a spawned session ended or errored before the
 // gate reached a verdict. It is deliberately terminal: the spec requires the
 // lease released and the run failed WITH ATTRIBUTION, and explicitly no silent
@@ -203,6 +311,7 @@ func Run(ctx context.Context, cfg Config, r runtime.Runtime) (gate.Verdict, erro
 	}
 
 	rounds := 0
+	cycles := newFixCycle(cfg.Gate.Required)
 	for {
 		select {
 		case v := <-verdicts:
@@ -211,10 +320,15 @@ func Run(ctx context.Context, cfg Config, r runtime.Runtime) (gate.Verdict, erro
 			}
 			// A failing verdict already routed blocks to the owners; their
 			// couriers steer them into a fix. Keep waiting for the next round,
-			// up to the cap.
+			// up to the cap — which counts FIX CYCLES rather than failing
+			// verdicts, because standing readiness turned one cycle into as
+			// many verdicts as there are participants. See fixCycle.
+			if !cycles.completes(v) {
+				continue
+			}
 			rounds++
 			if rounds >= maxRounds {
-				return v, fmt.Errorf("gate %s still failing after %d rounds (cap %d): %s",
+				return v, fmt.Errorf("gate %s still failing after %d fix cycles (cap %d): %s",
 					cfg.GateID, rounds, maxRounds, v.Detail)
 			}
 		case f := <-failures:

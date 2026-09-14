@@ -12,7 +12,7 @@ import (
 )
 
 // submitWaiter owns the state Submit's message handlers and its attempt loop
-// share: the round boundary, and the four channels the handlers signal on.
+// share: the round boundary, and the five channels the handlers signal on.
 //
 // It exists because two invariants of that shared state were previously
 // maintained by repetition, and each was got wrong once:
@@ -24,35 +24,60 @@ import (
 //  2. Every attempt must drain cross-attempt state before declaring
 //     readiness, or a signal buffered by a previous attempt answers this one.
 //     Three near-identical drains; the first version drained one of three.
-//     Now declareReady does all four.
+//     Now declareReady does all five.
 //
 // What deliberately stays outside: the bus, the agent, the config, the gate id
-// and the version. This owns the round boundary and the four channels, and
+// and the version. This owns the round boundary and the five channels, and
 // nothing whose lifetime differs from those.
 type submitWaiter struct {
 	mu sync.Mutex
 	// readyAt is written once per attempt by declareReady, called from
 	// Submit's own goroutine, and read by fresh from the agent's dispatch
-	// goroutine — which is why this field is guarded by mu while the four
-	// channels below it are not: a channel is already safe for concurrent
-	// use without one.
+	// goroutine — which is why this field is guarded by mu, along with
+	// recorded just below, while the five channels after them are not: a
+	// channel is already safe for concurrent use without one.
 	readyAt time.Time
 
-	// All four are buffered 1 and all four are written by non-blocking sends:
+	// recorded reports whether the coordinator told us, via an Ack, that THIS
+	// attempt's readiness was actually recorded — as opposed to a Nack, which
+	// means it was dropped in favour of a round already in flight. Guarded by
+	// mu for the same reason readyAt is: declareReady resets it (to false, a
+	// fresh attempt starts unrecorded) from Submit's own goroutine, while
+	// offerAck and offerNack set it from the agent's dispatch goroutine.
+	//
+	// This is what lets the IntentInform guard tell apart two verdicts that
+	// can otherwise look identical — both naming this agent at a version
+	// other than the one just declared: one that resolves OUR OWN round
+	// (recorded == true), where a differing name is a genuine version
+	// mismatch; and one that resolves the round that displaced us after a
+	// Nack (recorded == false), where the same-shaped entry is simply this
+	// agent's OLD readiness, still standing from before the Nack under
+	// Task 5's sticky-claim merge, and is proof that the displacing round is
+	// done rather than anything to act on.
+	recorded bool
+
+	// All five are buffered 1 and all five are written by non-blocking sends:
 	// a handler runs on the agent's dispatch goroutine and must never block
 	// it on a send nobody is reading yet.
 	verdicts chan gate.Verdict
 	acked    chan []string
 	nacked   chan map[string]string
 	declined chan struct{}
+	// mismatched carries the version a verdict said it tested for THIS agent
+	// when that differs from the one declared. Distinct from declined: a
+	// verdict that does not name us at all is someone else's round and we keep
+	// waiting, but one that names us at a different version means our branch
+	// moved and waiting is futile.
+	mismatched chan string
 }
 
 func newSubmitWaiter() *submitWaiter {
 	return &submitWaiter{
-		verdicts: make(chan gate.Verdict, 1),
-		acked:    make(chan []string, 1),
-		nacked:   make(chan map[string]string, 1),
-		declined: make(chan struct{}, 1),
+		verdicts:   make(chan gate.Verdict, 1),
+		acked:      make(chan []string, 1),
+		nacked:     make(chan map[string]string, 1),
+		declined:   make(chan struct{}, 1),
+		mismatched: make(chan string, 1),
 	}
 }
 
@@ -107,6 +132,21 @@ func (w *submitWaiter) stampReadyAt(t time.Time) {
 	w.mu.Unlock()
 }
 
+// setRecorded updates whether THIS attempt's readiness was recorded (Ack) or
+// dropped (Nack). See the recorded field's doc comment for why this exists.
+func (w *submitWaiter) setRecorded(v bool) {
+	w.mu.Lock()
+	w.recorded = v
+	w.mu.Unlock()
+}
+
+// isRecorded reports the current attempt's recorded state.
+func (w *submitWaiter) isRecorded() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.recorded
+}
+
 // declareReady stamps a new round boundary, drains every cross-attempt
 // channel, and publishes readiness — in that order, which is load-bearing.
 //
@@ -136,8 +176,16 @@ func (w *submitWaiter) stampReadyAt(t time.Time) {
 // declined: a foreign-version verdict can leave a stale signal sitting there
 // long before any Nack exists — a fence on arrival does not drain what an
 // earlier attempt already buffered, which is what this drain is for.
+//
+// mismatched is the fifth and gets the same treatment for the same reason: a
+// previous attempt's own mismatch, buffered by the IntentInform handler
+// before this attempt's Ready is even declared, must not be handed to this
+// attempt as if it were an answer to a version this attempt never declared.
 func (w *submitWaiter) declareReady(ctx context.Context, a *agent.Agent, gateID, version string) error {
 	w.stampReadyAt(time.Now())
+	// A fresh attempt starts unrecorded: whether the coordinator actually
+	// recorded THIS Ready is unknown until its own Ack or Nack arrives.
+	w.setRecorded(false)
 
 	// Non-blocking drains: an empty channel must not block the attempt.
 	select {
@@ -156,6 +204,10 @@ func (w *submitWaiter) declareReady(ctx context.Context, a *agent.Agent, gateID,
 	case <-w.declined:
 	default:
 	}
+	select {
+	case <-w.mismatched:
+	default:
+	}
 
 	if err := gate.Ready(ctx, a, gateID, version); err != nil {
 		return fmt.Errorf("declare ready: %w", err)
@@ -163,7 +215,7 @@ func (w *submitWaiter) declareReady(ctx context.Context, a *agent.Agent, gateID,
 	return nil
 }
 
-// The four offer* methods are the handlers' only way to signal. Each is a
+// The five offer* methods are the handlers' only way to signal. Each is a
 // non-blocking send for the reason given on the struct's channel fields.
 
 func (w *submitWaiter) offerVerdict(v gate.Verdict) {
@@ -174,6 +226,7 @@ func (w *submitWaiter) offerVerdict(v gate.Verdict) {
 }
 
 func (w *submitWaiter) offerAck(outstanding []string) {
+	w.setRecorded(true)
 	select {
 	case w.acked <- outstanding:
 	default:
@@ -181,6 +234,7 @@ func (w *submitWaiter) offerAck(outstanding []string) {
 }
 
 func (w *submitWaiter) offerNack(testing map[string]string) {
+	w.setRecorded(false)
 	select {
 	case w.nacked <- testing:
 	default:
@@ -190,6 +244,13 @@ func (w *submitWaiter) offerNack(testing map[string]string) {
 func (w *submitWaiter) offerDeclined() {
 	select {
 	case w.declined <- struct{}{}:
+	default:
+	}
+}
+
+func (w *submitWaiter) offerMismatch(tested string) {
+	select {
+	case w.mismatched <- tested:
 	default:
 	}
 }
@@ -207,11 +268,28 @@ type roundResolution struct {
 }
 
 // waitForRoundToResolve blocks until the in-flight round that displaced our
-// readiness has resolved. Two things can report that: declined, signalled by
-// a verdict for this gate that did not test our version (proof the round is
-// done, with nothing further to hand back); or verdicts, when the verdict
+// readiness has resolved. Three things can report that: declined, signalled
+// by a verdict for this gate that did not test our version (proof the round
+// is done, with nothing further to hand back); verdicts, when the verdict
 // that resolves the round happens to be OUR OWN — a race this attempt wins
-// outright, since there is nothing left to wait for.
+// outright, since there is nothing left to wait for; or mismatched, when the
+// inform that resolves the displacing round names us at some other version.
+//
+// The mismatched arm exists precisely BECAUSE isRecorded() is not guaranteed
+// to stay false for the whole of this wait. Do not delete it on the reasoning
+// that it is unreachable. Two `pc up` coordinators share one cursors row and
+// can both read a batch before either saves it, so a single Ready can draw
+// both an Ack and a Nack; whichever offer call lands last sets recorded,
+// regardless of which branch this attempt's select took. With recorded true,
+// the displacing round's inform — which under standing readiness names us at
+// the version our sticky claim still holds — takes offerMismatch rather than
+// offerDeclined, and without this arm the wait would block to ctx and report
+// ErrNoVerdict at SubmitTimeout: the exact hang this file exists to remove.
+//
+// Treating it as resolution rather than as a mismatch loses nothing. If the
+// gate really did test a different commit, the next attempt re-declares and
+// its own post-ack mismatched arm reports ErrVersionMismatch immediately, so
+// the cost is one extra round trip and the error is deferred, never swallowed.
 //
 // That verdict is returned to the caller rather than re-buffered and left for
 // the loop's next iteration: re-declaring readiness after a verdict already
@@ -242,6 +320,12 @@ func (w *submitWaiter) waitForRoundToResolve(ctx context.Context) roundResolutio
 		return roundResolution{resolved: true}
 	case v := <-w.verdicts:
 		return roundResolution{verdict: v, hasVerdict: true, resolved: true}
+	case <-w.mismatched:
+		// An inform naming us is proof the round ended, whichever version
+		// it named. Treating it as resolution rather than as a mismatch is
+		// right here: this wait exists only to learn that the round which
+		// displaced our readiness is over, so that we can re-declare.
+		return roundResolution{resolved: true}
 	case <-ctx.Done():
 		return roundResolution{}
 	}

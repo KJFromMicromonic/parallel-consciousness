@@ -69,6 +69,16 @@ func ServeRunner(a *agent.Agent, fn func(ctx context.Context, gateID string, ver
 			"gate":   gateID,
 			"detail": v.Detail,
 		})
+		// Only set when the runner actually reported. The coordinator backfills
+		// a verdict's versions from the readiness it recorded whenever this key
+		// is absent, and that backfill is the compatibility path for a runner
+		// that does not report — an older build, or a third-party
+		// implementation of this contract. Inventing an empty map here would
+		// suppress the backfill and leave such a verdict with no versions at
+		// all.
+		if len(v.Versions) > 0 {
+			reply.Body["versions"] = v.Versions
+		}
 		return &reply
 	})
 }
@@ -243,6 +253,48 @@ func (c *Coordinator) onReady(ctx context.Context, _ *agent.Agent, m protocol.Me
 			// from cache is never mistaken for an unacknowledged gate.
 			return nil
 		}
+		// Sticky invalidation. As of standing readiness this line is
+		// UNREACHABLE-BY-CONSEQUENCE, and the distinction matters to anyone
+		// tempted to delete it or to trust it.
+		//
+		// It is still executed — divergent resubmits reach it constantly —
+		// but the nil it writes can never afterwards be READ, because the
+		// same call goes on to record readiness and open a round, and
+		// resolve overwrites lastVerdict before the cache branch above is
+		// consulted again. Two facts that hold only since readiness became a
+		// standing claim carry a divergent submit that far: a verdict exists
+		// only after a full quorum, and a standing quorum is never lost. So
+		// every participant named in lastVerdict still stands in gs.ready,
+		// and any divergence therefore still completes the quorum and opens
+		// a round in this same dispatch.
+		//
+		// What that argument does NOT establish — and an earlier version of
+		// this comment wrongly claimed — is that a round is in flight across
+		// the whole window in which the stale value would be visible. It is
+		// not: onReady releases gs.mu before calling open, and open does not
+		// set gs.inflight until it retakes the lock, while !inflight plus a
+		// non-nil lastVerdict is all the cache branch above asks for. A
+		// genuinely exposed window therefore exists in between. What closes
+		// it is the CALLER, not this file: pkg/agent's Run dispatches one
+		// message at a time on a single goroutine, so no second onReady can
+		// run inside that window. The only concurrent entrant is the
+		// time.AfterFunc runner timeout open arms, and it never reads
+		// lastVerdict and is gen-fenced regardless.
+		//
+		// Two consequences. First, no test can pin this line through the
+		// public API: replacing it with a no-op leaves the suite green, and
+		// a test claiming to cover it would be this project's tenth vacuous
+		// test rather than its first real one here. Second, do not read its
+		// survival as evidence it is load-bearing — it is retained because
+		// the argument above is a property of the CALLERS, not of this file.
+		// A host that dispatches handlers concurrently makes it load-bearing
+		// immediately — that is the likeliest trigger of the lot, because the
+		// serial-dispatch half of the argument is the half nothing in this
+		// package enforces — and so does any future change that lets a quorum
+		// lapse (a participant removed from Required mid-run, readiness
+		// expiry, a persisted gs.ready reloaded partially). Either arrives
+		// with no test to notice. Deleting it is safe only together with a
+		// check that dispatch is serial and that quorum cannot lapse.
 		gs.lastVerdict = nil
 	}
 
@@ -285,6 +337,12 @@ func (c *Coordinator) onReady(ctx context.Context, _ *agent.Agent, m protocol.Me
 		ack := m.Reply(protocol.Address{Agent: c.a.Name}, protocol.IntentAck, map[string]any{
 			"gate":        gateID,
 			"outstanding": outstanding,
+			// Under standing readiness an empty outstanding list is the common
+			// case — once everyone has submitted once, any later submit
+			// completes the set immediately — so "nothing outstanding" and "a
+			// round just started" became indistinguishable, and both pc submit
+			// and pc watch rendered them as silence.
+			"running": full,
 		})
 		reply = &ack
 	} else if required {
@@ -294,12 +352,13 @@ func (c *Coordinator) onReady(ctx context.Context, _ *agent.Agent, m protocol.Me
 		// yet" from "no coordinator is running" from "a required peer is
 		// never coming".
 		//
-		// This deliberately does NOT carry outstandingFor(gs). open leaves
-		// gs.ready intact for the whole round (only resolve clears it), so on
-		// this path outstandingFor always returns an empty slice — which reads
-		// as "waiting on nobody", the opposite of what is happening. What is
-		// actually useful is the version set the in-flight round is testing
-		// instead of this submitter's.
+		// This deliberately does NOT carry outstandingFor(gs). gs.ready holds
+		// standing claims that nothing ever clears — a round in flight was
+		// opened by a full quorum, and resolve only overwrites the claims it
+		// tested — so on this path outstandingFor always returns an empty
+		// slice, which reads as "waiting on nobody", the opposite of what is
+		// happening. What is actually useful is the version set the in-flight
+		// round is testing instead of this submitter's.
 		//
 		// IntentNack for the same reason as the IntentAck above: the courier
 		// registers no handler for it, so it reaches pcops.Submit's own
@@ -372,7 +431,17 @@ func (c *Coordinator) onVerdictMsg(ctx context.Context, _ *agent.Agent, m protoc
 		return nil
 	}
 	detail, _ := m.Body["detail"].(string)
-	c.resolve(ctx, gs, Verdict{GateID: gateID, Passed: m.Intent == protocol.IntentDone, Detail: detail}, false, false)
+	// The runner reports what it actually merged. When it does, that is the
+	// truth about the round and it wins; resolve's backfill from recorded
+	// readiness then fires only for a runner that reported nothing, which is
+	// the compatibility path rather than the normal one.
+	v := Verdict{
+		GateID:   gateID,
+		Passed:   m.Intent == protocol.IntentDone,
+		Detail:   detail,
+		Versions: protocol.Versions(m.Body["versions"]),
+	}
+	c.resolve(ctx, gs, v, false, false)
 	return nil
 }
 
@@ -390,10 +459,62 @@ func (c *Coordinator) resolve(ctx context.Context, gs *gateState, v Verdict, sta
 	}
 	gs.inflight = false
 	gs.gen++ // invalidate any pending timer for this run
-	if v.Versions == nil {
-		v.Versions = copyMap(gs.ready)
+	// Backfill the verdict per key, not all-or-nothing. What the runner
+	// reported wins for every participant it names; every required
+	// participant it does NOT name is filled in from the readiness recorded
+	// for it, and one that has no recorded readiness stays absent because
+	// there is nothing truthful to say about it. A runner that reports
+	// nothing at all — an older build, or a third-party implementation of the
+	// ServeRunner contract — therefore still gets a fully described verdict,
+	// which is what the old `v.Versions == nil` switch was for.
+	//
+	// It has to be per key because a PARTIAL report is reachable and the
+	// all-or-nothing switch passed its gaps straight through: StartRunner
+	// takes its branches as a parameter separate from cfg.Agents and drops
+	// any branch with no participant, and validate permits gate.required to
+	// name cfg.Runner, whose branch is never among them. Downstream a missing
+	// key does not read as "unknown", it reads as "this verdict did not name
+	// me": pcops.Submit declines the offer and waits out its whole budget for
+	// a verdict that already arrived. That is the F4 silent-timeout class
+	// arriving through the one hop the per-key merge below exists to protect.
+	//
+	// Copied rather than mutated in place: on the cached path v.Versions
+	// aliases gs.lastVerdict.Versions, and a backfill must not reach back
+	// into the remembered round.
+	v.Versions = copyMap(v.Versions)
+	for _, p := range gs.spec.Required {
+		if _, named := v.Versions[p]; named {
+			continue
+		}
+		if recorded, ok := gs.ready[p]; ok {
+			v.Versions[p] = recorded
+		}
 	}
-	gs.ready = make(map[string]string) // re-arm for the next round
+	// Readiness is a standing claim about a version — "my half is ready at X" —
+	// not an event this round consumes. Clearing it here meant a participant
+	// whose half was already correct starved the gate permanently by finishing
+	// and exiting: its peer's corrected re-submission could never reach quorum
+	// again. A live run lost exactly that way, with billing submitting once,
+	// the round failing for gateway's reason, and billing correctly concluding
+	// it had nothing to fix.
+	//
+	// Updated per key rather than replaced wholesale: each participant the
+	// verdict names has its claim overwritten with what was actually tested,
+	// and any participant the verdict does not name keeps the claim it had, so
+	// a verdict that names only a subset cannot silently erase the rest of the
+	// quorum.
+	for name, tested := range v.Versions {
+		// Filter to required participants. onReady applies the same filter at
+		// the top of this file, and since readiness is now standing — nothing
+		// clears gs.ready — an unrequired key inserted here would be permanent.
+		// Quorum is an exact length equality, so one extra key starves the gate
+		// forever. This is reachable today: Config.validate permits an agent
+		// that is not in gate.required, and the runner reports a version for
+		// every branch it merged.
+		if contains(gs.spec.Required, name) {
+			gs.ready[name] = tested
+		}
+	}
 	owners := append([]string(nil), gs.spec.Required...)
 	gateID := gs.spec.ID
 

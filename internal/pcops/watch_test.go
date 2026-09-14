@@ -318,3 +318,48 @@ func TestWatchStopsCleanlyWhenCancelledMidFollow(t *testing.T) {
 		t.Fatal("timed out waiting for Watch to return after cancellation")
 	}
 }
+
+// Under standing readiness an ack usually carries an empty outstanding list,
+// which rendered as a bare "coordinator → billing ack" and told an operator
+// nothing. Say that the round started.
+func TestFormatRecordShowsARoundStarting(t *testing.T) {
+	m := protocol.New(protocol.Address{Agent: "coordinator"}, protocol.Address{Agent: "billing"},
+		protocol.IntentAck, map[string]any{"gate": "g", "running": true})
+	got := pcops.FormatRecord(sqlite.Record{Seq: 1, Msg: m}, false)
+	if !strings.Contains(got, "round running") {
+		t.Fatalf("rendered %q, want it to say the round is running", got)
+	}
+}
+
+// The negative half, and the half that actually pins the guard. Without it,
+// `summarise` could return "round running" for ANY ack with an empty
+// outstanding list and every test above would still pass — while misreporting
+// the two cases that matter most:
+//
+//   - a partial quorum whose ack lists nobody outstanding, and
+//   - an ack from a coordinator too old to set the field at all, which is the
+//     realistic mixed-version case during a rolling upgrade, since the map
+//     comes off the wire without the key and the comma-ok assertion yields
+//     false rather than panicking.
+//
+// Telling an operator a round is running when none is is worse than the
+// silence this field was added to fix: silence is merely uninformative, and
+// this would be wrong. Found by a reviewer's mutation, not by a failing test.
+func TestFormatRecordDoesNotInventARoundThatIsNotRunning(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body map[string]any
+	}{
+		{"running is false", map[string]any{"gate": "g", "running": false}},
+		{"older coordinator omits the field", map[string]any{"gate": "g"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := protocol.New(protocol.Address{Agent: "coordinator"}, protocol.Address{Agent: "billing"},
+				protocol.IntentAck, tc.body)
+			got := pcops.FormatRecord(sqlite.Record{Seq: 1, Msg: m}, false)
+			if strings.Contains(got, "round running") {
+				t.Fatalf("rendered %q, which claims a round is running when the ack does not say so", got)
+			}
+		})
+	}
+}

@@ -60,9 +60,26 @@ the F2 reason above.
 **Versions become truthful rather than advisory.** The runner reports the SHAs
 it actually merged. Rejected: pinning the merge to the declared versions
 (`git merge <sha>` instead of `git merge <branch>`), which would be truthful by
-construction and is conceptually cleaner — but `pc submit --version` is
-documented as "an opaque version string", and making it a hard git ref would
-break that contract for anyone passing a label rather than a SHA.
+construction and is conceptually cleaner.
+
+The reason given here for rejecting it was that `pc submit --version` is
+documented as "an opaque version string", and that making it a hard git ref
+would break that contract for anyone passing a label. **That reasoning was
+wrong, and the design broke the contract anyway — later, and in a worse
+shape.** Because `Submit`'s guard compares the declared version against the
+SHA the runner reports, a caller passing a label could never match: each
+retry missed the F2 cache, completed the standing quorum, and opened a fresh
+full spanning-test round, so the agent never obtained a verdict and the gate
+passed unheard. An unbounded expensive retry loop is worse than the merge
+error the rejection was avoiding. Reproduced end-to-end in the whole-branch
+review against a real repository and a passing gate command.
+
+Resolved by narrowing the contract where it actually lives: `cmd/pc` resolves
+an explicit `--version` through git and declares the resulting commit, failing
+fast when it names no commit. `pkg/gate` keeps the opaque-string contract and
+its doc comment stays true — that package genuinely does not care what a
+version is. The requirement belongs to the git-backed runner layer, and saying
+so in `pkg/gate` would have been the wrong place to say it.
 
 **Rejected: readiness as bare presence.** Dropping version values from
 `gs.ready` entirely and letting the runner be the only version authority is a
@@ -163,11 +180,28 @@ runner that does not report — an older build, or a third-party implementation 
 `ServeRunner`'s contract — gets exactly today's behaviour. This is additive to
 the wire protocol, not a breaking change.
 
-**Why the key sets agree.** The runner merges `cfg.Agents`' branches and
-`gs.ready` is keyed by participant. `Config.validate` already requires every
-`gate.required` name to appear in `agents`, so the two sets match by
-construction. If that validation were ever relaxed, a verdict could name a
-participant the runner never merged.
+**Why the merge must filter to required participants.** An earlier draft of
+this section claimed the key sets agree by construction, reasoning that
+`Config.validate` requires every `gate.required` name to appear in `agents`.
+That is true and it is the wrong inclusion. It gives `required` ⊆ `agents`;
+the merge needs `agents` ⊆ `required`, and nothing enforces that —
+`internal/pcops/config.go:175` explicitly permits an agent that is not in
+`gate.required`, while the runner reports a version for every branch it
+merged. So a verdict can and does name a participant the gate does not
+require.
+
+Under the old wholesale clear that was harmless: the extra key vanished at the
+end of the round. Under standing readiness nothing clears `gs.ready`, so the
+extra key is permanent — and quorum is an exact length equality, which can
+then never be true again. The gate runs exactly once and starves forever, with
+`outstandingFor` still reporting "waiting on nobody" because it iterates
+`Required`. Discovered in review by reproduction, not by reading: a three-agent
+config with two required participants opens round two before this change and
+starves after it.
+
+`resolve` therefore merges only keys in `Spec.Required`, the same filter
+`onReady` applies to incoming readiness. A name the filter drops could not have
+entered `gs.ready` through the front door either, so the filter loses nothing.
 
 ---
 
@@ -191,8 +225,17 @@ means two different things — "you completed quorum, a round is starting" and
 case. Both surfaces render it as silence today: `Submit` prints its stderr line
 only when the list is non-empty, and `pc watch`'s `IntentAck` case falls through
 to a bare `coordinator → gateway  ack`. `full` is already computed on that line,
-so carrying it costs one field and makes the most common acknowledgement legible
-in both places.
+so carrying it costs one field.
+
+**What shipped covers only one of those two surfaces.** `pc watch` reads the
+flag; `Submit` does not. `Submit`'s ack path receives `outstanding` as a bare
+`[]string` and still prints only when that list is non-empty, so the
+now-common quorum-completing ack remains silent to a blocked `pc submit` — the
+F4 shape this field exists to remove, still present on the surface an agent
+actually watches. Widening the waiter's ack channel to carry the flag is the
+remaining work; it was outside the implementing plan's scope, and this
+paragraph previously claimed both surfaces were covered. Found in the
+whole-branch review, not by a test.
 
 ---
 
@@ -276,6 +319,19 @@ Phase B part 1 precisely to read the log without `Subscribe`'s recipient filter
 — is the mechanism that would let a restarting coordinator rebuild standing
 claims. Deliberately not folded in here: it is a separate concern with its own
 correctness questions about how far back to replay.
+
+**Two `pc up` coordinators on one database can produce a spurious
+`ErrVersionMismatch`.** They share a single `cursors` row and can both read a
+batch before either saves it, so one `Ready` can draw both an Ack and a Nack.
+A second coordinator's independent `gateState`, holding this agent's sticky
+standing claim, can then resolve its own round and broadcast an inform naming
+the agent at that older version while its real round is healthy and in flight.
+Pre-existing in kind rather than introduced here, and the consequence is a
+fast, actionable error rather than a hang — strictly better than the behaviour
+this design replaces, which is why it is recorded rather than fixed. The
+`isRecorded()` fence in `Submit` and the `mismatched` arm in
+`waitForRoundToResolve` both exist because of this same multi-coordinator
+window.
 
 **An agent that abandons mid-round leaves a stale claim about who agreed to
 what.** The verdict stays honest about what ran; the attribution goes stale. PC

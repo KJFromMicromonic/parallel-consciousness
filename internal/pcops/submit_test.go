@@ -598,8 +598,17 @@ func TestSubmitRedeclaresAfterNackAndReturnsTheReDeclaredVerdict(t *testing.T) {
 // The defect: pkg/gate drops a readiness that lands while a round is already
 // in flight, but Submit would still accept that round's verdict — one computed
 // without its version. The runner is gated so the ordering is deterministic:
-// the stale verdict is the ONLY verdict on the log at the moment Submit could
+// the foreign verdict is the ONLY verdict on the log at the moment Submit could
 // wrongly accept it, and the genuine one cannot arrive until we release it.
+//
+// The foreign verdict names a DIFFERENT participant, which is what this test's
+// name means by "did not include it": a round billing was never part of. It
+// deliberately does not name billing at some other version — that message says
+// the gate merged and tested a later commit of billing's OWN branch, and the
+// honest answer to it is ErrVersionMismatch rather than continued silence (see
+// TestSubmitReportsWhenTheGateTestedADifferentVersion). The property guarded
+// here is the same under either shape: Submit must never return a gate.Verdict
+// that was computed without this agent's version.
 func TestSubmitDeclinesAVerdictThatDidNotIncludeIt(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -665,22 +674,23 @@ func TestSubmitDeclinesAVerdictThatDidNotIncludeIt(t *testing.T) {
 		t.Fatal("runner was never invoked, so the round never started")
 	}
 
-	// A verdict for a DIFFERENT version of billing, published exactly as the
-	// coordinator publishes one.
+	// A verdict for a round that did not include billing at all — it names a
+	// different participant entirely — published exactly as the coordinator
+	// publishes one.
 	stale := protocol.New(protocol.Address{Agent: "coordinator"},
 		protocol.Address{Topic: gate.Topic("g")}, protocol.IntentInform,
 		map[string]any{"gate": "g", "passed": true, "text": "g PASSED",
-			"versions": map[string]any{"billing": "SOMEONE-ELSES-VERSION"}})
+			"versions": map[string]any{"gateway": "SOMEONE-ELSES-VERSION"}})
 	if err := b.Publish(ctx, stale); err != nil {
 		t.Fatal(err)
 	}
 
-	// THE ASSERTION THAT CATCHES THE DEFECT. The stale verdict is the only
+	// THE ASSERTION THAT CATCHES THE DEFECT. The foreign verdict is the only
 	// verdict available; a Submit without the version guard accepts it and
 	// returns here. With the guard it must keep waiting.
 	select {
 	case r := <-done:
-		t.Fatalf("Submit returned %+v (err %v) on a verdict that tested %q, not MY-VERSION",
+		t.Fatalf("Submit returned %+v (err %v) on a verdict that did not name billing at all (it tested gateway at %q)",
 			r.v, r.err, "SOMEONE-ELSES-VERSION")
 	case <-time.After(3 * time.Second):
 		// Still waiting, correctly.
@@ -698,5 +708,224 @@ func TestSubmitDeclinesAVerdictThatDidNotIncludeIt(t *testing.T) {
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("Submit never returned after the genuine verdict was broadcast")
+	}
+}
+
+// Truthful verdicts mean an agent that commits again after submitting sees a
+// verdict naming the sha actually merged, and the version guard correctly
+// declines it. Nothing then wakes it: the post-ack select waits only on
+// verdicts and ctx, so it burns the full SubmitTimeout and reports ErrNoVerdict
+// — the F4 failure class this project spent a phase eliminating.
+//
+// The elapsed-time assertion is the point. With a generous deadline, "returns
+// an error eventually" passes against exactly the hang this exists to prevent.
+func TestSubmitReportsWhenTheGateTestedADifferentVersion(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	db := filepath.Join(t.TempDir(), "bus.db")
+	cfg := pcops.Config{
+		DB:            db,
+		GateID:        "g",
+		Gate:          pcops.GateDef{Required: []string{"billing"}, Runner: "runner"},
+		SubmitTimeout: 45 * time.Second,
+	}
+	cstop, err := pcops.StartCoordinator(ctx, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cstop()
+
+	b, err := sqlite.Open(ctx, db, sqlite.WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	run, err := agent.New(ctx, b, "runner", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The runner reports a sha that is NOT what billing declares below.
+	gate.ServeRunner(run, func(_ context.Context, gateID string, _ map[string]string) gate.Verdict {
+		return gate.Verdict{GateID: gateID, Passed: true, Versions: map[string]string{"billing": "actually-merged"}}
+	})
+	go run.Run(ctx)
+
+	start := time.Now()
+	_, err = pcops.Submit(ctx, cfg, "g", "billing", "declared")
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, pcops.ErrVersionMismatch) {
+		t.Fatalf("Submit err = %v, want ErrVersionMismatch", err)
+	}
+	// Must return promptly, not at SubmitTimeout. AckTimeout is 10s and the
+	// round resolves in well under that.
+	if elapsed > 30*time.Second {
+		t.Fatalf("Submit took %v to report a version mismatch; it waited out its budget instead of reporting", elapsed)
+	}
+}
+
+// TestSubmitDoesNotReportAMismatchAgainstItsOwnStandingClaim pins the
+// `&& w.isRecorded()` fence in submit.go's IntentInform handler — the one
+// thing standing between a healthy submit and an ErrVersionMismatch naming
+// the agent's own stale claim, on a branch that never moved.
+//
+// What makes the fence load-bearing is that readiness is now a STANDING
+// claim. After a Nack, the round that displaced this submit resolves and, in
+// doing so, names us — at whatever version our sticky claim last recorded,
+// which is the OLD one, from before the Nack. That is proof the displacing
+// round is over, not a version mismatch to act on, and the only thing that
+// tells the two apart is whether the coordinator recorded THIS attempt's
+// readiness: an Ack (recorded) means the verdict answers our own round and a
+// differing version is real; a Nack, or no answer yet, means it does not.
+//
+// Why a fake coordinator rather than the real one: the mismatch this guards
+// against needs an Ack and a Nack for a SINGLE Ready, which one Coordinator
+// never produces — onReady answers each Ready with exactly one of the two.
+// Two `pc up` coordinators on one database do produce it (they share a
+// cursors row and can both read a batch before either saves it), and that is
+// the configuration this reproduces by publishing both replies by hand.
+// Publishing directly also keeps the messages off any second subscription
+// under the name "billing", which would otherwise compete with Submit's own
+// agent for them.
+//
+// The assertion that catches a deleted fence is the SECOND stale inform, the
+// one delivered while attempt 2 is waiting for its acknowledgement. The first
+// one cannot catch it: Submit is inside waitForRoundToResolve there, and that
+// function's `mismatched` arm treats a mismatch as resolution too, so with or
+// without the fence attempt 2 begins either way. (That arm is itself correct
+// and deliberate — see its comment — which is exactly how one change on this
+// branch came to mask the only plausible test of another.) At the
+// acknowledgement wait there is no such arm: `mismatched` returns
+// ErrVersionMismatch outright, so the fence is the whole difference, with no
+// select race to make the outcome a coin flip.
+func TestSubmitDoesNotReportAMismatchAgainstItsOwnStandingClaim(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	db := filepath.Join(t.TempDir(), "bus.db")
+	cfg := pcops.Config{DB: db, SubmitTimeout: 45 * time.Second}
+
+	b, err := sqlite.Open(ctx, db, sqlite.WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+
+	type result struct {
+		v   gate.Verdict
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		v, err := pcops.Submit(ctx, cfg, "g", "billing", "v2")
+		done <- result{v, err}
+	}()
+
+	publish := func(m protocol.Message) {
+		t.Helper()
+		if err := b.Publish(ctx, m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	coordinator := protocol.Address{Agent: "coordinator"}
+	toBilling := protocol.Address{Agent: "billing"}
+	toGate := protocol.Address{Topic: gate.Topic("g")}
+	// A verdict for a round that tested billing at v1 — the version its
+	// standing claim still holds, from before the Nack — while billing has
+	// declared v2 and is waiting.
+	staleRound := func() protocol.Message {
+		return protocol.New(coordinator, toGate, protocol.IntentInform,
+			map[string]any{"gate": "g", "passed": true, "text": "g PASSED",
+				"versions": map[string]any{"billing": "v1", "gateway": "v1"}})
+	}
+
+	// waitForReadies waits until billing has published n IntentReady messages
+	// — i.e. until Submit has re-declared readiness n-1 times. It watches the
+	// durable log because Submit exposes no hook for "I am back at the
+	// acknowledgement wait", and it fails fast if Submit has already returned,
+	// so a deleted fence reports itself as the wrong error rather than as a
+	// context timeout sixty seconds later.
+	waitForReadies := func(n int) {
+		t.Helper()
+		for {
+			select {
+			case r := <-done:
+				t.Fatalf("Submit returned early (verdict %+v, err %v) while waiting for it to re-declare readiness %d times", r.v, r.err, n)
+			default:
+			}
+			recs, err := b.History(ctx, 0)
+			if err != nil {
+				t.Fatalf("history: %v", err)
+			}
+			seen := 0
+			for _, r := range recs {
+				if r.Msg.Intent == protocol.IntentReady && r.Msg.From.Agent == "billing" {
+					seen++
+				}
+			}
+			if seen >= n {
+				return
+			}
+			select {
+			case <-time.After(20 * time.Millisecond):
+			case <-ctx.Done():
+				t.Fatalf("billing published %d Ready messages, want %d", seen, n)
+			}
+		}
+	}
+
+	// Attempt 1: declared, then answered BOTH ways by the two coordinators.
+	// The Ack is what sets recorded; the Nack is what must clear it again.
+	waitForReadies(1)
+	publish(protocol.New(coordinator, toBilling, protocol.IntentAck,
+		map[string]any{"gate": "g", "outstanding": []string{"gateway"}, "running": false}))
+	publish(protocol.New(coordinator, toBilling, protocol.IntentNack,
+		map[string]any{"gate": "g", "testing": map[string]any{"billing": "v1", "gateway": "v1"}}))
+	// The displacing round resolves, naming billing at its standing v1. This
+	// one is masked by waitForRoundToResolve's mismatched arm; it is here to
+	// carry the submit into attempt 2, which is where the fence is visible.
+	publish(staleRound())
+
+	// Attempt 2: re-declared at v2 and waiting for an acknowledgement, with
+	// recorded false again because declareReady reset it.
+	waitForReadies(2)
+	// THE ASSERTION. A second round of the other coordinator's resolves,
+	// naming billing at the same standing v1. With the fence this is a
+	// foreign round and Submit keeps waiting for its own; without it, this is
+	// offered as a mismatch and the acknowledgement wait returns
+	// ErrVersionMismatch — against a branch that has not moved since v2 was
+	// declared, and with the caller's only remedy being to resubmit at a HEAD
+	// it is already submitting.
+	publish(staleRound())
+
+	select {
+	case r := <-done:
+		t.Fatalf("Submit returned %+v (err %v) on a verdict naming billing at its own standing v1, for a round it was never recorded in", r.v, r.err)
+	case <-time.After(2 * time.Second):
+		// Still waiting, correctly.
+	}
+
+	// Now answer attempt 2 properly, so the test also proves Submit is still
+	// able to finish rather than merely still blocked.
+	publish(protocol.New(coordinator, toBilling, protocol.IntentAck,
+		map[string]any{"gate": "g", "outstanding": []string{}, "running": true}))
+	publish(protocol.New(coordinator, toGate, protocol.IntentInform,
+		map[string]any{"gate": "g", "passed": true, "text": "g PASSED",
+			"versions": map[string]any{"billing": "v2", "gateway": "v2"}}))
+
+	select {
+	case r := <-done:
+		if errors.Is(r.err, pcops.ErrVersionMismatch) {
+			t.Fatalf("Submit err = %v, want the verdict for the version it declared", r.err)
+		}
+		if r.err != nil {
+			t.Fatalf("Submit: %v", r.err)
+		}
+		if !r.v.Passed || r.v.Versions["billing"] != "v2" {
+			t.Fatalf("Submit returned %+v, want a passing verdict over billing=v2", r.v)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Submit never returned after its own round resolved")
 	}
 }
