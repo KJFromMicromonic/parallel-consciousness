@@ -27,8 +27,17 @@ for the harnesses that have it — over one implementation so they never drift.
 
 1. **One core, many skins.** All logic lives in `internal/pcops`; the CLI and the
    MCP server are thin adapters. No duplicated coordination logic.
-2. **Harness-agnostic.** Plain inputs only — a gate id, an opaque version string,
-   an agent name. Nothing tied to a specific harness.
+2. **Harness-agnostic.** Plain inputs only — a gate id, a version string, an
+   agent name. Nothing tied to a specific harness.
+
+   The version is opaque to `pkg/gate` and to `pcops.Submit`, which compare it
+   and never interpret it. It is NOT opaque at the `pc submit` boundary: the
+   runner merges git branches and reports the commits it merged, so a declared
+   version that names no commit can never match a verdict. `pc submit` therefore
+   resolves `--version` through git and rejects what does not resolve. The
+   harness-agnosticism that matters is preserved — nothing here knows about
+   Claude Code or Codex — but the git-backed runner is not agnostic about git,
+   and this principle used to imply it was.
 3. **Reuse the durable log.** `pc` adds no new coordination semantics; it drives
    `pkg/gate` over `pkg/bus/sqlite`. `Submit`'s correctness rides the durable cursor.
 4. **Floor: `go 1.23` (resolved 2026-06-23).** The MCP `go-sdk` hard-requires

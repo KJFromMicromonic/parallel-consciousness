@@ -249,8 +249,14 @@ func TestRunStopsAfterTheRoundCap(t *testing.T) {
 	if v.Passed {
 		t.Fatalf("verdict = %+v, want a failing one", v)
 	}
-	if !strings.Contains(err.Error(), "3 rounds") {
-		t.Fatalf("Run err = %v, want it to name the round count", err)
+	// "fix cycles", not "rounds". Since readiness became a standing claim the
+	// two differ: N participants fixing in sequence produce N failing verdicts
+	// per cycle, so an operator reading "3 rounds" after watching five spanning
+	// test runs go by would reasonably conclude the tool was lying to them. The
+	// assertion is on the count and the unit together, because naming the count
+	// in the wrong unit is the actual defect being guarded here.
+	if !strings.Contains(err.Error(), "3 fix cycles") {
+		t.Fatalf("Run err = %v, want it to name the count of fix cycles it stopped after", err)
 	}
 }
 

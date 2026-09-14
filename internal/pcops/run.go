@@ -328,7 +328,7 @@ func Run(ctx context.Context, cfg Config, r runtime.Runtime) (gate.Verdict, erro
 			}
 			rounds++
 			if rounds >= maxRounds {
-				return v, fmt.Errorf("gate %s still failing after %d rounds (cap %d): %s",
+				return v, fmt.Errorf("gate %s still failing after %d fix cycles (cap %d): %s",
 					cfg.GateID, rounds, maxRounds, v.Detail)
 			}
 		case f := <-failures:
