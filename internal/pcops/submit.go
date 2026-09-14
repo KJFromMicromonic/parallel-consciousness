@@ -125,6 +125,14 @@ func Submit(ctx context.Context, cfg Config, gateID, agentName, version string) 
 				// false throughout that wait (declareReady resets it, and
 				// offerNack clears it again), so it falls through to
 				// offerDeclined below exactly as it must.
+				//
+				// Pinned by
+				// TestSubmitDoesNotReportAMismatchAgainstItsOwnStandingClaim,
+				// which had to reach the ACKNOWLEDGEMENT wait of a second
+				// attempt to see it: waitForRoundToResolve's own mismatched
+				// arm treats a mismatch as resolution, so on the Nack wait
+				// itself deleting this fence changes nothing observable. Do
+				// not reason about this fence from that wait alone.
 				w.offerMismatch(tested)
 				return nil
 			}
