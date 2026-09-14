@@ -172,7 +172,7 @@ func cmdSubmit(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("submit", flag.ExitOnError)
 	gateID := fs.String("gate", "", "gate id")
 	as := fs.String("as", "", "agent identity (defaults to $PC_AGENT)")
-	version := fs.String("version", "", "opaque version string")
+	version := fs.String("version", "", "commit to declare: a branch, tag or sha resolved with git (default: HEAD)")
 	config := fs.String("config", "", "scenario file (optional when $PC_DB is set)")
 	fs.Parse(args)
 
@@ -420,9 +420,9 @@ func exitForDaemon(err error) int {
 }
 
 // resolveVersion implements the design spec's resolution order for `pc
-// submit`: --version, when the caller passed one, wins outright and git is
-// never consulted. Otherwise fall back to `git rev-parse HEAD` run in the
-// process's current working directory — deliberately the cwd, not the repo
+// submit`: --version, when the caller passed one, names the commit to declare
+// and is RESOLVED through git rather than passed through; otherwise fall back
+// to `git rev-parse HEAD` run in the process's current working directory — deliberately the cwd, not the repo
 // root and not a path derived from config, because an agent runs `pc submit`
 // from inside its own git worktree and that worktree's HEAD is precisely the
 // version being declared. HEAD is the right answer even with uncommitted
@@ -433,9 +433,35 @@ func exitForDaemon(err error) int {
 // nothing left to attribute a verdict to, so this returns an error rather
 // than a placeholder constant — an unattributable "unversioned" readiness
 // declaration was the defect this replaces.
+//
+// An explicit --version used to be returned unchanged, git never consulted, so
+// that a caller outside a git repository could still submit. That promise is
+// no longer keepable. The runner merges git branches and reports the commit it
+// ACTUALLY merged per participant, and pcops.Submit compares a verdict against
+// what was declared — so a declared version that is not a commit can never
+// equal what comes back. Passing a label through does not preserve the old
+// behaviour, it defers the failure: every resubmit misses pkg/gate's cache
+// (the label never equals the sha), completes the standing quorum, and opens
+// another full spanning-test round, forever, with the gate passing and the
+// agent never hearing it. Resolving here turns that unbounded loop into one
+// immediate, actionable error. The requirement belongs to this git-backed
+// layer only: pkg/gate genuinely does not care what a version string is, and
+// its "opaque version string" contract is still true.
+//
+// Not a silent fallback to HEAD, deliberately: a caller who passed --version
+// meant something by it, and quietly declaring a different commit is the
+// class of untruth this whole branch exists to remove.
 func resolveVersion(ctx context.Context, explicit string) (string, error) {
 	if explicit != "" {
-		return explicit, nil
+		// ^{commit} peels tags and rejects anything that names a non-commit
+		// object; --verify -q makes git exit non-zero and stay quiet instead
+		// of echoing the unresolved argument back, which is what would turn a
+		// typo into a declared "version".
+		out, err := exec.CommandContext(ctx, "git", "rev-parse", "--verify", "-q", explicit+"^{commit}").Output()
+		if err != nil {
+			return "", fmt.Errorf("--version %q does not name a commit here: the gate merges git branches and reports the commit it actually merged for each participant, so a version that is not a commit can never match the verdict that comes back; pass a branch, tag or sha that resolves in this worktree, or omit --version to declare HEAD: %w", explicit, err)
+		}
+		return strings.TrimSpace(string(out)), nil
 	}
 	out, err := exec.CommandContext(ctx, "git", "rev-parse", "HEAD").Output()
 	if err != nil {

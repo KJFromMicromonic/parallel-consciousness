@@ -472,16 +472,87 @@ func chdir(t *testing.T, dir string) {
 	})
 }
 
-// An explicit --version wins outright: it must not consult git at all, which
-// this proves by resolving it from a directory that is not a git repository.
-func TestResolveVersionExplicitWinsWithoutGit(t *testing.T) {
-	chdir(t, t.TempDir())
-	got, err := resolveVersion(context.Background(), "v1.2.3")
+// TestResolveVersionResolvesAnExplicitVersionToItsCommit replaces a test that
+// guaranteed the opposite, and the swap is deliberate rather than convenient.
+//
+// The old test — TestResolveVersionExplicitWinsWithoutGit — asserted that an
+// explicit --version wins outright and git is NEVER consulted, proving it from
+// a directory that is not a git repository. That was a faithful encoding of
+// the documented contract at the time: the version was an opaque string, so a
+// caller outside a repo could still submit.
+//
+// That promise stopped being keepable when verdicts became truthful. The
+// runner now merges git branches and reports the commit it ACTUALLY merged for
+// each participant, and pcops.Submit compares a verdict against what this agent
+// declared. A declared label can therefore never equal what comes back — and
+// what the old behaviour bought was not a working submit but a deferred and far
+// more expensive failure: each retry misses pkg/gate's cache, completes the
+// standing quorum, and opens another full spanning-test round, with the gate
+// passing and the agent never hearing it. Reproduced against a real repo, three
+// identical label submits produced three resolved rounds and no verdict.
+//
+// So the guarantee was not dropped for convenience; it was dropped because
+// keeping it meant guaranteeing a promise the system can no longer honour. The
+// choice for a caller who cannot produce a commit is now an immediate,
+// actionable error instead of an unbounded retry loop.
+//
+// Both halves are asserted here, because either alone would let the defect back:
+// a real commit-ish must come back as the full sha it names, and something that
+// names no commit must be REJECTED rather than passed through.
+func TestResolveVersionResolvesAnExplicitVersionToItsCommit(t *testing.T) {
+	dir := t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	runGit("init")
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "f.txt")
+	runGit("commit", "-m", "initial")
+	runGit("tag", "release-1.2.3")
+
+	shaOut, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "v1.2.3" {
-		t.Errorf("resolveVersion(explicit) = %q, want %q", got, "v1.2.3")
+	sha := strings.TrimSpace(string(shaOut))
+
+	chdir(t, dir)
+
+	// A tag and a short sha are both things a caller plausibly passes; each
+	// must be declared as the full 40-character commit, since that is the
+	// spelling the runner reports back and Submit compares against.
+	for _, explicit := range []string{"release-1.2.3", sha[:8]} {
+		got, err := resolveVersion(context.Background(), explicit)
+		if err != nil {
+			t.Fatalf("resolveVersion(%q): %v", explicit, err)
+		}
+		if got != sha {
+			t.Errorf("resolveVersion(%q) = %q, want the full commit %q", explicit, got, sha)
+		}
+	}
+
+	// The half that matters most: a label naming no commit must not be passed
+	// through to be declared as a version no verdict can ever match.
+	got, err := resolveVersion(context.Background(), "release-9.9.9")
+	if err == nil {
+		t.Fatalf("resolveVersion(%q) = %q, nil error: an unresolvable version was declared instead of rejected", "release-9.9.9", got)
+	}
+	// The caller was told the version was opaque, so the error has to say why
+	// it no longer is and what to pass instead, not merely that git failed.
+	for _, want := range []string{"release-9.9.9", "commit", "HEAD"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q: it must say what was rejected, why a commit is required, and what to pass instead", err.Error(), want)
+		}
 	}
 }
 
@@ -590,7 +661,7 @@ func TestCmdSubmitExits2AndNamesTheGateWhenNotAcknowledged(t *testing.T) {
 
 	var got int
 	stderr := captureStderr(t, func() {
-		got = cmdSubmit(context.Background(), []string{"--gate", "checkout", "--version", "v1"})
+		got = cmdSubmit(context.Background(), []string{"--gate", "checkout", "--version", "HEAD"})
 	})
 	if got != 2 {
 		t.Errorf("cmdSubmit with no coordinator = %d, want 2", got)

@@ -73,7 +73,16 @@ defaults:
 - **DB:** `$PC_DB` → else `.pc.yaml` `db` → else error.
 - **Agent identity (`submit`):** `--as` → `$PC_AGENT` → error. Must be explicit and
   stable (it is the durable cursor key).
-- **Version (`submit`):** `--version` → `git rev-parse HEAD` in the cwd → error.
+- **Version (`submit`):** `--version`, RESOLVED through git in the cwd
+  (`git rev-parse --verify <v>^{commit}`) → else `git rev-parse HEAD` in the cwd
+  → else error. A `--version` that does not name a commit is rejected, not passed
+  through, and never silently replaced by HEAD. This narrows the opaque-string
+  contract at this layer only, and it is forced: the runner merges git branches
+  and reports the commit it actually merged per participant, so a declared value
+  that is not a commit can never match the verdict that comes back — the agent
+  would resubmit forever, opening a full spanning-test round each time, while the
+  gate passed without it. `pkg/gate` still takes any string; the requirement is
+  the git-backed `cmd/pc`/`pcops` layer's alone.
 - **Config file path:** `--config` → `./.pc.yaml`.
 
 With config in place the agent's instruction snippet collapses to
