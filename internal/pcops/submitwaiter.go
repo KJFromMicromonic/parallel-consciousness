@@ -38,6 +38,24 @@ type submitWaiter struct {
 	// use without one.
 	readyAt time.Time
 
+	// recorded reports whether the coordinator told us, via an Ack, that THIS
+	// attempt's readiness was actually recorded — as opposed to a Nack, which
+	// means it was dropped in favour of a round already in flight. Guarded by
+	// mu for the same reason readyAt is: declareReady resets it (to false, a
+	// fresh attempt starts unrecorded) from Submit's own goroutine, while
+	// offerAck and offerNack set it from the agent's dispatch goroutine.
+	//
+	// This is what lets the IntentInform guard tell apart two verdicts that
+	// can otherwise look identical — both naming this agent at a version
+	// other than the one just declared: one that resolves OUR OWN round
+	// (recorded == true), where a differing name is a genuine version
+	// mismatch; and one that resolves the round that displaced us after a
+	// Nack (recorded == false), where the same-shaped entry is simply this
+	// agent's OLD readiness, still standing from before the Nack under
+	// Task 5's sticky-claim merge, and is proof that the displacing round is
+	// done rather than anything to act on.
+	recorded bool
+
 	// All four are buffered 1 and all four are written by non-blocking sends:
 	// a handler runs on the agent's dispatch goroutine and must never block
 	// it on a send nobody is reading yet.
@@ -45,14 +63,21 @@ type submitWaiter struct {
 	acked    chan []string
 	nacked   chan map[string]string
 	declined chan struct{}
+	// mismatched carries the version a verdict said it tested for THIS agent
+	// when that differs from the one declared. Distinct from declined: a
+	// verdict that does not name us at all is someone else's round and we keep
+	// waiting, but one that names us at a different version means our branch
+	// moved and waiting is futile.
+	mismatched chan string
 }
 
 func newSubmitWaiter() *submitWaiter {
 	return &submitWaiter{
-		verdicts: make(chan gate.Verdict, 1),
-		acked:    make(chan []string, 1),
-		nacked:   make(chan map[string]string, 1),
-		declined: make(chan struct{}, 1),
+		verdicts:   make(chan gate.Verdict, 1),
+		acked:      make(chan []string, 1),
+		nacked:     make(chan map[string]string, 1),
+		declined:   make(chan struct{}, 1),
+		mismatched: make(chan string, 1),
 	}
 }
 
@@ -107,6 +132,21 @@ func (w *submitWaiter) stampReadyAt(t time.Time) {
 	w.mu.Unlock()
 }
 
+// setRecorded updates whether THIS attempt's readiness was recorded (Ack) or
+// dropped (Nack). See the recorded field's doc comment for why this exists.
+func (w *submitWaiter) setRecorded(v bool) {
+	w.mu.Lock()
+	w.recorded = v
+	w.mu.Unlock()
+}
+
+// isRecorded reports the current attempt's recorded state.
+func (w *submitWaiter) isRecorded() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.recorded
+}
+
 // declareReady stamps a new round boundary, drains every cross-attempt
 // channel, and publishes readiness — in that order, which is load-bearing.
 //
@@ -138,6 +178,9 @@ func (w *submitWaiter) stampReadyAt(t time.Time) {
 // earlier attempt already buffered, which is what this drain is for.
 func (w *submitWaiter) declareReady(ctx context.Context, a *agent.Agent, gateID, version string) error {
 	w.stampReadyAt(time.Now())
+	// A fresh attempt starts unrecorded: whether the coordinator actually
+	// recorded THIS Ready is unknown until its own Ack or Nack arrives.
+	w.setRecorded(false)
 
 	// Non-blocking drains: an empty channel must not block the attempt.
 	select {
@@ -154,6 +197,10 @@ func (w *submitWaiter) declareReady(ctx context.Context, a *agent.Agent, gateID,
 	}
 	select {
 	case <-w.declined:
+	default:
+	}
+	select {
+	case <-w.mismatched:
 	default:
 	}
 
@@ -174,6 +221,7 @@ func (w *submitWaiter) offerVerdict(v gate.Verdict) {
 }
 
 func (w *submitWaiter) offerAck(outstanding []string) {
+	w.setRecorded(true)
 	select {
 	case w.acked <- outstanding:
 	default:
@@ -181,6 +229,7 @@ func (w *submitWaiter) offerAck(outstanding []string) {
 }
 
 func (w *submitWaiter) offerNack(testing map[string]string) {
+	w.setRecorded(false)
 	select {
 	case w.nacked <- testing:
 	default:
@@ -190,6 +239,13 @@ func (w *submitWaiter) offerNack(testing map[string]string) {
 func (w *submitWaiter) offerDeclined() {
 	select {
 	case w.declined <- struct{}{}:
+	default:
+	}
+}
+
+func (w *submitWaiter) offerMismatch(tested string) {
+	select {
+	case w.mismatched <- tested:
 	default:
 	}
 }

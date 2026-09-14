@@ -598,8 +598,17 @@ func TestSubmitRedeclaresAfterNackAndReturnsTheReDeclaredVerdict(t *testing.T) {
 // The defect: pkg/gate drops a readiness that lands while a round is already
 // in flight, but Submit would still accept that round's verdict — one computed
 // without its version. The runner is gated so the ordering is deterministic:
-// the stale verdict is the ONLY verdict on the log at the moment Submit could
+// the foreign verdict is the ONLY verdict on the log at the moment Submit could
 // wrongly accept it, and the genuine one cannot arrive until we release it.
+//
+// The foreign verdict names a DIFFERENT participant, which is what this test's
+// name means by "did not include it": a round billing was never part of. It
+// deliberately does not name billing at some other version — that message says
+// the gate merged and tested a later commit of billing's OWN branch, and the
+// honest answer to it is ErrVersionMismatch rather than continued silence (see
+// TestSubmitReportsWhenTheGateTestedADifferentVersion). The property guarded
+// here is the same under either shape: Submit must never return a gate.Verdict
+// that was computed without this agent's version.
 func TestSubmitDeclinesAVerdictThatDidNotIncludeIt(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -665,22 +674,23 @@ func TestSubmitDeclinesAVerdictThatDidNotIncludeIt(t *testing.T) {
 		t.Fatal("runner was never invoked, so the round never started")
 	}
 
-	// A verdict for a DIFFERENT version of billing, published exactly as the
-	// coordinator publishes one.
+	// A verdict for a round that did not include billing at all — it names a
+	// different participant entirely — published exactly as the coordinator
+	// publishes one.
 	stale := protocol.New(protocol.Address{Agent: "coordinator"},
 		protocol.Address{Topic: gate.Topic("g")}, protocol.IntentInform,
 		map[string]any{"gate": "g", "passed": true, "text": "g PASSED",
-			"versions": map[string]any{"billing": "SOMEONE-ELSES-VERSION"}})
+			"versions": map[string]any{"gateway": "SOMEONE-ELSES-VERSION"}})
 	if err := b.Publish(ctx, stale); err != nil {
 		t.Fatal(err)
 	}
 
-	// THE ASSERTION THAT CATCHES THE DEFECT. The stale verdict is the only
+	// THE ASSERTION THAT CATCHES THE DEFECT. The foreign verdict is the only
 	// verdict available; a Submit without the version guard accepts it and
 	// returns here. With the guard it must keep waiting.
 	select {
 	case r := <-done:
-		t.Fatalf("Submit returned %+v (err %v) on a verdict that tested %q, not MY-VERSION",
+		t.Fatalf("Submit returned %+v (err %v) on a verdict that did not name billing at all (it tested gateway at %q)",
 			r.v, r.err, "SOMEONE-ELSES-VERSION")
 	case <-time.After(3 * time.Second):
 		// Still waiting, correctly.
@@ -698,5 +708,59 @@ func TestSubmitDeclinesAVerdictThatDidNotIncludeIt(t *testing.T) {
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("Submit never returned after the genuine verdict was broadcast")
+	}
+}
+
+// Truthful verdicts mean an agent that commits again after submitting sees a
+// verdict naming the sha actually merged, and the version guard correctly
+// declines it. Nothing then wakes it: the post-ack select waits only on
+// verdicts and ctx, so it burns the full SubmitTimeout and reports ErrNoVerdict
+// — the F4 failure class this project spent a phase eliminating.
+//
+// The elapsed-time assertion is the point. With a generous deadline, "returns
+// an error eventually" passes against exactly the hang this exists to prevent.
+func TestSubmitReportsWhenTheGateTestedADifferentVersion(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	db := filepath.Join(t.TempDir(), "bus.db")
+	cfg := pcops.Config{
+		DB:            db,
+		GateID:        "g",
+		Gate:          pcops.GateDef{Required: []string{"billing"}, Runner: "runner"},
+		SubmitTimeout: 45 * time.Second,
+	}
+	cstop, err := pcops.StartCoordinator(ctx, cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cstop()
+
+	b, err := sqlite.Open(ctx, db, sqlite.WithPollInterval(5*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	run, err := agent.New(ctx, b, "runner", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The runner reports a sha that is NOT what billing declares below.
+	gate.ServeRunner(run, func(_ context.Context, gateID string, _ map[string]string) gate.Verdict {
+		return gate.Verdict{GateID: gateID, Passed: true, Versions: map[string]string{"billing": "actually-merged"}}
+	})
+	go run.Run(ctx)
+
+	start := time.Now()
+	_, err = pcops.Submit(ctx, cfg, "g", "billing", "declared")
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, pcops.ErrVersionMismatch) {
+		t.Fatalf("Submit err = %v, want ErrVersionMismatch", err)
+	}
+	// Must return promptly, not at SubmitTimeout. AckTimeout is 10s and the
+	// round resolves in well under that.
+	if elapsed > 30*time.Second {
+		t.Fatalf("Submit took %v to report a version mismatch; it waited out its budget instead of reporting", elapsed)
 	}
 }
