@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -387,5 +389,124 @@ func TestRunFailsWhenALeaseIsLost(t *testing.T) {
 func TestErrLeaseLostIsReachableThroughTheWorkspaceSentinel(t *testing.T) {
 	if !errors.Is(pcops.ErrLeaseLost, workspace.ErrLeaseLost) {
 		t.Fatal("pcops.ErrLeaseLost does not wrap workspace.ErrLeaseLost: a caller holding the workspace sentinel cannot match a run failure with it")
+	}
+}
+
+// threeServiceRepo is twoServiceRepo with a third half, so the fixture can
+// exercise what changed when readiness became a standing claim: with three
+// required participants, one fix cycle is three separate rounds rather than
+// one. The spanning check still passes only when EVERY file carries the
+// currency field, so no participant can satisfy it alone.
+func threeServiceRepo(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	git(t, dir, "init", "-q", "-b", "main")
+	for _, name := range []string{"billing.txt", "gateway.txt", "ledger.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("amount\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "check.sh"), []byte(`#!/bin/sh
+missing=""
+for f in billing.txt gateway.txt ledger.txt; do
+  grep -q currency "$f" || missing="$missing $f"
+done
+if [ -n "$missing" ]; then
+  echo "`+diagnosticMarker+`:$missing"
+  exit 1
+fi
+exit 0
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	git(t, dir, "add", ".")
+	git(t, dir, "commit", "-q", "-m", "init")
+	return dir
+}
+
+// TestRunConvergesWithThreeParticipantsEachFixingOnce pins what the round cap
+// means now that readiness is a standing claim.
+//
+// Three required participants each fix their own half exactly once, in
+// sequence. Before standing readiness that was TWO runner invocations: a round
+// could not open until every participant had re-declared, so the three fixes
+// arrived as one round. Now a single re-declaration completes the standing
+// quorum, so the same three fixes open four rounds — FAIL(b1,g1,l1),
+// FAIL(b2,g1,l1), FAIL(b2,g2,l1), PASS(b2,g2,l2) — and `rounds++` on every
+// failing verdict reaches a cap of 3 on the THIRD failing verdict, which is
+// the moment the second participant finishes fixing. Run then reports "still
+// failing after 3 rounds" before the third participant has submitted its fix
+// at all, with the gate about to pass. Each of those rounds is also a full run
+// of the spanning test — ten minutes of budget apiece in the live config — so
+// the cost of the miscount is not only the wrong verdict.
+//
+// The staggering (fix on your first, second, third steer respectively) is what
+// makes the trace deterministic, and it is load-bearing rather than
+// decorative. Every failing round blocks all three owners, so agents that all
+// fixed on the first steer raced the runner: this branch made the runner merge
+// and report the commit it ACTUALLY merged, so a fix committed after a round
+// opened is still picked up by that round's merge, and the run then converges
+// in one or two rounds instead of three. Measured: the same scenario resolved
+// in 3 failing rounds on one execution and 1 on the next. A test that
+// sometimes produces one failing round is a test that sometimes asserts
+// nothing about a cap of three.
+//
+// The steer-count assertion is there for the same reason. Convergence alone
+// would still "pass" against a trace that never reached three failing rounds,
+// and that is precisely the trace against which the defect is invisible.
+func TestRunConvergesWithThreeParticipantsEachFixingOnce(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+
+	pc := buildPC(t)
+	cfg := scenario(t, threeServiceRepo(t), []pcops.AgentDef{
+		{Name: "billing", Branch: "agent/billing", Role: "implementer", Task: "add currency to billing"},
+		{Name: "gateway", Branch: "agent/gateway", Role: "implementer", Task: "add currency to gateway"},
+		{Name: "ledger", Branch: "agent/ledger", Role: "implementer", Task: "add currency to ledger"},
+	})
+	cfg.Wall = 150 * time.Second
+
+	submit := fake.Exec{Args: []string{pc, "submit", "--gate", "checkout"}}
+	// Submit at once; fix on the nth steer and on no other, so exactly one
+	// participant's half is repaired between consecutive rounds.
+	var steers sync.Map // agent -> *int32, how many blocks it was steered with
+	fixOnSteer := func(agent string, n int32, path string) func(string) []fake.Action {
+		seen := new(int32)
+		steers.Store(agent, seen)
+		return func(string) []fake.Action {
+			if atomic.AddInt32(seen, 1) != n {
+				return nil
+			}
+			return []fake.Action{
+				fake.Write{Path: path, Content: "amount currency\n"},
+				commitAll,
+				submit,
+			}
+		}
+	}
+	r := fake.New(map[string]fake.Script{
+		"billing": {OnStart: []fake.Action{submit}, OnSteer: fixOnSteer("billing", 1, "billing.txt")},
+		"gateway": {OnStart: []fake.Action{submit}, OnSteer: fixOnSteer("gateway", 2, "gateway.txt")},
+		"ledger":  {OnStart: []fake.Action{submit}, OnSteer: fixOnSteer("ledger", 3, "ledger.txt")},
+	})
+
+	v, err := pcops.Run(ctx, cfg, r)
+	if err != nil {
+		t.Fatalf("Run: %v — three participants each fixing their own half once is one fix cycle, and the cap must not end the run inside it", err)
+	}
+	if !v.Passed {
+		t.Fatalf("verdict = %+v, want a passing one once all three halves carry the field", v)
+	}
+	// Three failing rounds actually happened: ledger is steered once per
+	// failing verdict and only fixes on the third, so the run could not have
+	// passed with fewer. Asserted rather than assumed, because a trace with
+	// fewer failing rounds never reaches a cap of 3 and would make this test
+	// vacuous without changing its outcome.
+	seen, ok := steers.Load("ledger")
+	if !ok {
+		t.Fatal("ledger was never scripted")
+	}
+	if got := atomic.LoadInt32(seen.(*int32)); got < 3 {
+		t.Fatalf("ledger was steered %d times, want at least 3: the run converged without ever reaching three failing rounds, so it never exercised the cap", got)
 	}
 }
