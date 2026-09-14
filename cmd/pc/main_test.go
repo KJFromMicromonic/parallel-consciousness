@@ -655,7 +655,46 @@ func captureStderr(t *testing.T, fn func()) string {
 // from the CLI's generic "pc submit: %v" fallback used for every other
 // error. See docs/superpowers/specs/2026-09-02-live-fire-findings.md, F4:
 // this is exactly the case that used to be an 8-minute silent block.
+
+// tempGitRepo creates a throwaway repository with a single commit and points
+// the process cwd at it, so a test that needs resolveVersion's git step to
+// SUCCEED does not borrow the ambient repository it happens to be running in.
+//
+// Borrowing it was a real regression, not a hypothetical one: when this test
+// file started passing --version HEAD, `go test ./...` stopped being hermetic
+// and failed in any source tree exported without .git — a tarball release, a
+// container build that copies sources without history, a vendored CI checkout.
+// Caught by a reviewer extracting HEAD with `git archive` and running the
+// suite there, which is worth copying as a habit: a suite that depends on its
+// own repository passes everywhere the authors work and nowhere else.
+func tempGitRepo(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	runGit("init")
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "f.txt")
+	runGit("commit", "-m", "initial")
+	chdir(t, dir)
+	return dir
+}
+
 func TestCmdSubmitExits2AndNamesTheGateWhenNotAcknowledged(t *testing.T) {
+	// Its own repository, so --version HEAD resolves here rather than in
+	// whatever tree the suite happens to be run from. See tempGitRepo.
+	tempGitRepo(t)
 	t.Setenv("PC_DB", filepath.Join(t.TempDir(), "pc.db"))
 	t.Setenv("PC_AGENT", "billing")
 
