@@ -273,10 +273,23 @@ type roundResolution struct {
 // is done, with nothing further to hand back); verdicts, when the verdict
 // that resolves the round happens to be OUR OWN — a race this attempt wins
 // outright, since there is nothing left to wait for; or mismatched, when the
-// inform that resolves the displacing round names us at some other version —
-// still just proof the round is over, not a mismatch to act on, since
-// isRecorded() is false throughout this wait (see the mismatched field's and
-// isRecorded's doc comments).
+// inform that resolves the displacing round names us at some other version.
+//
+// The mismatched arm exists precisely BECAUSE isRecorded() is not guaranteed
+// to stay false for the whole of this wait. Do not delete it on the reasoning
+// that it is unreachable. Two `pc up` coordinators share one cursors row and
+// can both read a batch before either saves it, so a single Ready can draw
+// both an Ack and a Nack; whichever offer call lands last sets recorded,
+// regardless of which branch this attempt's select took. With recorded true,
+// the displacing round's inform — which under standing readiness names us at
+// the version our sticky claim still holds — takes offerMismatch rather than
+// offerDeclined, and without this arm the wait would block to ctx and report
+// ErrNoVerdict at SubmitTimeout: the exact hang this file exists to remove.
+//
+// Treating it as resolution rather than as a mismatch loses nothing. If the
+// gate really did test a different commit, the next attempt re-declares and
+// its own post-ack mismatched arm reports ErrVersionMismatch immediately, so
+// the cost is one extra round trip and the error is deferred, never swallowed.
 //
 // That verdict is returned to the caller rather than re-buffered and left for
 // the loop's next iteration: re-declaring readiness after a verdict already
