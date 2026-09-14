@@ -339,6 +339,44 @@ func TestVerdictFallsBackToRecordedReadinessWhenTheRunnerReportsNone(t *testing.
 	}
 }
 
+// The two cases above are the extremes; the dangerous one is in between. A
+// runner that names SOME required participants and not others used to have its
+// gaps passed straight through, because the backfill switched on
+// `v.Versions == nil` — all or nothing. It is reachable: StartRunner takes its
+// branches as a parameter separate from cfg.Agents and drops any branch it has
+// no participant for, and validate permits gate.required to name the runner,
+// whose branch is never among them.
+//
+// A gap is not read downstream as "unknown". pcops.Submit reads a missing key
+// as "this verdict did not name me", declines the offer, and waits out its
+// whole budget for a verdict that already arrived — the F4 silent-timeout
+// class, arriving through the one hop resolve's per-key merge exists to
+// protect. So the assertion is on the BROADCAST, which is what a submitter
+// actually reads, not on the Verdict struct alone.
+func TestPartiallyReportedVerdictIsBackfilledPerKey(t *testing.T) {
+	h := setupGate(t, checkoutSpec(), func(gateID string, _ map[string]string) gate.Verdict {
+		// Names billing at what it merged, and omits gateway entirely.
+		return gate.Verdict{
+			GateID:   gateID,
+			Passed:   true,
+			Versions: map[string]string{"billing": "merged-b"},
+		}
+	})
+	defer h.cancel()
+
+	h.ready(t, "billing", "b1")
+	h.ready(t, "gateway", "g1")
+
+	m := recvMsg(t, h.informs)
+	got := protocol.Versions(m.Body["versions"])
+	if got["billing"] != "merged-b" {
+		t.Errorf("broadcast versions = %v, want billing at the runner's merged-b: a report that IS present still wins", got)
+	}
+	if got["gateway"] != "g1" {
+		t.Errorf("broadcast versions = %v, want gateway backfilled at its recorded g1: an omitted required participant reads downstream as 'this verdict did not name me' and waits out its whole budget", got)
+	}
+}
+
 func TestDuplicateReadyLastVersionWins(t *testing.T) {
 	h := setupGate(t, checkoutSpec(), passRunner)
 	defer h.cancel()

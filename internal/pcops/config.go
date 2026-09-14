@@ -172,10 +172,15 @@ func (c Config) validate() error {
 		names[a.Name] = true
 		branches[a.Branch] = true
 	}
+	required := make(map[string]bool, len(c.Gate.Required))
 	for _, r := range c.Gate.Required {
 		if !names[r] {
 			return fmt.Errorf("gate.required names %q, which is not in agents: the gate would wait forever for a readiness nobody declares", r)
 		}
+		if required[r] {
+			return fmt.Errorf("duplicate gate.required entry %q: quorum is an exact count of declared readiness and %q can only declare once, so the gate would never reach quorum — it would starve silently while reporting nobody outstanding", r, r)
+		}
+		required[r] = true
 	}
 
 	if c.SubmitTimeout <= c.RunnerTimeout {
