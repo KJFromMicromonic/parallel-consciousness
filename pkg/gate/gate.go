@@ -304,12 +304,13 @@ func (c *Coordinator) onReady(ctx context.Context, _ *agent.Agent, m protocol.Me
 		// yet" from "no coordinator is running" from "a required peer is
 		// never coming".
 		//
-		// This deliberately does NOT carry outstandingFor(gs). open leaves
-		// gs.ready intact for the whole round (only resolve clears it), so on
-		// this path outstandingFor always returns an empty slice — which reads
-		// as "waiting on nobody", the opposite of what is happening. What is
-		// actually useful is the version set the in-flight round is testing
-		// instead of this submitter's.
+		// This deliberately does NOT carry outstandingFor(gs). gs.ready holds
+		// standing claims that nothing ever clears — a round in flight was
+		// opened by a full quorum, and resolve only overwrites the claims it
+		// tested — so on this path outstandingFor always returns an empty
+		// slice, which reads as "waiting on nobody", the opposite of what is
+		// happening. What is actually useful is the version set the in-flight
+		// round is testing instead of this submitter's.
 		//
 		// IntentNack for the same reason as the IntentAck above: the courier
 		// registers no handler for it, so it reaches pcops.Submit's own
@@ -423,13 +424,20 @@ func (c *Coordinator) resolve(ctx context.Context, gs *gateState, v Verdict, sta
 	//
 	// Updated per key rather than replaced wholesale: each participant the
 	// verdict names has its claim overwritten with what was actually tested,
-	// and any participant the verdict does not name keeps the claim it had. The
-	// key sets agree in practice — Config.validate requires every gate.required
-	// name to appear in agents, and the runner reports one entry per merged
-	// branch — but a per-key merge means a verdict that ever named a subset
-	// could not silently erase the rest of the quorum.
+	// and any participant the verdict does not name keeps the claim it had, so
+	// a verdict that names only a subset cannot silently erase the rest of the
+	// quorum.
 	for name, tested := range v.Versions {
-		gs.ready[name] = tested
+		// Filter to required participants. onReady applies the same filter at
+		// the top of this file, and since readiness is now standing — nothing
+		// clears gs.ready — an unrequired key inserted here would be permanent.
+		// Quorum is an exact length equality, so one extra key starves the gate
+		// forever. This is reachable today: Config.validate permits an agent
+		// that is not in gate.required, and the runner reports a version for
+		// every branch it merged.
+		if contains(gs.spec.Required, name) {
+			gs.ready[name] = tested
+		}
 	}
 	owners := append([]string(nil), gs.spec.Required...)
 	gateID := gs.spec.ID

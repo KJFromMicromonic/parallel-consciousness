@@ -1249,6 +1249,12 @@ func TestStandingReadinessLetsAPeerReSubmitAlone(t *testing.T) {
 	if second.Versions["billing"] != "b1" {
 		t.Errorf("versions = %v, want billing's standing claim b1 carried into the round", second.Versions)
 	}
+	// Exactly one failing round: the g1 round. A second would mean gateway's
+	// g2 was tested against something other than billing's standing b1, or
+	// that a round re-ran work it had already done.
+	if got := atomic.LoadInt32(&rounds); got != 1 {
+		t.Errorf("failing rounds = %d, want 1", got)
+	}
 }
 
 // Standing readiness must not make the gate re-run work it has already done. A
@@ -1277,14 +1283,40 @@ func TestStandingReadinessDoesNotOpenARedundantRound(t *testing.T) {
 	}
 }
 
-// F2, replayed under standing readiness. Sticky invalidation is what keeps this
-// design sound: without it, an unchanged resubmit would hit the cache and be
-// answered with a verdict for a combination that no longer holds, because the
-// other participant's standing claim moved underneath it.
+// F2, replayed under standing readiness: a participant whose own version has
+// not moved must never be answered from a verdict the OTHER participant has
+// already invalidated. The earlier, submitter-only guard answered exactly that
+// resubmit from a stale FAILED verdict in a live run.
+//
+// What this pins, precisely: billing's divergent b2 is not answered from the
+// remembered b1 round — it falls through to ordinary readiness recording and a
+// fresh round — and gateway's subsequent UNCHANGED g1 resubmit is then served
+// the post-b2 verdict, not the pre-b2 one. The assertions are on the cached
+// path itself (the runner's invocation count and the "already tested" marker),
+// not merely on Verdict.Versions, so an answer that came from the wrong round
+// cannot slip past.
+//
+// What this does NOT pin, deliberately and with the reason recorded so the
+// next reader does not mistake it for coverage: the `gs.lastVerdict = nil`
+// assignment in onReady. Under standing readiness a divergent submit always
+// completes quorum (gs.ready is never cleared, so every required participant
+// still has a claim), so it opens a round in the same dispatch, before any
+// other message can be handled — and the resolve that clears gs.inflight is
+// the same one that overwrites gs.lastVerdict. The stale pointer is therefore
+// unreadable through the bus. That assignment only closes the window between
+// onReady's unlock and open setting inflight, which a concurrent host could
+// enter but pkg/agent's serial dispatch loop cannot. See the fix-round-1
+// report for the mutation run that demonstrates this.
 func TestStandingReadinessStillInvalidatesOnDivergence(t *testing.T) {
-	var lastTested map[string]string
+	var runs int32
+	// lastTested is written on the runner's goroutine and read on the test's.
+	// Guarded like the neighbouring counters rather than left bare: -race is
+	// clean either way today because the bus hand-off supplies a happens-before
+	// edge, but the next test to copy this shape may not have one.
+	var lastTested atomic.Pointer[map[string]string]
 	h := setupGate(t, checkoutSpec(), func(gateID string, versions map[string]string) gate.Verdict {
-		lastTested = versions
+		atomic.AddInt32(&runs, 1)
+		lastTested.Store(&versions)
 		passed := versions["billing"] == "b2"
 		return gate.Verdict{GateID: gateID, Passed: passed, Versions: versions}
 	})
@@ -1295,15 +1327,108 @@ func TestStandingReadinessStillInvalidatesOnDivergence(t *testing.T) {
 	if v := recvVerdict(t, h.verdict); v.Passed {
 		t.Fatalf("first round = %+v, want a failure", v)
 	}
+	recvMsg(t, h.informs) // round 1's broadcast
 
-	// billing fixes its half. gateway then resubmits UNCHANGED — it must not be
-	// answered from the pre-fix verdict.
+	// billing fixes its half. Its divergent version must not be answered from
+	// the remembered round; it must run a fresh one.
 	h.ready(t, "billing", "b2")
 	second := recvVerdict(t, h.verdict)
 	if !second.Passed {
 		t.Fatalf("second round = %+v, want a pass once billing moved to b2", second)
 	}
-	if lastTested["billing"] != "b2" || lastTested["gateway"] != "g1" {
-		t.Fatalf("runner saw %v, want billing=b2 with gateway's standing g1", lastTested)
+	if tested := loadVersions(&lastTested); tested["billing"] != "b2" || tested["gateway"] != "g1" {
+		t.Fatalf("runner saw %v, want billing=b2 with gateway's standing g1", tested)
+	}
+	if m := recvMsg(t, h.informs); strings.Contains(text(m), "already tested") {
+		t.Fatalf("round 2 inform = %q, must be a fresh round, not a cached answer", text(m))
+	}
+	if got := atomic.LoadInt32(&runs); got != 2 {
+		t.Fatalf("runner invoked %d times, want 2 (the b1 round and the fresh b2 round)", got)
+	}
+
+	// gateway now resubmits UNCHANGED. It is answered from cache — but it must
+	// be the post-b2 round, not the pre-b2 failure it was submitted against.
+	h.ready(t, "gateway", "g1")
+	third := recvVerdict(t, h.verdict)
+	if !third.Passed {
+		t.Fatalf("gateway's unchanged resubmit = %+v, want the post-b2 PASS, not the pre-b2 failure", third)
+	}
+	if third.Versions["billing"] != "b2" {
+		t.Fatalf("gateway's answer names billing=%q, want b2: it was served from the pre-b2 round", third.Versions["billing"])
+	}
+	m3 := recvMsg(t, h.informs)
+	if !strings.Contains(text(m3), "already tested at this version") {
+		t.Fatalf("gateway's inform = %q, want the cached-answer marker: this must come from the remembered round", text(m3))
+	}
+	if !strings.Contains(text(m3), "PASSED") {
+		t.Fatalf("gateway's inform = %q, want the post-b2 PASS", text(m3))
+	}
+	if got := atomic.LoadInt32(&runs); got != 2 {
+		t.Fatalf("runner invoked %d times after the unchanged resubmit, want still 2", got)
+	}
+	// The runner never saw gateway's resubmit at all: it was answered from the
+	// remembered round, which is the whole point of asserting on this rather
+	// than on the verdict alone.
+	if tested := loadVersions(&lastTested); tested["billing"] != "b2" {
+		t.Fatalf("runner's last observed versions = %v, want the b2 round's", tested)
+	}
+}
+
+func loadVersions(p *atomic.Pointer[map[string]string]) map[string]string {
+	if v := p.Load(); v != nil {
+		return *v
+	}
+	return nil
+}
+
+func text(m protocol.Message) string {
+	s, _ := m.Body["text"].(string)
+	return s
+}
+
+// A verdict may legitimately name a participant the gate does not require:
+// internal/pcops's Config.validate only checks required ⊆ agents, cmd/pc merges
+// every agent's branch, and the runner reports a version for every branch it
+// merged. Since readiness is standing — nothing clears gs.ready — merging such
+// a key in would make it permanent, and quorum is an exact length equality
+// (len(ready) == len(Required)), so the gate would never open again: it runs
+// once and starves, with even a full resubmit unable to recover it.
+func TestVerdictNamingAnUnrequiredParticipantDoesNotStarveTheGate(t *testing.T) {
+	var runs int32
+	h := setupGate(t, checkoutSpec(), func(gateID string, versions map[string]string) gate.Verdict {
+		atomic.AddInt32(&runs, 1)
+		// What the runner actually merged: both required participants plus
+		// "docs", an agent that is in the config but not in Spec.Required.
+		reported := map[string]string{"docs": "d1"}
+		for k, v := range versions {
+			reported[k] = v
+		}
+		return gate.Verdict{GateID: gateID, Passed: false, Detail: "still failing", Versions: reported}
+	})
+	defer h.cancel()
+
+	h.ready(t, "billing", "b1")
+	h.ready(t, "gateway", "g1")
+	first := recvVerdict(t, h.verdict)
+	if first.Versions["docs"] != "d1" {
+		t.Fatalf("round 1 versions = %v, want the runner's report including docs", first.Versions)
+	}
+
+	// Both required participants resubmit at fresh versions — the full resubmit
+	// that recovered the gate before readiness became standing. A round must
+	// still open; if the unrequired key was merged into the readiness map, the
+	// quorum equality can never hold again and this deadline is what trips.
+	h.ready(t, "billing", "b2")
+	h.ready(t, "gateway", "g2")
+
+	second := recvVerdict(t, h.verdict)
+	if second.Versions["billing"] != "b2" {
+		t.Fatalf("round 2 versions = %v, want billing at its resubmitted b2", second.Versions)
+	}
+	// Deliberately not an exact count: gateway's resubmit may be nacked as
+	// mid-round or may open a third round, depending on whether round 2's
+	// verdict overtakes it. Both orderings are correct; a starved gate is not.
+	if got := atomic.LoadInt32(&runs); got < 2 {
+		t.Fatalf("runner invoked %d times, want at least 2: the gate must reopen after a full resubmit", got)
 	}
 }
