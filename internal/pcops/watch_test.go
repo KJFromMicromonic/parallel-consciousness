@@ -318,3 +318,15 @@ func TestWatchStopsCleanlyWhenCancelledMidFollow(t *testing.T) {
 		t.Fatal("timed out waiting for Watch to return after cancellation")
 	}
 }
+
+// Under standing readiness an ack usually carries an empty outstanding list,
+// which rendered as a bare "coordinator → billing ack" and told an operator
+// nothing. Say that the round started.
+func TestFormatRecordShowsARoundStarting(t *testing.T) {
+	m := protocol.New(protocol.Address{Agent: "coordinator"}, protocol.Address{Agent: "billing"},
+		protocol.IntentAck, map[string]any{"gate": "g", "running": true})
+	got := pcops.FormatRecord(sqlite.Record{Seq: 1, Msg: m}, false)
+	if !strings.Contains(got, "round running") {
+		t.Fatalf("rendered %q, want it to say the round is running", got)
+	}
+}

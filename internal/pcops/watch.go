@@ -72,6 +72,9 @@ func summarise(m protocol.Message, full bool) string {
 		if out := protocol.Strings(m.Body["outstanding"]); len(out) > 0 {
 			return "waiting on " + strings.Join(out, ", ")
 		}
+		if running, _ := m.Body["running"].(bool); running {
+			return "round running"
+		}
 	case protocol.IntentNack:
 		// Unlike the Ack above, a Nack carries "testing" (the version set the
 		// in-flight round is actually testing), not "outstanding" — see

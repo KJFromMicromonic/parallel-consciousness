@@ -322,6 +322,12 @@ func (c *Coordinator) onReady(ctx context.Context, _ *agent.Agent, m protocol.Me
 		ack := m.Reply(protocol.Address{Agent: c.a.Name}, protocol.IntentAck, map[string]any{
 			"gate":        gateID,
 			"outstanding": outstanding,
+			// Under standing readiness an empty outstanding list is the common
+			// case — once everyone has submitted once, any later submit
+			// completes the set immediately — so "nothing outstanding" and "a
+			// round just started" became indistinguishable, and both pc submit
+			// and pc watch rendered them as silence.
+			"running": full,
 		})
 		reply = &ack
 	} else if required {

@@ -1432,3 +1432,24 @@ func TestVerdictNamingAnUnrequiredParticipantDoesNotStarveTheGate(t *testing.T) 
 		t.Fatalf("runner invoked %d times, want at least 2: the gate must reopen after a full resubmit", got)
 	}
 }
+
+// An empty outstanding list means two different things — "you completed quorum
+// and a round is starting" and "nothing to report" — and under standing
+// readiness the first becomes the common case. Both pc submit and pc watch
+// render it as silence, so the ack carries whether a round actually opened.
+func TestAckSaysWhetherARoundStarted(t *testing.T) {
+	h := setupGate(t, checkoutSpec(), passRunner)
+	defer h.cancel()
+
+	h.ready(t, "billing", "b1")
+	first := recvMsg(t, h.acks)
+	if running, _ := first.Body["running"].(bool); running {
+		t.Errorf("ack for a partial quorum says a round is running: %+v", first.Body)
+	}
+
+	h.ready(t, "gateway", "g1")
+	second := recvMsg(t, h.acks)
+	if running, _ := second.Body["running"].(bool); !running {
+		t.Errorf("ack for the quorum-completing submit does not say a round started: %+v", second.Body)
+	}
+}
