@@ -253,6 +253,33 @@ func (c *Coordinator) onReady(ctx context.Context, _ *agent.Agent, m protocol.Me
 			// from cache is never mistaken for an unacknowledged gate.
 			return nil
 		}
+		// Sticky invalidation. As of standing readiness this line is
+		// UNREACHABLE-BY-CONSEQUENCE, and the distinction matters to anyone
+		// tempted to delete it or to trust it.
+		//
+		// It is still executed — divergent resubmits reach it constantly —
+		// but the nil it writes can never afterwards be READ, because the
+		// same call goes on to record readiness and open a round, and
+		// resolve overwrites lastVerdict before the cache branch above is
+		// consulted again. The proof rests on two facts that hold only since
+		// readiness became a standing claim: a verdict exists only after a
+		// full quorum, and a standing quorum is never lost. So every
+		// participant named in lastVerdict still stands in gs.ready, any
+		// divergence therefore still completes the quorum, and a round is
+		// always in flight across the whole window in which the stale value
+		// would otherwise be visible (the cache branch requires !inflight).
+		//
+		// Two consequences. First, no test can pin this line through the
+		// public API: replacing it with a no-op leaves the suite green, and
+		// a test claiming to cover it would be this project's tenth vacuous
+		// test rather than its first real one here. Second, do not read its
+		// survival as evidence it is load-bearing — it is retained because
+		// the argument above is a property of the CALLERS, not of this file,
+		// and a future change that lets a quorum lapse (a participant
+		// removed from Required mid-run, readiness expiry, a persisted
+		// gs.ready reloaded partially) makes it load-bearing again with no
+		// test to notice. Deleting it is safe only together with a check
+		// that quorum cannot lapse.
 		gs.lastVerdict = nil
 	}
 
