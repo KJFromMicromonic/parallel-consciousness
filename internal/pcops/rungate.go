@@ -136,6 +136,15 @@ func mergeAll(ctx context.Context, workdir string, branches []string) (map[strin
 		// merged — the very defect truthful versions exist to remove, in
 		// miniature. Merging the sha closes the window: what we merge and what
 		// we report are the same value by construction.
+		//
+		// This comment is the ONLY thing holding that ordering. Reverting to
+		// `merge br` followed by `rev-parse br` leaves every test in this
+		// package green, because reproducing the defect needs a commit landing
+		// inside the gap between two git invocations — a race no test here can
+		// open deterministically, which is why there is no test for it and why
+		// there is unlikely ever to be one. So do not "simplify" the two-step
+		// resolve-then-merge back into merging the branch name: nothing but
+		// this paragraph will stop you, and nothing will tell you afterwards.
 		shaOut, shaErr := gitIn(ctx, workdir, "rev-parse", br)
 		if shaErr != nil {
 			// Same "merge failed on %s" prefix as the ordinary merge-failure
